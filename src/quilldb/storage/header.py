@@ -19,7 +19,6 @@ All multibyte fields are big-endian.
 
 from dataclasses import dataclass
 
-
 from quilldb.constants import (
     FILE_FORMAT_LEGACY,
     FILE_HEADER_SIZE,
@@ -56,8 +55,6 @@ from quilldb.constants import (
     TEXT_ENCODING_UTF8,
 )
 from quilldb.errors import InvalidHeaderError
-
-
 
 
 @dataclass
@@ -167,7 +164,7 @@ class FileHeader:
             raise InvalidHeaderError(f"PAGE SIZE must be {PAGE_SIZE}")
        
         if self.text_encoding != TEXT_ENCODING_UTF8:
-            raise InvalidHeaderError(f"Text encoding should be UTF8 which value is 1")
+            raise InvalidHeaderError("Text encoding should be UTF8 which value is 1")
 
 
         if self.read_version == 2 or self.write_version == 2:

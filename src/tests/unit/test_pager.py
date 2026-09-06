@@ -1,14 +1,10 @@
 import subprocess
 
-
 import pytest
-
 
 from quilldb.constants import OFF_RESERVED, PAGE_SIZE, RESERVED_LEN
 from quilldb.errors import PageOutOfRangeError
 from quilldb.storage.pager import Pager, page_header_offset
-
-
 
 
 def test_create_then_open_roundtrip(tmp_path) -> None:

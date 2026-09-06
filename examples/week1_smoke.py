@@ -13,13 +13,11 @@ not just passing in isolation.
 
 from pathlib import Path
 
-
 from quilldb.codec.record import decode_record, encode_record
 from quilldb.constants import PageType
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
-
 
 path = Path("demo.db")
 path.unlink(missing_ok=True)  # rerunning this script shouldn't hit FileExistsError

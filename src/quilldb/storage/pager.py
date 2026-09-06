@@ -20,12 +20,9 @@ never read or written. See allocate_page/free_page and chapter 01 §1.8.
 import os
 from pathlib import Path
 
-
 from quilldb.constants import FILE_HEADER_SIZE, PAGE_SIZE, SCHEMA_ROOT_PAGE, PageType
 from quilldb.errors import CorruptDatabaseError, PageOutOfRangeError
 from quilldb.storage.header import FileHeader
-
-
 
 
 def page_header_offset(page_id: int) -> int:
@@ -43,7 +40,7 @@ def page_header_offset(page_id: int) -> int:
 class Pager:
     def __init__(self, path: Path) -> None:
         """Prefer Pager.create() or Pager.open()."""
-        raise NotImplementedError("Use Pager.create() or Pager.open().")
+        Pager.create(path = path)
 
 
     @classmethod

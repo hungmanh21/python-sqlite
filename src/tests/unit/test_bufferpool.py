@@ -1,12 +1,9 @@
 import pytest
 
-
 from quilldb.constants import PAGE_SIZE
 from quilldb.errors import PoolExhaustedError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
-
-
 
 
 @pytest.fixture

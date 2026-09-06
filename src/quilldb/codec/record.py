@@ -35,10 +35,8 @@ Note the lengths are BYTES, not characters. "café" is 5 bytes -> type 23.
 import struct
 from collections.abc import Sequence
 
-
 from quilldb.codec.varint import decode_uvarint, encode_uvarint
 from quilldb.errors import MalformedRecordError
-
 
 Value = None | int | float | str | bytes
 

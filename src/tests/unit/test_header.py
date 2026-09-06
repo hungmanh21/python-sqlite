@@ -1,8 +1,6 @@
 import subprocess
 
-
 import pytest
-
 
 from quilldb.constants import (
     MAGIC,
@@ -16,8 +14,6 @@ from quilldb.constants import (
 )
 from quilldb.errors import InvalidHeaderError
 from quilldb.storage.header import FileHeader
-
-
 
 
 def test_roundtrip() -> None:

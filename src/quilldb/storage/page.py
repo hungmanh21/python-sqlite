@@ -19,10 +19,9 @@ See ADR-003.
 
 
 from dataclasses import dataclass, field
-from quilldb.errors import PageFullError, InvalidPageTypeError, MalformedCellError
-from quilldb.constants import PageType, PAGE_SIZE
 
-
+from quilldb.constants import PAGE_SIZE, PageType
+from quilldb.errors import InvalidPageTypeError, MalformedCellError, PageFullError
 
 
 @dataclass

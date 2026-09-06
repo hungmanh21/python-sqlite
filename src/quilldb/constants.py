@@ -13,7 +13,6 @@ See docs/theory/01-pages-and-pager.md §1.6 for why each header field exists.
 
 from enum import IntEnum
 
-
 PAGE_SIZE = 4096                   # SQLite's default since 3.12.0 (2016)
 MAGIC = b"SQLite format 3\x00"     # exactly 16 bytes, NUL-terminated
 

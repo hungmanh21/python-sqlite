@@ -13,12 +13,9 @@ import sys
 from dataclasses import fields
 from pathlib import Path
 
-
 from quilldb.constants import FILE_HEADER_SIZE
 from quilldb.errors import QuillDBError
 from quilldb.storage.header import FileHeader
-
-
 
 
 def read_header(path: Path) -> FileHeader:

@@ -25,8 +25,6 @@ two's complement at that width. See §3.5.
 from quilldb.errors import MalformedRecordError
 
 
-
-
 def encode_uvarint(value: int) -> bytes:
     """Encode a non-negative integer.
 

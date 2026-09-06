@@ -1,10 +1,9 @@
 import math
 import struct
 
-
 import pytest
-from hypothesis import given, strategies as st
-
+from hypothesis import given
+from hypothesis import strategies as st
 
 from quilldb.codec.record import (
     decode_column,
@@ -14,7 +13,6 @@ from quilldb.codec.record import (
     serial_type_for,
 )
 from quilldb.errors import MalformedRecordError
-
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1
@@ -171,7 +169,7 @@ def test_three_char_ascii_string_is_type_19() -> None:
 def test_multibyte_utf8_counts_bytes_not_characters() -> None:
     # "café" is 5 BYTES (é is 2 bytes in UTF-8) -> (5*2)+13 = 23.
     stype, body = serial_type_for("café")
-    assert body == "café".encode("utf-8")
+    assert body == "café".encode()
     assert len(body) == 5
     assert stype == 23
 

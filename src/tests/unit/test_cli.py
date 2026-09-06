@@ -1,11 +1,8 @@
 import pytest
 
-
 from quilldb.cli import main
 from quilldb.constants import PAGE_SIZE
 from quilldb.storage.pager import Pager
-
-
 
 
 @pytest.fixture

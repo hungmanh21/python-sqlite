@@ -26,11 +26,8 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-
 from quilldb.errors import PoolExhaustedError
 from quilldb.storage.pager import Pager
-
-
 
 
 @dataclass

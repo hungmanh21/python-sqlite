@@ -1,6 +1,6 @@
 import pytest
-from hypothesis import given, strategies as st
-
+from hypothesis import given
+from hypothesis import strategies as st
 
 from quilldb.codec.varint import (
     decode_uvarint,
@@ -9,7 +9,6 @@ from quilldb.codec.varint import (
     to_twos_complement,
 )
 from quilldb.errors import MalformedRecordError
-
 
 U64_MAX = 2**64 - 1
 I64_MIN = -(2**63)
