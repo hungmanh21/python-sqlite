@@ -9,6 +9,9 @@ dependencies = [
     "pytest>=9.1.1",
 ]
 
+[project.scripts]
+quilldb = "quilldb.cli:main"
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -25,5 +28,11 @@ files = ["src"]
 
 [tool.ruff]
 line-length = 100
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "ruff>=0.16.6",
+]
 
 
