@@ -75,8 +75,11 @@ class PageFullError(QuillDBError):
 
 
 
+class PoolExhaustedError(QuillDBError):
+    """A full buffer pool has no unpinned page left to evict."""
+
+
+
+
 class UnsupportedFeatureError(QuillDBError):
     """A valid file using a feature quilldb does not implement."""
-
-
-

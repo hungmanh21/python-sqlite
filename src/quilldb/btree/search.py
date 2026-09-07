@@ -79,11 +79,51 @@ def child_for_key(page: PageBody, key: int) -> int:
         key <= separator means "go left"), or page.right_child if key is
         greater than every separator on this page.
     """
-    # Same shape as binary_search_leaf, but this is a boundary search, not an
-    # exact-match one: narrow [lo, hi) to the leftmost index whose separator
-    # is >= key. `key <= separator` keeps mid as a candidate (hi = mid) --
-    # that's the §6.1 convention, an equal separator must stay a candidate
-    # so an exact match still resolves left, not past it.
+    return children_of_interior(page)[interior_slot_for_key(page, key)]
+
+
+
+
+def children_of_interior(page: PageBody) -> list[int]:
+    """Every child pointer on an INTERIOR_TABLE page, left to right.
+
+
+    Args:
+        page: page.page_type must be PageType.INTERIOR_TABLE.
+    Returns:
+        len(page.cells) + 1 page numbers: each cell's child_page in order,
+        then page.right_child last. Index i covers keys <= cells[i]'s
+        separator (and > cells[i - 1]'s, if any); the final entry -- at
+        index len(page.cells), the same index interior_slot_for_key()
+        returns when every separator is < key -- covers everything past
+        the last separator. TableCursor uses this to enumerate siblings
+        while walking a level, which child_for_key alone can't do.
+    """
+    return [decode_interior_table_cell(cell)[0] for cell in page.cells] + [page.right_child]
+
+
+
+
+def interior_slot_for_key(page: PageBody, key: int) -> int:
+    """The binary search child_for_key is built on, minus the final lookup.
+
+
+    Args:
+        page: same restriction as child_for_key.
+        key: the rowid being searched for.
+    Returns:
+        The index into children_of_interior(page) that child_for_key would
+        return -- i.e. an index in [0, len(page.cells)], where
+        len(page.cells) means every separator was < key. Split out from
+        child_for_key so TableCursor can record *which slot* it descended
+        through (needed to resume and advance later), not just where that
+        slot led.
+    """
+    # This is a boundary search, not an exact-match one: narrow [lo, hi) to
+    # the leftmost index whose separator is >= key. `key <= separator` keeps
+    # mid as a candidate (hi = mid) -- that's the §6.1 convention, an equal
+    # separator must stay a candidate so an exact match still resolves left,
+    # not past it.
     cells = page.cells
     lo, hi = 0, len(cells)
 
@@ -97,12 +137,38 @@ def child_for_key(page: PageBody, key: int) -> int:
             lo = mid + 1
 
 
-    # lo == len(cells) means every separator was < key -- nothing left of
-    # right_child qualifies. Otherwise lo is the winning cell's index.
-    if lo == len(cells):
-        return page.right_child
-    child_page, _ = decode_interior_table_cell(cells[lo])
-    return child_page
+    return lo
 
 
 
+
+def leaf_slot_lower_bound(page: PageBody, key: int) -> int:
+    """The leftmost index in page.cells whose rowid is >= key.
+
+
+    Args:
+        page: page.page_type must be PageType.LEAF_TABLE.
+        key: the rowid being searched for.
+    Returns:
+        An index in [0, len(page.cells)]. Unlike binary_search_leaf (exact
+        match or None), this always returns a position -- len(page.cells)
+        means every rowid on this page is < key, so the smallest key >=
+        `key`, if it exists at all, is on a page further right.
+        TableCursor.seek() uses this: it's the same binary search, just
+        keeping the boundary §6.1 already said binary search gives you for
+        free, instead of throwing it away on a miss.
+    """
+    cells = page.cells
+    lo, hi = 0, len(cells)
+
+
+    while lo < hi:
+        mid = lo + (hi - lo) // 2
+        rowid, *_ = decode_leaf_table_cell(cells[mid])
+        if key <= rowid:
+            hi = mid
+        else:
+            lo = mid + 1
+
+
+    return lo

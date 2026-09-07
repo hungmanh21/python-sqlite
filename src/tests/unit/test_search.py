@@ -4,7 +4,12 @@ from hypothesis import strategies as st
 
 
 from quilldb.btree.cells import encode_interior_table_cell, encode_leaf_table_cell
-from quilldb.btree.search import binary_search_leaf, child_for_key
+from quilldb.btree.search import (
+    binary_search_leaf,
+    child_for_key,
+    children_of_interior,
+    leaf_slot_lower_bound,
+)
 from quilldb.constants import PageType
 from quilldb.storage.page import PageBody
 
@@ -148,3 +153,59 @@ def test_matches_linear_scan_oracle_interior(separators: list[int], probe: int) 
 
 
 
+
+# =====================================================================
+# children_of_interior -- the enumeration TableCursor needs that
+# child_for_key alone can't give it (§6.3's "children() helper").
+# =====================================================================
+
+
+
+
+def test_children_of_interior_is_cells_then_right_child() -> None:
+    page = _standard_interior_page()
+    assert children_of_interior(page) == [100, 200, 300, 400]
+
+
+
+
+def test_children_of_interior_with_no_cells_is_just_right_child() -> None:
+    page = PageBody(PageType.INTERIOR_TABLE, cells=[], right_child=42)
+    assert children_of_interior(page) == [42]
+
+
+
+
+# =====================================================================
+# leaf_slot_lower_bound -- same binary search as binary_search_leaf, but it
+# never discards the boundary on a miss (§6.1: "the same code path as
+# seek()"). Matched against a linear-scan oracle, same as the other two.
+# =====================================================================
+
+
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_index"),
+    [(5, 0), (10, 0), (11, 1), (20, 1), (21, 2), (30, 2), (31, 3), (999, 3)],
+)
+def test_leaf_slot_lower_bound_boundary_and_range(key: int, expected_index: int) -> None:
+    page = _leaf_page([10, 20, 30])
+    assert leaf_slot_lower_bound(page, key) == expected_index
+
+
+
+
+def test_leaf_slot_lower_bound_empty_page_is_zero() -> None:
+    assert leaf_slot_lower_bound(_leaf_page([]), 5) == 0
+
+
+
+
+@given(st.lists(st.integers(min_value=0, max_value=10_000), min_size=0, max_size=50, unique=True))
+def test_leaf_slot_lower_bound_matches_linear_scan_oracle(rowids: list[int]) -> None:
+    rowids = sorted(rowids)
+    page = _leaf_page(rowids)
+    for probe in [*rowids, -1, 10_001]:
+        expected = next((i for i, r in enumerate(rowids) if r >= probe), len(rowids))
+        assert leaf_slot_lower_bound(page, probe) == expected
