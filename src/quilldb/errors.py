@@ -73,6 +73,8 @@ class PageFullError(QuillDBError):
     """Not enough room on a page. Internal control flow — triggers a split."""
 
 
+class DuplicateRowIDError(QuillDBError):
+    """insert() was asked to add a rowid that's already in the tree."""
 
 
 class PoolExhaustedError(QuillDBError):

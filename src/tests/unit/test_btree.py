@@ -2,10 +2,16 @@ import pytest
 
 
 from quilldb.btree.btree import BTree
-from quilldb.btree.cells import encode_interior_table_cell, encode_leaf_table_cell
+from quilldb.btree.cells import (
+    decode_leaf_table_cell,
+    encode_interior_table_cell,
+    encode_leaf_table_cell,
+)
 from quilldb.constants import PageType
+from quilldb.errors import DuplicateRowIDError, PageFullError
 from quilldb.storage.bufferpool import BufferPool
-from quilldb.storage.page import PageBody, serialize_page
+from quilldb.storage.overflow import read_overflow_chain
+from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
 
 
@@ -154,3 +160,203 @@ def test_search_does_not_leak_pins(pager, pool) -> None:
 
 
 
+
+# =====================================================================
+# insert -- easy case only (§6.4 session 5): sorted placement into an
+# existing leaf. No split; a full leaf must raise, not make room.
+# =====================================================================
+
+
+
+
+def _build_full_leaf(pager: Pager, pool: BufferPool) -> tuple[BTree, int, int]:
+    """A single-leaf tree, packed cell by cell until one more won't fit.
+
+
+    Returns (tree, leaf_page_id, next_rowid) where next_rowid is guaranteed
+    to be the first insert that raises PageFullError -- however many cells
+    that took, so the test never has to reason about varint sizes by hand.
+    """
+    body = PageBody(PageType.LEAF_TABLE)
+    rowid = 1
+    while body.fits(len(_leaf_cell(rowid))):
+        body.insert_cell(body.cell_count, _leaf_cell(rowid))
+        rowid += 1
+    leaf = _write_page(pager, pool, body)
+    return BTree(pager, pool, leaf), leaf, rowid
+
+
+
+
+def test_insert_into_empty_leaf(pager, pool) -> None:
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE))
+    bt = BTree(pager, pool, leaf)
+
+
+    bt.insert(1, b"hello")
+
+
+    assert bt.search(1) == (leaf, 0)
+
+
+
+
+def test_insert_at_start_middle_and_end_keeps_sorted_order(pager, pool) -> None:
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(10), _leaf_cell(30)]))
+    bt = BTree(pager, pool, leaf)
+
+
+    bt.insert(20, b"middle")  # between existing cells
+    bt.insert(5, b"start")  # before every existing cell
+    bt.insert(40, b"end")  # after every existing cell
+
+
+    raw = pool.get_page(leaf)
+    body = parse_page(raw)
+    pool.unpin(leaf)
+    rowids = [decode_leaf_table_cell(cell)[0] for cell in body.cells]
+    assert rowids == [5, 10, 20, 30, 40]
+
+
+
+
+def test_insert_routes_through_a_multilevel_tree_to_the_right_leaf(pager, pool) -> None:
+    bt, _, leaf_mid, _ = _build_three_leaf_tree(pager, pool)
+
+
+    bt.insert(13, b"new-row")
+
+
+    assert bt.search(13) == (leaf_mid, 2)
+
+
+
+
+def test_insert_persists_the_exact_payload(pager, pool) -> None:
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE))
+    bt = BTree(pager, pool, leaf)
+    payload = b"a small row"
+
+
+    bt.insert(7, payload)
+
+
+    page_id, slot = bt.search(7)
+    raw = pool.get_page(page_id)
+    body = parse_page(raw)
+    pool.unpin(page_id)
+    assert decode_leaf_table_cell(body.cells[slot]) == (7, len(payload), payload, 0)
+
+
+
+
+def test_insert_spills_an_oversized_payload_to_overflow(pager, pool) -> None:
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE))
+    bt = BTree(pager, pool, leaf)
+    payload = bytes((i * 3) % 256 for i in range(10_000))  # comfortably spills
+
+
+    bt.insert(99, payload)
+
+
+    page_id, slot = bt.search(99)
+    raw = pool.get_page(page_id)
+    body = parse_page(raw)
+    pool.unpin(page_id)
+    rowid, total_len, local_payload, overflow_page = decode_leaf_table_cell(body.cells[slot])
+    assert (rowid, total_len) == (99, len(payload))
+    assert overflow_page != 0
+
+
+    rest = read_overflow_chain(pager, pool, overflow_page, total_len - len(local_payload))
+    assert local_payload + rest == payload
+
+
+
+
+def test_insert_duplicate_rowid_raises_and_leaves_the_page_untouched(pager, pool) -> None:
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(5)]))
+    bt = BTree(pager, pool, leaf)
+
+
+    with pytest.raises(DuplicateRowIDError):
+        bt.insert(5, b"clobber?")
+
+
+    raw = pool.get_page(leaf)
+    body = parse_page(raw)
+    pool.unpin(leaf)
+    assert len(body.cells) == 1
+    assert decode_leaf_table_cell(body.cells[0])[2] == b"row5"  # unchanged
+
+
+
+
+def test_insert_into_a_full_leaf_raises_page_full_error(pager, pool) -> None:
+    bt, _, next_rowid = _build_full_leaf(pager, pool)
+
+
+    with pytest.raises(PageFullError):
+        bt.insert(next_rowid, f"row{next_rowid}".encode())
+
+
+
+
+def test_insert_of_oversized_payload_into_full_leaf_does_not_allocate_orphan_pages(pager, pool) -> None:
+    """A failed insert must not leave its overflow chain unreachable on disk."""
+    bt, _, next_rowid = _build_full_leaf(pager, pool)
+    page_count_before = pager.page_count
+
+
+    with pytest.raises(PageFullError):
+        bt.insert(next_rowid, b"x" * 10_000)
+
+
+    assert pager.page_count == page_count_before
+
+
+
+
+def test_insert_releases_leaf_pin_when_overflow_write_fails(pager, pool, monkeypatch) -> None:
+    """An overflow-write error must not strand the target leaf in the buffer pool."""
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE))
+    pool.flush_all()  # The small pool below must read the initialized leaf from disk.
+    small_pool = BufferPool(pager, capacity=1)
+    bt = BTree(pager, small_pool, leaf)
+
+
+    def fail_overflow_write(*_args, **_kwargs):
+        raise OSError("simulated overflow write failure")
+
+
+    monkeypatch.setattr("quilldb.btree.btree.write_overflow_chain", fail_overflow_write)
+
+
+    with pytest.raises(OSError, match="simulated overflow write failure"):
+        bt.insert(1, b"x" * 10_000)
+
+
+    # This fetch needs to evict the target leaf. It can only do so if insert()
+    # released the leaf pin while propagating the overflow-write exception.
+    other_page = pager.allocate_page()
+    with small_pool.pinned(other_page):
+        pass
+
+
+
+
+def test_insert_does_not_leak_pins(pager) -> None:
+    small_pool = BufferPool(pager, capacity=2)
+    bt, leaf_lo, leaf_mid, _ = _build_three_leaf_tree(pager, small_pool)
+
+
+    bt.insert(13, b"row13")
+    bt.insert(2, b"row2")
+
+
+    # Still usable afterwards -- a leaked pin on the leaf (success path) or on
+    # an ancestor (the duplicate/full-page raise paths) would exhaust capacity=2.
+    with pytest.raises(DuplicateRowIDError):
+        bt.insert(13, b"dup")
+    with small_pool.pinned(leaf_lo), small_pool.pinned(leaf_mid):
+        pass
