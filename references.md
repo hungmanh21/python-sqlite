@@ -12,12 +12,12 @@ when you get stuck.
 ## 0. How To Use This
 
 
-> **Read `docs/theory/` first for weeks 1–2.** Chapters 00–06 there already contain the *content* of
-> most of the week 1–2 reading below — varint and record format, slotted pages, buffer pool policy,
-> B+tree fanout and splits, overflow thresholds — worked through from first principles with the
-> primary sources quoted and cited. That's ~4.5 hours and it comes *out of* the budget below rather
-> than adding to it. Use the entries below when you want the primary text itself, or when the theory
-> chapter points you at one.
+> **Read `docs/theory/` first for weeks 1–3.** Chapters 00–09 there already contain the *content* of
+> most of the week 1–3 reading below — storage, B+tree mechanics, the SQL frontend, catalog and
+> binding, and iterator execution — worked through from first principles with the primary sources
+> quoted and cited. That's ~6.5 hours and it comes *out of* the budget below rather than adding to
+> it. Use the entries below when you want the primary text itself, or when a theory chapter points
+> you at one.
 
 
 **Reading budget: ~12 hours total across 8 weeks — about 10% of build time.** Each week has 60–90
@@ -446,6 +446,4 @@ Three caveats:
   stable URL. Search the titles.
 - Books (Petrov, Sciore) and older papers (Graefe, Selinger, Gray, ARIES, Pillai) are cited from
   knowledge by title/author/year rather than by link — those are stable enough to search.
-
-
-
+  
