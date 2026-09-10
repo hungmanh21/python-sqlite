@@ -65,10 +65,10 @@ that order*, the answer is in `docs/theory/txn/`.
 | [`btree/`](btree/) | `btree/` — `btree`, `cells`, `cursor`, `split`, `index` | 05, 06, 10, 11 |
 | [`sql/`](sql/) | `sql/` — `tokenizer`, `ast`, `parser` | 07 |
 | [`catalog/`](catalog/) | `catalog/` — `schema`, `catalog` — plus `sql/binder.py` | 08 |
-| `plan/` | `plan/` — `planner`, `explain` | 12 |
+| [`plan/`](plan/) | `plan/` — `planner`, `explain` | 12 |
 | [`exec/`](exec/) | `exec/` — `operators`, `expressions`, `join`, `aggregate`, `sort` | 09, 17, 18 |
-| `txn/` | `txn/` — `transaction`, `journal`, `recovery`, `locks` | 13, 14, 15, 16 |
-| `benchmarks/` | `benchmarks/` | 19 |
+| [`txn/`](txn/) | `txn/` — `transaction`, `journal`, `recovery`, `locks` | 13, 14, 15, 16 |
+| [`benchmarks/`](benchmarks/) | `benchmarks/` | 19 |
 
 
 **Chapter numbers are global and follow reading order, so folders have gaps.** `btree/` jumps from
@@ -134,9 +134,9 @@ both halves incomprehensible.
 
 | # | Chapter | What you'll be able to explain afterwards |
 |---|---|---|
-| 10 | Deletion and space reuse — `btree/10-deletion-and-space-reuse.md` | Why deleting a row makes the file bigger before it makes it smaller, what a freeblock is and when it's reclaimable, why SQLite merges siblings and quilldb doesn't, and why databases don't shrink |
-| 11 | Index B-trees — `btree/11-index-b-trees.md` | Why an index is the same B-tree with the payload thrown away, why the rowid is glued onto every key, what makes a covering index twice as fast, and what `WITHOUT ROWID` really changes |
-| 12 | The query planner — `plan/12-the-query-planner.md` | What "sargable" means and why `WHERE lower(x)='a'` can't use an index, the leading-column-no-gaps rule and why gaps are fatal, and what `sqlite_stat1` buys a cost-based planner that a rule-based one can't have |
+| 10 | [Deletion and space reuse](btree/10-deletion-and-space-reuse.md) | Why deleting a row makes the file bigger before it makes it smaller, what a freeblock is and when it's reclaimable, why SQLite merges siblings and quilldb doesn't, and why databases don't shrink |
+| 11 | [Index B-trees](btree/11-index-b-trees.md) | Why an index is the same B-tree with the payload thrown away, why the rowid is glued onto every key, what makes a covering index twice as fast, and what `WITHOUT ROWID` really changes |
+| 12 | [The query planner](plan/12-the-query-planner.md) | What "sargable" means and why `WHERE lower(x)='a'` can't use an index, the leading-column-no-gaps rule and why gaps are fatal, and what `sqlite_stat1` buys a cost-based planner that a rule-based one can't have |
 
 
 ### Part 5 — Week 5: Durability
@@ -144,8 +144,8 @@ both halves incomprehensible.
 
 | # | Chapter | What you'll be able to explain afterwards |
 |---|---|---|
-| 13 | Atomic commit and the journal — `txn/13-atomic-commit-and-the-journal.md` | Why the commit point is *deleting a file*, the exact fsync order and the specific crash each barrier stops, why the journal holds old pages rather than new ones, and what WAL trades away to be faster |
-| 14 | Crash recovery — `txn/14-crash-recovery.md` | What makes a journal "hot," why replay must be idempotent, why crashing *during* recovery is the case that finds real bugs, and how to turn a durability claim into evidence |
+| 13 | [Atomic commit and the journal](txn/13-atomic-commit-and-the-journal.md) | Why the commit point is *deleting a file*, the exact fsync order and the specific crash each barrier stops, why the journal holds old pages rather than new ones, and what WAL trades away to be faster |
+| 14 | [Crash recovery](txn/14-crash-recovery.md) | What makes a journal "hot," why replay must be idempotent, why crashing *during* recovery is the case that finds real bugs, and how to turn a durability claim into evidence |
 
 
 ### Part 6 — Week 6: Concurrency
@@ -153,8 +153,8 @@ both halves incomprehensible.
 
 | # | Chapter | What you'll be able to explain afterwards |
 |---|---|---|
-| 15 | Isolation and the anomalies — `txn/15-isolation-and-anomalies.md` | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly |
-| 16 | Locking, 2PL, and deadlock — `txn/16-locking-and-deadlock.md` | Why the *second* phase of two-phase locking is the load-bearing half, locks vs. latches, deadlock detection vs. avoidance vs. prevention, and why SQLite's 5-state ladder needs `PENDING` |
+| 15 | [Isolation and the anomalies](txn/15-isolation-and-anomalies.md) | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly |
+| 16 | [Locking, 2PL, and deadlock](txn/16-locking-and-deadlock.md) | Why the *second* phase of two-phase locking is the load-bearing half, locks vs. latches, deadlock detection vs. avoidance vs. prevention, and why SQLite's 5-state ladder needs `PENDING` |
 
 
 ### Part 7 — Week 7: Query Processing
@@ -162,8 +162,8 @@ both halves incomprehensible.
 
 | # | Chapter | What you'll be able to explain afterwards |
 |---|---|---|
-| 17 | Joins — `exec/17-joins.md` | Why a join is a nested loop before it's anything else, what an index turns the inner loop into, when hash and merge joins win, and why SQLite ships only one join algorithm on purpose |
-| 18 | Sorting and aggregation — `exec/18-sorting-and-aggregation.md` | How to sort more data than you have RAM, why an index can delete the sort step entirely, sort-based vs. hash-based grouping, and why `LIMIT` changes the algorithm rather than just the output |
+| 17 | [Joins](exec/17-joins.md) | Why a join is a nested loop before it's anything else, what an index turns the inner loop into, when hash and merge joins win, and why SQLite ships only one join algorithm on purpose |
+| 18 | [Sorting and aggregation](exec/18-sorting-and-aggregation.md) | How to sort more data than you have RAM, why an index can delete the sort step entirely, sort-based vs. hash-based grouping, and why `LIMIT` changes the algorithm rather than just the output |
 
 
 ### Part 8 — Week 8: Presentation
@@ -171,7 +171,7 @@ both halves incomprehensible.
 
 | # | Chapter | What you'll be able to explain afterwards |
 |---|---|---|
-| 19 | Measuring it — `benchmarks/19-measuring-it.md` | Why you report page reads and not milliseconds, how warm caches produce numbers that are real but meaningless, and how to state a result an interviewer can't poke a hole in |
+| 19 | [Measuring it](benchmarks/19-measuring-it.md) | Why you report page reads and not milliseconds, how warm caches produce numbers that are real but meaningless, and how to state a result an interviewer can't poke a hole in |
 
 
 ---

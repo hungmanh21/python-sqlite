@@ -11,7 +11,8 @@
 > analogies, breaks each week into ~7 two-hour sessions, and has a glossary. This file is the terse
 > planning reference; `guide.md` is the teaching version. `references.md` has the annotated reading
 > list, and **`docs/theory/` has the actual theory** — the physics, the design space, and why SQLite
-> chose what it chose, with primary sources. Chapters 00–06 (foundations, weeks 1–2) are written.
+> chose what it chose, with primary sources. All twenty chapters (00–19) are written, and
+> `docs/theory/` mirrors `src/quilldb/` so each folder explains the package it's named after.
 
 
 ---
@@ -613,23 +614,30 @@ problem, and it's why week 5 comes next.
 
 
 **Role in SQLite.** Index B-trees use the *same* `btree.c` code, keyed by
-`(indexed columns…, rowid)` with no separate payload. So an index lookup gets you a rowid, and then
-a *second* B-tree search fetches the actual row — which is precisely why covering indexes are ~2×
-faster: one search instead of two. The planner is `where.c`, roughly 10k lines, and it's
-**cost-based**, consuming statistics that `ANALYZE` writes into `sqlite_stat1`. Yours is rule-based,
-which is the right call at this scale and an honest thing to say.
+`(indexed columns…, rowid)` — and that key is a **standard record**, so the trailing rowid is a
+record field with an integer serial type, not a bare varint. An index lookup gets you a rowid, and
+then a *second* B-tree search fetches the actual row, which is precisely why covering indexes are
+~2× faster: one search instead of two. The planner is `where*.c` — about 13,000 lines across
+`where.c`, `whereexpr.c` and `wherecode.c` — and it's **cost-based**, consuming statistics that
+`ANALYZE` writes into `sqlite_stat1`. (For a citation, use `queryplanner-ng.html`, which names the
+cost model and the N-nearest-neighbours search; `arch.html` never says "cost-based.") Yours is
+rule-based, which is the right call at this scale and an honest thing to say.
 
 
 SQLite's index-usability rule is documented in `optoverview.html` §2 and is exactly what you should
-implement: leading columns need `=`, `IN`, or `IS`; the right-most used column may take inequalities;
-**no gaps allowed**. There's a worked table of which `WHERE` clauses can use `ex1(a,b,c,d,…)` — steal
-its logic directly.
+implement: leading columns need `=`, `IN`, or `IS`; the right-most used column may take inequalities
+(up to two, sandwiching a range); **no gaps allowed**. There's a worked table of which `WHERE`
+clauses can use `ex1(a,b,c,…,z)` — steal its logic directly. One documented exception you should
+*not* implement but should know about: the **skip-scan**, where SQLite synthesizes a missing leading
+equality by iterating that column's distinct values. It only happens on an analyzed database, which
+is a nice demonstration that statistics don't just re-rank plans, they unlock plans that are
+otherwise unavailable. See chapter 12 §12.4.
 
 
 | Task | Hours |
 |---|---|
 | `DELETE` + `UPDATE` parsing, `Delete`/`Update` operators | 2 |
-| B+tree delete: remove cell, repack, free emptied pages to the freelist (no merge — documented) | 2 |
+| B+tree delete: remove cell, repack, free emptied pages to the freelist (no sibling merge — SQLite merges below ⅓ occupancy; chapter 10 §10.3 documents the gap) | 2 |
 | Index B+trees: key = `(indexed values..., rowid)`, lexicographic comparison | 2.5 |
 | `CREATE INDEX`, `CREATE UNIQUE INDEX`, uniqueness violation errors | 1.5 |
 | Index maintenance on insert/update/delete | 1.5 |
@@ -1219,8 +1227,3 @@ That turns out not to be a party trick. It's a free reference implementation to 
 run, which is the single strongest quality lever available to a project this size. You keep the
 interesting internals, you keep the format, you drop the expensive direction of the interop — and you
 gain something you can hand someone and say *"try it, then open it in sqlite3."*
-
-
-
-
-
