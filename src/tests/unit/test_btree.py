@@ -8,7 +8,7 @@ from quilldb.btree.cells import (
     encode_leaf_table_cell,
 )
 from quilldb.constants import PageType
-from quilldb.errors import DuplicateRowIDError, PageFullError
+from quilldb.errors import DuplicateRowIDError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import read_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
@@ -162,28 +162,9 @@ def test_search_does_not_leak_pins(pager, pool) -> None:
 
 
 # =====================================================================
-# insert -- easy case only (§6.4 session 5): sorted placement into an
-# existing leaf. No split; a full leaf must raise, not make room.
+# insert -- sorted placement into an existing leaf. Splitting a full leaf
+# is covered separately in test_btree_splits.py.
 # =====================================================================
-
-
-
-
-def _build_full_leaf(pager: Pager, pool: BufferPool) -> tuple[BTree, int, int]:
-    """A single-leaf tree, packed cell by cell until one more won't fit.
-
-
-    Returns (tree, leaf_page_id, next_rowid) where next_rowid is guaranteed
-    to be the first insert that raises PageFullError -- however many cells
-    that took, so the test never has to reason about varint sizes by hand.
-    """
-    body = PageBody(PageType.LEAF_TABLE)
-    rowid = 1
-    while body.fits(len(_leaf_cell(rowid))):
-        body.insert_cell(body.cell_count, _leaf_cell(rowid))
-        rowid += 1
-    leaf = _write_page(pager, pool, body)
-    return BTree(pager, pool, leaf), leaf, rowid
 
 
 
@@ -288,31 +269,6 @@ def test_insert_duplicate_rowid_raises_and_leaves_the_page_untouched(pager, pool
     pool.unpin(leaf)
     assert len(body.cells) == 1
     assert decode_leaf_table_cell(body.cells[0])[2] == b"row5"  # unchanged
-
-
-
-
-def test_insert_into_a_full_leaf_raises_page_full_error(pager, pool) -> None:
-    bt, _, next_rowid = _build_full_leaf(pager, pool)
-
-
-    with pytest.raises(PageFullError):
-        bt.insert(next_rowid, f"row{next_rowid}".encode())
-
-
-
-
-def test_insert_of_oversized_payload_into_full_leaf_does_not_allocate_orphan_pages(pager, pool) -> None:
-    """A failed insert must not leave its overflow chain unreachable on disk."""
-    bt, _, next_rowid = _build_full_leaf(pager, pool)
-    page_count_before = pager.page_count
-
-
-    with pytest.raises(PageFullError):
-        bt.insert(next_rowid, b"x" * 10_000)
-
-
-    assert pager.page_count == page_count_before
 
 
 
