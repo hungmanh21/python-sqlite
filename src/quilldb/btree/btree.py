@@ -31,11 +31,25 @@ from quilldb.btree.split import (
     split_interior_cells,
 )
 from quilldb.constants import PageType
-from quilldb.errors import DuplicateRowIDError
+from quilldb.errors import DuplicateRowIDError, PageFullError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import write_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
+
+
+
+
+def _fits_one_leaf_page(cells: list[bytes]) -> bool:
+    """Would `cells` (in this order) serialize into one LEAF_TABLE page?
+
+
+    Mirrors the exact bound serialize_page() enforces, checked ahead of
+    time so a caller can raise a clear error before writing anything,
+    rather than letting PageFullError surface from deep inside
+    serialize_page() itself after a page's already been allocated for it.
+    """
+    return PageBody(PageType.LEAF_TABLE, cells=cells).free_bytes() >= 0
 
 
 
@@ -256,34 +270,89 @@ class BTree:
             keys = [decode_leaf_table_cell(cell)[0] for cell in body.cells]
 
 
+            # is_rightmost (positional: is this leaf reached via the
+            # parent's right_child, not a separator cell) governs how the
+            # PARENT gets updated below -- that's purely structural and
+            # must stay positional. use_append_split additionally requires
+            # rowid to actually be the new max on this leaf: that's the
+            # narrower, safety-relevant condition split_cells' peel-just-
+            # one-cell fast path actually depends on (see split.py) --
+            # position alone doesn't guarantee THIS insert is the append
+            # case, only that the leaf is the tree's rightmost one.
             is_rightmost = parent is None or parent[3] == len(parent[2].cells)
-            left_cells, right_cells, separator = split_cells(body.cells, keys, is_rightmost)
+            use_append_split = is_rightmost and (not keys or rowid > keys[-1])
+
+
+            local_len = local_payload_size(PageType.LEAF_TABLE, len(payload))
+            local_payload = payload[:local_len]
+            spills = local_len < len(payload)
+
+
+            # Placeholder overflow pointer for sizing only -- same trick
+            # insert()'s easy case uses: a real overflow page number and
+            # this sentinel both encode to the same fixed 4 bytes, so the
+            # cell's size (and therefore whether a split even succeeds) is
+            # already decided before the chain exists. Deferring the real
+            # write until after the split-feasibility check below means a
+            # split that turns out to be impossible (see next comment)
+            # never leaves an orphaned overflow chain behind.
+            new_cell = encode_leaf_table_cell(rowid, len(payload), local_payload, overflow_page=1 if spills else 0)
+
+
+            # Build the FULL sorted cell list -- existing cells plus the
+            # pending row -- before splitting, rather than splitting
+            # body.cells alone and inserting new_cell into whichever half
+            # falls out. split_cells' byte-aware balancing can only weigh
+            # what it's given: balancing body.cells alone still leaves it
+            # blind to new_cell's own size, and a half that looked
+            # comfortably balanced without it can overflow once it lands.
+            # insert_slot is where the new cell belongs in the ORIGINAL,
+            # unsplit, sorted list -- same index split_cells' caller would
+            # have used had the leaf not been full.
+            _, insert_slot = path[-1]
+            combined_cells = body.cells[:insert_slot] + [new_cell] + body.cells[insert_slot:]
+            combined_keys = keys[:insert_slot] + [rowid] + keys[insert_slot:]
+            left_cells, right_cells, separator = split_cells(combined_cells, combined_keys, use_append_split)
+
+
+            # A leaf's cells stay in sorted key order, so a two-way split
+            # can only cut at ONE contiguous boundary -- it can't skip over
+            # a too-big cell to pair its smaller neighbors together
+            # instead. When one cell is large enough that it doesn't fit
+            # on a page alongside EITHER neighbor, no boundary works: every
+            # split_cells() candidate was already tried by its byte-aware
+            # search, so if the one it picked doesn't fit, none would.
+            # Real three-way rebalancing is the actual fix and is out of
+            # scope here (see docs/theory README's "implementation gaps");
+            # this at least fails before anything is written, with a
+            # message that explains why, instead of a bare PageFullError
+            # surfacing from inside serialize_page after a page's already
+            # been allocated for the doomed half.
+            if not (_fits_one_leaf_page(left_cells) and _fits_one_leaf_page(right_cells)):
+                raise PageFullError(
+                    "cannot split this leaf: a cell is too large to fit on either side of a "
+                    "two-way split next to its neighbors -- this needs three-way rebalancing, "
+                    "which isn't implemented"
+                )
+
+
+            # The split is going to succeed -- now it's safe to actually
+            # write the overflow chain and swap the placeholder cell for
+            # the real one. Same encoded length either way (see above), so
+            # it replaces cleanly at whichever index it landed on.
+            if spills:
+                overflow_page = write_overflow_chain(self.pager, self.pool, payload[local_len:])
+                real_cell = encode_leaf_table_cell(rowid, len(payload), local_payload, overflow_page)
+                if insert_slot < len(left_cells):
+                    left_cells[insert_slot] = real_cell
+                else:
+                    right_cells[insert_slot - len(left_cells)] = real_cell
 
 
             new_left_cell = b""
             if parent is not None:
                 new_left_cell = encode_interior_table_cell(page_id, separator)
                 parent_has_room = parent[2].fits(len(new_left_cell))
-
-
-            local_len = local_payload_size(PageType.LEAF_TABLE, len(payload))
-            overflow_page = (
-                write_overflow_chain(self.pager, self.pool, payload[local_len:])
-                if local_len < len(payload)
-                else 0
-            )
-            new_cell = encode_leaf_table_cell(rowid, len(payload), payload[:local_len], overflow_page)
-
-
-            # insert_slot is where the new cell would land in the ORIGINAL,
-            # unsplit, sorted list -- so it's < len(left_cells) exactly when
-            # the new key is smaller than every key that moved right.
-            _, insert_slot = path[-1]
-            if insert_slot < len(left_cells):
-                left_cells = left_cells[:insert_slot] + [new_cell] + left_cells[insert_slot:]
-            else:
-                right_slot = insert_slot - len(left_cells)
-                right_cells = right_cells[:right_slot] + [new_cell] + right_cells[right_slot:]
 
 
             right_page_id = self.pager.allocate_page()
@@ -459,18 +528,26 @@ class BTree:
                     combined_right_child = body.right_child
 
 
-                if level == 0:
-                    # The root has no parent to be "rightmost" relative to
-                    # -- default to the same append-heavy fast path
-                    # _split_leaf() already defaults to for a leaf root.
-                    is_own_rightmost = True
-                else:
-                    grandparent_id, grandparent_slot = path[level - 1]
-                    grandparent_raw = self.pool.get_page(grandparent_id)
-                    try:
-                        is_own_rightmost = grandparent_slot == len(parse_page(grandparent_raw).cells)
-                    finally:
-                        self.pool.unpin(grandparent_id)
+                # is_own_rightmost asks a narrower question than "is
+                # page_id positionally its own parent's rightmost child" --
+                # it asks whether THIS promotion lands at the tail of
+                # page_id's own cells (child_slot == len(body.cells)).
+                # That's exactly the condition _find_leaf()'s descent
+                # already guarantees means "separator is greater than
+                # every separator page_id currently holds" (§6.1's
+                # boundary convention, one level up) -- which is what
+                # makes split_interior_cells' peel-just-the-new-cell fast
+                # path safe here: the tail of combined_cells IS
+                # new_left_cell itself, so peeling it exactly restores
+                # page_id to the valid, fits-in-a-page state it was in
+                # before this promotion arrived. Checking position
+                # instead (an earlier version of this method did) can be
+                # wrong in both directions: page_id can be its parent's
+                # rightmost child while this specific promotion lands in
+                # the MIDDLE of page_id's own cells (unsafe to peel), or
+                # vice versa (safe to peel, but position alone would have
+                # said no and taken the slower balanced split instead).
+                is_own_rightmost = child_slot == len(body.cells)
 
 
                 new_left_cells, new_left_right_child, new_right_cells, new_right_right_child, new_separator = (

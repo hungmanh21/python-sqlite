@@ -12,6 +12,7 @@ from quilldb.btree.cells import (
     encode_leaf_table_cell,
 )
 from quilldb.constants import PageType
+from quilldb.errors import PageFullError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
@@ -274,3 +275,52 @@ def test_leaf_split_cascades_into_a_full_interior_root_and_grows_the_tree(pager,
     # level, it didn't just reshuffle the leaf level.
     assert _read_page(pool, left_page).page_type is PageType.INTERIOR_TABLE
     assert _read_page(pool, right_page).page_type is PageType.INTERIOR_TABLE
+
+
+
+
+# =====================================================================
+# The two-way-split ceiling: leaf cells stay in sorted key order, so a
+# split can only cut at one contiguous boundary. A cell too large to fit
+# on a page next to EITHER neighbor has no valid boundary at all -- true
+# three-way rebalancing is the actual fix and is out of scope, but this
+# must fail loudly and cleanly, not crash from inside serialize_page
+# after a page's already been allocated for the doomed half.
+# =====================================================================
+
+
+
+
+def test_insert_raises_cleanly_when_no_two_way_split_exists(pager, pool) -> None:
+    """Two existing cells sized so the incoming third cell, landing between
+    them, overflows a page paired with EITHER neighbor -- neither possible
+    split boundary works.
+    """
+    payload_a = b"a" * 1900  # rowid 1
+    payload_b = b"b" * 1020  # rowid 3
+    leaf = _write_page(
+        pager,
+        pool,
+        PageBody(
+            PageType.LEAF_TABLE,
+            cells=[
+                encode_leaf_table_cell(1, len(payload_a), payload_a),
+                encode_leaf_table_cell(3, len(payload_b), payload_b),
+            ],
+        ),
+    )
+    tree = BTree(pager, pool, leaf)
+    page_count_before = pager.page_count
+
+
+    with pytest.raises(PageFullError):
+        tree.insert(2, b"c" * 3280)  # rowid 2 -- sorts between them, too big for either side
+
+
+    assert pager.page_count == page_count_before  # nothing allocated on the failure path
+
+
+    body = _read_page(pool, leaf)
+    assert _rowids(body) == [1, 3]  # leaf left completely untouched
+    assert decode_leaf_table_cell(body.cells[0])[2] == payload_a
+    assert decode_leaf_table_cell(body.cells[1])[2] == payload_b

@@ -9,30 +9,37 @@ dependencies = [
     "pytest>=9.1.1",
 ]
 
+
 [project.scripts]
 quilldb = "quilldb.cli:main"
+
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: exercises the tree at real scale (100k+ inserts); excluded by default, run with `pytest -m slow`"]
+addopts = "-m 'not slow'"
+
 
 [tool.mypy]
 strict = true
 files = ["src"]
 
+
 [tool.ruff]
 line-length = 100
+
 
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",
     "ruff>=0.16.6",
 ]
-
-

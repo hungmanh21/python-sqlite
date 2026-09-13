@@ -52,31 +52,63 @@ def split_cells(
             left_cells + right_cells == cells, in order -- nothing added,
             dropped, or reordered. separator == keys[len(left_cells) - 1],
             the largest key ending up in left_cells, per §6.1's boundary
-            convention. When is_rightmost is False and len(cells) is odd,
-            the extra cell goes to left_cells.
+            convention. When is_rightmost is False, left_size is chosen so
+            each half's serialized footprint (not just its cell count) is
+            as close to half the total as possible -- see
+            _closest_to_half_by_bytes. Ties favor left_cells.
     Raises:
         ValueError: fewer than 2 cells -- there's nothing to usefully split.
     """
-    # TODO(human)
     if len(cells) < 2:
         raise ValueError("Cannot split a leaf with only 1 cell")
-   
-    left_cells, right_cells = [], []
-   
+
+
     if is_rightmost:
         left_size = len(cells) - 1
-        left_cells = cells[:left_size]
-        right_cells = [cells[-1]]
-   
     else:
-        left_size = (len(cells) + 1) // 2
-        left_cells = cells[:left_size]
-        right_cells = cells[left_size:]
-       
-    seperator = keys[left_size - 1]
+        left_size = _closest_to_half_by_bytes(cells)
 
 
-    return (left_cells, right_cells, seperator)
+    left_cells = cells[:left_size]
+    right_cells = cells[left_size:]
+    separator = keys[left_size - 1]
+
+
+    return (left_cells, right_cells, separator)
+
+
+
+
+def _closest_to_half_by_bytes(cells: list[bytes]) -> int:
+    """The left_size in [1, len(cells) - 1] whose left half's serialized
+    footprint (cell bytes + its 2-byte pointer, matching PageBody.fits())
+    is closest to half of `cells`' total footprint. Ties -- which only
+    happen with identically-sized cells -- favor the LARGER left_size,
+    matching split_cells' pre-existing "left gets the extra cell on an odd
+    count" convention.
+
+
+    Cell size is NOT uniform here the way a plain cell-count halving
+    assumes: cells.py's two's-complement varint encoding makes a very
+    negative rowid/separator's cell up to 9x bigger than a small positive
+    one's. A pure count-based split can leave one half still short of room
+    for whatever happens to land there -- a byte-aware split is what
+    actually guarantees each half got roughly its fair share of the space.
+    """
+    sizes = [len(cell) + 2 for cell in cells]
+    target = sum(sizes) / 2
+
+
+    running = 0
+    best_size, best_diff = 1, None
+    for left_size in range(1, len(cells)):
+        running += sizes[left_size - 1]
+        diff = abs(running - target)
+        if best_diff is None or diff <= best_diff:
+            best_size, best_diff = left_size, diff
+
+
+    return best_size
 
 
 
@@ -136,39 +168,14 @@ def split_interior_cells(
             always the page's original right_child -- the split never
             touches the rightmost subtree, only which page owns the
             pointer to it. When is_rightmost is True, m == len(cells) - 1
-            (right_cells comes out empty). When is_rightmost is False,
-            m is near the middle -- exact tie-breaking on an odd cell
-            count is your call; document whichever you pick.
+            (right_cells comes out empty). When is_rightmost is False, m
+            is chosen so cells[:m] and cells[m + 1:] end up as close in
+            serialized footprint as possible -- see
+            _consume_closest_to_half_by_bytes. Ties favor a larger m.
     Raises:
         ValueError: fewer than 2 cells -- there's nothing to usefully
             split (mirrors split_cells).
     """
-    # TODO(human)
-    #
-    # - Guard: if len(cells) < 2, raise ValueError (mirrors split_cells).
-    #
-    # - Pick m, the index of the cell that gets consumed:
-    #     - is_rightmost=True  -> m = len(cells) - 1 (peel just the last
-    #       cell; right_cells ends up empty)
-    #     - is_rightmost=False -> m = somewhere near the middle. Same
-    #       odd/even tie-break question as split_cells -- your call,
-    #       document whichever you pick.
-    #
-    # - Read off cell m BEFORE slicing it out of anything:
-    #     separator        = keys[m]
-    #     left_right_child = children[m]
-    #
-    # - Slice around m -- note the "+1", unlike split_cells' plain
-    #   left_size boundary, because index m itself belongs to neither half:
-    #     left_cells  = cells[:m]
-    #     right_cells = cells[m + 1:]
-    #
-    # - right_right_child is always the page's ORIGINAL right_child,
-    #   unchanged -- the split never touches the rightmost subtree.
-    #
-    # - Return (left_cells, left_right_child, right_cells,
-    #   right_right_child, separator) -- that exact order, matching the
-    #   function's declared return type.
     if len(cells) < 2:
         raise ValueError("not enough cells to split")
 
@@ -176,14 +183,50 @@ def split_interior_cells(
     if is_rightmost:
         m = len(cells) - 1
     else:
-        m = (len(cells) + 1) // 2
-   
-    seperator = keys[m]
+        m = _consume_closest_to_half_by_bytes(cells)
+
+
+    separator = keys[m]
     left_right_child = children[m]
-   
+
+
     left_cells = cells[:m]
-    right_cells = cells[m+1:]
-   
+    right_cells = cells[m + 1 :]
+
+
     right_right_child = right_child
-   
-    return (left_cells, left_right_child, right_cells, right_right_child, seperator)
+
+
+    return (left_cells, left_right_child, right_cells, right_right_child, separator)
+
+
+
+
+def _consume_closest_to_half_by_bytes(cells: list[bytes]) -> int:
+    """The consumed index m in [0, len(cells) - 1] whose two remaining
+    halves -- cells[:m] and cells[m + 1:] -- end up closest in total
+    serialized footprint. Same reasoning as split_cells' analogous helper:
+    a separator's two's-complement varint can be up to 9x bigger than
+    another's, so a plain count-based midpoint doesn't guarantee either
+    half actually got a fair share of the freed bytes. Ties favor a
+    larger m (more cells left), matching split_cells' left-biased
+    tie-break for the same odd/even reason.
+    """
+    sizes = [len(cell) + 2 for cell in cells]
+    total = sum(sizes)
+    prefix = [0]
+    for size in sizes:
+        prefix.append(prefix[-1] + size)
+
+
+    best_m, best_diff = 0, None
+    for m in range(len(cells)):
+        # cells[:m] sums to prefix[m]; cells[m + 1:] sums to total minus
+        # prefix[m + 1] (that slice, plus the consumed cell at m, plus
+        # cells[:m] together make up the whole page).
+        diff = abs(prefix[m] + prefix[m + 1] - total)
+        if best_diff is None or diff <= best_diff:
+            best_m, best_diff = m, diff
+
+
+    return best_m
