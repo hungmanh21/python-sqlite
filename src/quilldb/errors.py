@@ -73,10 +73,15 @@ class PageFullError(QuillDBError):
     """Not enough room on a page. Internal control flow — triggers a split."""
 
 
+class DuplicateRowIDError(QuillDBError):
+    """insert() was asked to add a rowid that's already in the tree."""
+
+
+class PoolExhaustedError(QuillDBError):
+    """A full buffer pool has no unpinned page left to evict."""
+
+
 
 
 class UnsupportedFeatureError(QuillDBError):
     """A valid file using a feature quilldb does not implement."""
-
-
-
