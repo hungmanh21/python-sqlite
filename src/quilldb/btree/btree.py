@@ -26,9 +26,12 @@ from quilldb.btree.search import (
     interior_slot_for_key,
     leaf_slot_lower_bound,
 )
-from quilldb.btree.split import split_cells
+from quilldb.btree.split import (
+    split_cells,
+    split_interior_cells,
+)
 from quilldb.constants import PageType
-from quilldb.errors import DuplicateRowIDError, PageFullError
+from quilldb.errors import DuplicateRowIDError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import write_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
@@ -199,8 +202,7 @@ class BTree:
         self, page_id: int, path: list[tuple[int, int]], rowid: int, payload: bytes
     ) -> None:
         """Split a full leaf, insert the new row into whichever half it
-        belongs on, and promote a separator (§6.4's split, one level only --
-        no cascade into a full parent yet, that's a later task).
+        belongs on, and promote a separator (§6.4's split cascade).
 
 
         `path` came from `_find_leaf()` and holds no pins; this method owns
@@ -218,7 +220,10 @@ class BTree:
         - `len(path) > 1`: the leaf has a parent at `path[-2] = (parent_id,
           child_slot)`. Only ONE new page is allocated (right); `page_id`
           itself is rewritten in place to hold the left half, and the
-          separator is promoted into the parent at `child_slot`.
+          separator is promoted into the parent at `child_slot` -- directly,
+          if the parent has room, or via `_promote_separator()`'s cascade
+          (splitting the parent, and however many ancestors above it, and
+          possibly growing the root) if it doesn't.
 
 
         Args:
@@ -230,11 +235,8 @@ class BTree:
                 have used had the leaf not been full.
             rowid, payload: the row that didn't fit; see insert()'s Args.
         Raises:
-            PageFullError: the parent has no room for the promoted
-                separator. Checked BEFORE any page is written, so a raise
-                here leaves the tree completely untouched -- cascading this
-                into a further split is out of scope here, but failing
-                cleanly instead of destroying the leaf's data isn't.
+            InvalidPageTypeError, MalformedCellError: propagated unchanged
+                from parse_page/decode_* if a page is corrupt.
         """
         raw = self.pool.get_page(page_id)
         leaf_dirty = False
@@ -242,6 +244,7 @@ class BTree:
 
         parent: tuple[int, bytearray, PageBody, int] | None = None
         parent_dirty = False
+        parent_has_room = True
         if len(path) > 1:
             parent_id, child_slot = path[-2]
             parent_raw = self.pool.get_page(parent_id)
@@ -257,19 +260,10 @@ class BTree:
             left_cells, right_cells, separator = split_cells(body.cells, keys, is_rightmost)
 
 
-            # Promoting `separator` is the only parent mutation that can grow
-            # the page (the non-rightmost branch's other edit is a same-size
-            # replace) -- so this is the one check that must happen before
-            # ANY write below. Getting this order wrong means a PageFullError
-            # here would be raised only after the leaf was already
-            # overwritten and the right half's page already allocated,
-            # silently losing whichever cells landed in that orphaned page.
+            new_left_cell = b""
             if parent is not None:
                 new_left_cell = encode_interior_table_cell(page_id, separator)
-                if not parent[2].fits(len(new_left_cell)):
-                    raise PageFullError(
-                        "Cannot promote separator into a full parent; cascading split not implemented"
-                    )
+                parent_has_room = parent[2].fits(len(new_left_cell))
 
 
             local_len = local_payload_size(PageType.LEAF_TABLE, len(payload))
@@ -317,25 +311,215 @@ class BTree:
 
 
             # Non-root split: page_id keeps the left half in place -- only
-            # the right half needed a new page. Promote a separator into
-            # the parent at child_slot.
+            # the right half needed a new page.
             raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=left_cells))
             leaf_dirty = True
 
 
-            _, parent_raw, parent_body, child_slot = parent
-            if is_rightmost:
-                parent_body.insert_cell(child_slot, new_left_cell)
-                parent_body.right_child = right_page_id
-            else:
-                _, old_separator = decode_interior_table_cell(parent_body.cells[child_slot])
-                parent_body.cells[child_slot] = encode_interior_table_cell(right_page_id, old_separator)
-                parent_body.insert_cell(child_slot, new_left_cell)
+            if parent_has_room:
+                # Promote directly into the parent at child_slot.
+                _, parent_raw, parent_body, child_slot = parent
+                if is_rightmost:
+                    parent_body.insert_cell(child_slot, new_left_cell)
+                    parent_body.right_child = right_page_id
+                else:
+                    _, old_separator = decode_interior_table_cell(parent_body.cells[child_slot])
+                    parent_body.cells[child_slot] = encode_interior_table_cell(right_page_id, old_separator)
+                    parent_body.insert_cell(child_slot, new_left_cell)
 
 
-            parent_raw[:] = serialize_page(parent_body)
-            parent_dirty = True
+                parent_raw[:] = serialize_page(parent_body)
+                parent_dirty = True
+            # else: the parent has no room. Leave it untouched here --
+            # _promote_separator() below will re-fetch and split it once
+            # this leaf's own pins are released.
         finally:
             self.pool.unpin(page_id, dirty=leaf_dirty)
             if parent is not None:
                 self.pool.unpin(parent[0], dirty=parent_dirty)
+
+
+        if parent is not None and not parent_has_room:
+            self._promote_separator(path, len(path) - 2, page_id, separator, right_page_id)
+
+
+    def _promote_separator(
+        self,
+        path: list[tuple[int, int]],
+        level: int,
+        left_child: int,
+        separator: int,
+        right_child: int,
+    ) -> None:
+        """Insert `(left_child, separator, right_child)` into the interior
+        page at `path[level]` -- splitting that page, and cascading further
+        up `path`, and growing the root, as many times as it takes (§6.4's
+        "the parent might be full. Then the parent splits, promoting a
+        separator to its parent. Which might also be full. The cascade.").
+
+
+        `_split_leaf()` is the only intended caller, and only when the
+        immediate parent (`path[len(path) - 2]`) has no room for the leaf
+        split's promoted separator -- but this method doesn't lean on that:
+        it re-checks `path[level]` itself, so it's equally correct whether
+        `path[level]` turns out to have room (insert and stop) or not
+        (split, and recurse to `level - 1` with the newly split page's own
+        promotion).
+
+
+        `path[0]` is always `(self.root, ...)` (see `_find_leaf()`), so
+        `level == 0` having no room means the ROOT itself must split --
+        the same "root page number never changes" trick `_split_leaf()`
+        uses for a leaf root, generalized one level up: `self.root` is
+        rewritten in place as a fresh 1-cell INTERIOR_TABLE page, and BOTH
+        halves of its own former content move to freshly allocated pages
+        (unlike a non-root split, which keeps its own page number for the
+        left half -- the root can't, because its page number is needed for
+        the new top of the tree instead).
+
+
+        Args:
+            path: the same root-to-leaf path `_find_leaf()`/`_split_leaf()`
+                used. `path[level]` identifies the interior page this call
+                should insert into (or split to make room in).
+            level: index into `path`. Everything below `level` has already
+                been resolved by the caller (the leaf split, and zero or
+                more interior splits already performed by an earlier
+                iteration of this same cascade).
+            left_child: the page that belongs immediately before
+                `separator` at this level -- the just-split leaf's own
+                page_id on the first call, or an interior page that kept
+                its own left half on a later cascade step.
+            separator: the key being promoted -- from `split_cells()` on
+                the first call, from `split_interior_cells()` on every
+                subsequent one.
+            right_child: the freshly allocated page holding whatever didn't
+                fit alongside `left_child` -- `_split_leaf()`'s
+                right_page_id on the first call, or a freshly allocated
+                interior page on a later cascade step.
+        Raises:
+            InvalidPageTypeError, MalformedCellError: propagated unchanged
+                from parse_page/decode_* if a page is corrupt.
+        """
+        while True:
+            page_id, child_slot = path[level]
+            raw = self.pool.get_page(page_id)
+            dirty = False
+            try:
+                body = parse_page(raw)
+                new_left_cell = encode_interior_table_cell(left_child, separator)
+
+
+                if body.fits(len(new_left_cell)):
+                    # Room here -- same insert-or-swap dance _split_leaf()
+                    # does for its own parent, one level up.
+                    if child_slot == len(body.cells):
+                        body.insert_cell(child_slot, new_left_cell)
+                        body.right_child = right_child
+                    else:
+                        _, old_separator = decode_interior_table_cell(body.cells[child_slot])
+                        body.cells[child_slot] = encode_interior_table_cell(right_child, old_separator)
+                        body.insert_cell(child_slot, new_left_cell)
+                    raw[:] = serialize_page(body)
+                    dirty = True
+                    return
+
+
+                # No room: page_id must split too. Apply the SAME
+                # insert-or-swap dance to freshly built lists first (rather
+                # than splitting body.cells as-is and figuring out
+                # afterward which half the pending cell landed in) --
+                # that turns "split, then place the new cell" into one
+                # combined list plus a single, ordinary split.
+                keys = [decode_interior_table_cell(c)[1] for c in body.cells]
+                children = [decode_interior_table_cell(c)[0] for c in body.cells]
+
+
+                if child_slot == len(body.cells):
+                    combined_cells = [*body.cells, new_left_cell]
+                    combined_keys = [*keys, separator]
+                    combined_children = [*children, left_child]
+                    combined_right_child = right_child
+                else:
+                    old_separator = keys[child_slot]
+                    rewritten_cell = encode_interior_table_cell(right_child, old_separator)
+                    combined_cells = [
+                        *body.cells[:child_slot],
+                        new_left_cell,
+                        rewritten_cell,
+                        *body.cells[child_slot + 1 :],
+                    ]
+                    combined_keys = [*keys[:child_slot], separator, old_separator, *keys[child_slot + 1 :]]
+                    combined_children = [
+                        *children[:child_slot],
+                        left_child,
+                        right_child,
+                        *children[child_slot + 1 :],
+                    ]
+                    combined_right_child = body.right_child
+
+
+                if level == 0:
+                    # The root has no parent to be "rightmost" relative to
+                    # -- default to the same append-heavy fast path
+                    # _split_leaf() already defaults to for a leaf root.
+                    is_own_rightmost = True
+                else:
+                    grandparent_id, grandparent_slot = path[level - 1]
+                    grandparent_raw = self.pool.get_page(grandparent_id)
+                    try:
+                        is_own_rightmost = grandparent_slot == len(parse_page(grandparent_raw).cells)
+                    finally:
+                        self.pool.unpin(grandparent_id)
+
+
+                new_left_cells, new_left_right_child, new_right_cells, new_right_right_child, new_separator = (
+                    split_interior_cells(
+                        combined_cells, combined_keys, combined_children, combined_right_child, is_own_rightmost
+                    )
+                )
+
+
+                new_right_page_id = self.pager.allocate_page()
+                with self.pool.pinned(new_right_page_id, dirty=True) as new_right_raw:
+                    new_right_raw[:] = serialize_page(
+                        PageBody(PageType.INTERIOR_TABLE, cells=new_right_cells, right_child=new_right_right_child)
+                    )
+
+
+                if level == 0:
+                    # Root split: self.root (== page_id) keeps its page
+                    # number and becomes the new top interior page; BOTH
+                    # halves of its own former content move to fresh pages.
+                    new_left_page_id = self.pager.allocate_page()
+                    with self.pool.pinned(new_left_page_id, dirty=True) as new_left_raw:
+                        new_left_raw[:] = serialize_page(
+                            PageBody(
+                                PageType.INTERIOR_TABLE, cells=new_left_cells, right_child=new_left_right_child
+                            )
+                        )
+
+
+                    new_root = PageBody(
+                        PageType.INTERIOR_TABLE,
+                        cells=[encode_interior_table_cell(new_left_page_id, new_separator)],
+                        right_child=new_right_page_id,
+                    )
+                    raw[:] = serialize_page(new_root)
+                    dirty = True
+                    return
+
+
+                # Non-root split: page_id keeps the left half in place --
+                # only the right half needed a new page. Recurse one level
+                # further up with the promoted separator.
+                raw[:] = serialize_page(
+                    PageBody(PageType.INTERIOR_TABLE, cells=new_left_cells, right_child=new_left_right_child)
+                )
+                dirty = True
+            finally:
+                self.pool.unpin(page_id, dirty=dirty)
+
+
+            level -= 1
+            left_child, separator, right_child = page_id, new_separator, new_right_page_id

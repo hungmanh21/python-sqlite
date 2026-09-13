@@ -25,8 +25,6 @@ silently unreachable.
 """
 
 
-
-
 def split_cells(
     cells: list[bytes], keys: list[int], is_rightmost: bool
 ) -> tuple[list[bytes], list[bytes], int]:
@@ -76,5 +74,116 @@ def split_cells(
         right_cells = cells[left_size:]
        
     seperator = keys[left_size - 1]
-   
+
+
     return (left_cells, right_cells, seperator)
+
+
+
+
+def split_interior_cells(
+    cells: list[bytes],
+    keys: list[int],
+    children: list[int],
+    right_child: int,
+    is_rightmost: bool,
+) -> tuple[list[bytes], int, list[bytes], int, int]:
+    """Partition a full interior page's cells into a left and right half,
+    and pick the separator that must be promoted to ITS parent -- the
+    cascading step _split_leaf() doesn't do yet (btree.py, a later task).
+
+
+    This is NOT split_cells() again. A leaf split's separator is a COPY of
+    an existing key -- it stays in left_cells AND gets promoted. An
+    interior split's separator is CONSUMED: one whole cell -- one
+    (child, key) pair -- disappears from both halves. Its key becomes the
+    thing promoted; its child pointer doesn't vanish, it becomes the left
+    half's own right_child (§6.4). Get this backwards -- copy the
+    separator instead of consuming it, or drop the consumed cell's child
+    pointer instead of promoting it as right_child -- and the split still
+    "looks" plausible (right counts, right key order) while quietly
+    losing an entire subtree.
+
+
+    Args:
+        cells: every cell currently on the full interior page, in
+            ascending separator order -- exactly page.cells for an
+            INTERIOR_TABLE (or INTERIOR_INDEX) page.
+        keys: keys[i] is cells[i]'s separator, same order/length as
+            cells. Kept separate from cells (like split_cells' keys) so
+            this function never decodes a cell itself.
+        children: children[i] is cells[i]'s child page number, same
+            order/length as cells -- the other half of what the caller
+            already decoded once to discover the page was full. This
+            function needs it because, unlike split_cells, it can't
+            treat every cell as a fully opaque blob: one cell's child
+            pointer has to survive independently of its (now-promoted)
+            key.
+        right_child: the page's own right_child -- the (N+1)-th child,
+            covering everything past keys[-1]. Not present in `children`.
+        is_rightmost: True if this interior page is itself the rightmost
+            child of ITS OWN parent (reached via right_child, not a
+            separator cell) -- mirrors split_cells' rightmost
+            optimisation: peel off only the last cell instead of
+            splitting near the middle, since an append-heavy insert
+            pattern keeps landing here.
+    Returns:
+        (left_cells, left_right_child, right_cells, right_right_child, separator):
+            Exactly one cell -- call its index `m` -- is consumed:
+            separator == keys[m] and left_right_child == children[m].
+            Every other cell ends up, unchanged, in left_cells (indices
+            < m) or right_cells (indices > m). right_right_child is
+            always the page's original right_child -- the split never
+            touches the rightmost subtree, only which page owns the
+            pointer to it. When is_rightmost is True, m == len(cells) - 1
+            (right_cells comes out empty). When is_rightmost is False,
+            m is near the middle -- exact tie-breaking on an odd cell
+            count is your call; document whichever you pick.
+    Raises:
+        ValueError: fewer than 2 cells -- there's nothing to usefully
+            split (mirrors split_cells).
+    """
+    # TODO(human)
+    #
+    # - Guard: if len(cells) < 2, raise ValueError (mirrors split_cells).
+    #
+    # - Pick m, the index of the cell that gets consumed:
+    #     - is_rightmost=True  -> m = len(cells) - 1 (peel just the last
+    #       cell; right_cells ends up empty)
+    #     - is_rightmost=False -> m = somewhere near the middle. Same
+    #       odd/even tie-break question as split_cells -- your call,
+    #       document whichever you pick.
+    #
+    # - Read off cell m BEFORE slicing it out of anything:
+    #     separator        = keys[m]
+    #     left_right_child = children[m]
+    #
+    # - Slice around m -- note the "+1", unlike split_cells' plain
+    #   left_size boundary, because index m itself belongs to neither half:
+    #     left_cells  = cells[:m]
+    #     right_cells = cells[m + 1:]
+    #
+    # - right_right_child is always the page's ORIGINAL right_child,
+    #   unchanged -- the split never touches the rightmost subtree.
+    #
+    # - Return (left_cells, left_right_child, right_cells,
+    #   right_right_child, separator) -- that exact order, matching the
+    #   function's declared return type.
+    if len(cells) < 2:
+        raise ValueError("not enough cells to split")
+
+
+    if is_rightmost:
+        m = len(cells) - 1
+    else:
+        m = (len(cells) + 1) // 2
+   
+    seperator = keys[m]
+    left_right_child = children[m]
+   
+    left_cells = cells[:m]
+    right_cells = cells[m+1:]
+   
+    right_right_child = right_child
+   
+    return (left_cells, left_right_child, right_cells, right_right_child, seperator)
