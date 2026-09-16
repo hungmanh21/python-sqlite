@@ -303,6 +303,34 @@ def test_page_1_fills_up_with_a_clean_error_not_corruption(tmp_path) -> None:
     pager.close()
 
 
+def test_page_1_filling_up_leaves_a_file_sqlite3_still_calls_ok(tmp_path) -> None:
+    """The failure path must not leak the root page it allocated.
+
+    Reloading the catalog isn't enough to catch this -- the 53 surviving
+    tables are readable either way. Only sqlite3 notices, because an
+    unreferenced page is exactly what integrity_check looks for:
+    "Page 55 is never used".
+    """
+    path = tmp_path / "t.db"
+    pager = Pager.create(path)
+    pool = BufferPool(pager, capacity=64)
+    catalog = _catalog(pager, pool)
+
+    with pytest.raises(PageFullError):
+        for i in range(500):
+            sql = f"CREATE TABLE t{i} (id INTEGER, name TEXT, age INTEGER)"
+            _create_table(catalog, sql)
+
+    pool.flush_all()
+    pager.close()
+
+    result = subprocess.run(
+        ["sqlite3", str(path), "PRAGMA integrity_check;"],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout.strip() == "ok"
+
+
 # =====================================================================
 # sqlite3 itself must be able to read what we wrote
 # =====================================================================

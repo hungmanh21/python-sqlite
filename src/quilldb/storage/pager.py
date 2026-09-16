@@ -247,6 +247,17 @@ class Pager:
     def free_page(self, page_id: int) -> None:
         """Return a page to the freelist.
 
+        ⚠️ WRITES THROUGH THE POOL'S BACK: this writes the freelist trunk
+        straight to the file, so a caller running above a BufferPool must be
+        sure `page_id` has no dirty cached entry. If it does, the pool's later
+        flush overwrites the trunk with the page's old contents, and its type
+        byte is then read as the high byte of a next-trunk pointer -- sqlite3
+        reports "freelist leaf count too big" and an absurd page number rather
+        than anything that points at this function. BufferPool has no discard
+        API yet; until it does, free only pages the pool has never cached (a
+        page straight from allocate_page(), for instance, which this module
+        also writes directly).
+
         Raises:
             PageOutOfRangeError.
             ValueError: page_id is 1 (the header page).

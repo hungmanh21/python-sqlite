@@ -37,6 +37,7 @@ from quilldb.codec.record import decode_record, encode_record
 from quilldb.constants import SCHEMA_ROOT_PAGE, PageType
 from quilldb.errors import (
     CorruptDatabaseError,
+    PageFullError,
     TableAlreadyExistsError,
     TableNotFoundError,
     UnsupportedFeatureError,
@@ -131,7 +132,9 @@ class Catalog:
             UnsupportedFeatureError: the name starts with the reserved
                 `sqlite_` prefix.
             PageFullError: page 1 has no room for another schema row (see
-                this module's documented scope limit).
+                this module's documented scope limit). The root page
+                allocated for the doomed table is returned to the freelist
+                first, so the file still passes `PRAGMA integrity_check`.
         """
         # Both rejections happen before anything is allocated or written, so a
         # refused CREATE TABLE leaves the file byte-identical.
@@ -142,16 +145,33 @@ class Catalog:
             raise TableAlreadyExistsError(f"table {statement.name!r} already exists")
 
         root_page = self.pager.allocate_page()
+
+        _, schema_body = self._schema_page()
+        rowid = self._next_catalog_rowid(schema_body)
+        payload = encode_record(("table", statement.name, statement.name, root_page, sql))
+        cell_len = len(encode_leaf_table_cell(rowid, len(payload), payload))
+
+        # Page 1's room is checked HERE -- after allocate_page(), which wrote
+        # the new page through the pager directly, but before this page is ever
+        # touched through the BufferPool. That ordering is what makes the
+        # free_page() below safe: nothing is cached for `root_page` yet, so
+        # reclaiming it can't be undone by a later pool flush. Initialize the
+        # root first and the pool's dirty copy would overwrite the freelist
+        # trunk free_page() just wrote, turning a leaked page into a corrupt
+        # freelist (a LEAF_TABLE type byte read as a trunk pointer).
+        if not schema_body.fits(cell_len):
+            self.pager.free_page(root_page)
+            raise PageFullError(
+                f"sqlite_schema (page 1) has no room for table {statement.name!r}: the catalog "
+                "lives on page 1 alone and never splits (see this module's scope limit)"
+            )
+
         with self.pool.pinned(root_page, dirty=True) as raw:
             raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
 
-        payload = encode_record(("table", statement.name, statement.name, root_page, sql))
-        rowid = self._next_catalog_rowid()
-
-        # Publish the catalog row only after the root exists on disk: a
-        # PageFullError here leaves an unreferenced empty page (wasteful, not
-        # corrupt), whereas the reverse order would leave a catalog row
-        # pointing at a page that was never initialized.
+        # Publish the catalog row only after the root exists on disk: the
+        # reverse order would leave a catalog row pointing at a page that was
+        # never initialized.
         self._append_catalog_row(rowid, payload)
         self.pager.bump_schema_cookie()
 
@@ -215,14 +235,16 @@ class Catalog:
             rows.append(decode_record(local_payload))
         return rows
 
-    def _next_catalog_rowid(self) -> int:
-        """One past the largest rowid currently on page 1, starting at 1.
+    def _next_catalog_rowid(self, body: PageBody) -> int:
+        """One past the largest rowid on `body` (page 1), starting at 1.
+
+        Takes the already-decoded page rather than re-reading page 1, so a
+        caller that also needs the body for a free-space check reads it once.
 
         Catalog rowids are the schema table's own keys -- entirely
         independent of any user table's rowids, which live in that table's
         own b-tree.
         """
-        _, body = self._schema_page()
         if not body.cells:
             return 1
         rowids = [decode_leaf_table_cell(bytes(cell))[0] for cell in body.cells]
