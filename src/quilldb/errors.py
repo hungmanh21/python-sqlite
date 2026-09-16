@@ -1,4 +1,4 @@
-""""Exception hierarchy for quilldb.
+"""Exception hierarchy for quilldb.
 
 Rule: anything derived from CorruptDatabaseError means the FILE is bad.
 Anything else means the CALLER did something wrong, or is internal control flow.
@@ -72,3 +72,19 @@ class SQLError(QuillDBError):
 
 class SQLSyntaxError(SQLError):
     """The SQL text is not in the supported grammar."""
+
+
+class CatalogError(SQLError):
+    """Base class for schema lookup and schema-change errors."""
+
+
+class TableNotFoundError(CatalogError):
+    """A statement named a table that does not exist."""
+
+
+class TableAlreadyExistsError(CatalogError):
+    """CREATE TABLE named an existing table."""
+
+
+class ColumnNotFoundError(SQLError):
+    """A statement named a column that does not exist in its input row."""
