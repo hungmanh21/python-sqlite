@@ -178,11 +178,13 @@ def bind(
             disagree -- in either direction. Every supplied parameter must
             be consumed, so passing extras is an error rather than being
             silently ignored.
-        TypeMismatchError: an INSERT value is incompatible with its
-            column's declared type (see _coerce_to_declared_type).
+        TypeMismatchError: a supplied parameter is not a storable Value, or
+            an INSERT value is incompatible with its column's declared type
+            (see _require_bindable and _coerce_to_declared_type).
         UnsupportedFeatureError: an INSERT value is not a constant
             expression, or a statement type this binder doesn't handle.
     """
+    _require_bindable(parameters)
     binder = _Binder(catalog, parameters)
 
 
@@ -341,6 +343,45 @@ class _Binder:
 
 
 
+def _require_bindable(parameters: tuple[Value, ...]) -> None:
+    """Reject supplied parameters that aren't storable Values, before any
+    name resolution happens.
+
+
+    `parameters` is annotated tuple[Value, ...], but callers hand it in from
+    outside quilldb, so at runtime it is whatever they passed. Only the
+    INSERT path would otherwise notice: those values get checked against a
+    declared column type, while a parameter landing in a WHERE clause has no
+    declared type to be checked against and so was checked by nothing at all.
+
+
+    That asymmetry is worth closing here rather than in the evaluator,
+    because it is the same argument as resolving names once instead of per
+    row: an unusable parameter is a fact about the caller's arguments, known
+    before the first page is read, and a check hoisted here reports it as
+    such. Left to execution, `object()` surfaces as a TypeError from inside
+    a comparison on some arbitrary row, and `True` doesn't surface at all --
+    bool being an int subclass, `True > 30` quietly evaluates to False and
+    the query returns a wrong answer with no error anywhere.
+
+
+    Raises:
+        TypeMismatchError: a parameter is not None, int, float, str, or
+            bytes. bool is rejected for the reason above, matching
+            _coerce_to_declared_type's treatment of it.
+    """
+    for index, value in enumerate(parameters):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, bytes)):
+            raise TypeMismatchError(
+                f"parameter {index} is a {type(value).__name__}; "
+                "parameters must be None, int, float, str, or bytes"
+            )
+
+
+
+
 def _coerce_to_declared_type(
     value: Value, data_type: DataType, table_name: str, column_name: str
 ) -> Value:
@@ -396,9 +437,3 @@ def _coerce_to_declared_type(
 
 
     raise UnsupportedFeatureError(f"unknown declared type {data_type!r} on {where}")
-
-
-
-
-
-

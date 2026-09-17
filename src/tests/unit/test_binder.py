@@ -10,6 +10,9 @@ importing.
 """
 
 
+import datetime
+
+
 import pytest
 
 
@@ -314,6 +317,49 @@ def test_a_none_parameter_is_a_valid_value_not_a_missing_one() -> None:
     assert bound.where == BoundBinaryOp(
         BoundColumn(2, "age", DataType.INTEGER), ">", BoundLiteral(None)
     )
+
+
+
+
+# A WHERE-clause parameter has no declared column type to be checked
+# against, so before _require_bindable() nothing checked it at all -- these
+# all bound successfully and only failed later, inside the evaluator.
+@pytest.mark.parametrize(
+    "value",
+    [
+        True,                              # bool: an int subclass, so `True > 30` would
+        False,                             # silently evaluate rather than raise
+        datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC),
+        [1, 2, 3],
+        {"a": 1},
+        bytearray(b"x"),                   # not a bytes subclass; Value doesn't cover it
+        object(),
+    ],
+)
+def test_a_parameter_that_is_not_a_storable_value_raises(value: object) -> None:
+    with pytest.raises(TypeMismatchError):
+        _bind("SELECT id FROM users WHERE age > ?", value)
+
+
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, 2.5, "", "ada", b"", b"\x00\xff"])
+def test_every_storable_value_is_accepted_as_a_parameter(value: object) -> None:
+    bound = _bind("SELECT id FROM users WHERE age > ?", value)
+    assert isinstance(bound, BoundSelect)
+    assert bound.where == BoundBinaryOp(
+        BoundColumn(2, "age", DataType.INTEGER), ">", BoundLiteral(value)
+    )
+
+
+
+
+def test_an_unusable_parameter_is_rejected_before_the_table_is_resolved() -> None:
+    # The point of checking in bind() rather than the evaluator: the caller's
+    # arguments are wrong regardless of whether the table even exists, and
+    # saying so does not require a catalog lookup.
+    with pytest.raises(TypeMismatchError):
+        _bind("SELECT id FROM ghosts WHERE id > ?", object())
 
 
 
