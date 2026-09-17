@@ -73,8 +73,12 @@ class PageFullError(QuillDBError):
     """Not enough room on a page. Internal control flow — triggers a split."""
 
 
+
+
 class DuplicateRowIDError(QuillDBError):
     """insert() was asked to add a rowid that's already in the tree."""
+
+
 
 
 class PoolExhaustedError(QuillDBError):
@@ -85,3 +89,73 @@ class PoolExhaustedError(QuillDBError):
 
 class UnsupportedFeatureError(QuillDBError):
     """A valid file using a feature quilldb does not implement."""
+
+
+
+
+class SQLError(QuillDBError):
+    """Base class for SQL text, name-resolution, and execution errors.
+
+
+    Never derives from CorruptDatabaseError: a bad query is a caller mistake,
+    not evidence the file on disk is wrong.
+    """
+
+
+
+
+class SQLSyntaxError(SQLError):
+    """The SQL text is not in the supported grammar."""
+
+
+
+
+class CatalogError(SQLError):
+    """Base class for schema lookup and schema-change errors."""
+
+
+
+
+class TableNotFoundError(CatalogError):
+    """A statement named a table that does not exist."""
+
+
+
+
+class TableAlreadyExistsError(CatalogError):
+    """CREATE TABLE named an existing table."""
+
+
+
+
+class ColumnNotFoundError(SQLError):
+    """A statement named a column that does not exist in its input row."""
+
+
+
+
+class ColumnCountError(SQLError):
+    """A statement supplied a different number of values than the table has
+    columns.
+
+
+    Not TypeMismatchError: nothing here is the wrong *type*, there are just
+    the wrong number of them, and conflating the two makes the message
+    useless ("INSERT INTO t VALUES (1)" against a three-column table is an
+    arity mistake, not a type mistake).
+    """
+
+
+
+
+class ParameterCountError(SQLError):
+    """The number of supplied values does not match the number of `?` markers."""
+
+
+
+
+class TypeMismatchError(SQLError):
+    """A value has a type nothing can be done with: a supplied parameter that
+    isn't a storable Value, or an INSERT value incompatible with its column's
+    declared type.
+    """
