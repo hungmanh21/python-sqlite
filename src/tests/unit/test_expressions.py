@@ -37,7 +37,7 @@ from quilldb.sql.binder import (
 
 
 def _lit(value: object) -> BoundLiteral:
-    return BoundLiteral(value)  # type: ignore[arg-type]
+    return BoundLiteral(value)
 
 
 
@@ -49,7 +49,7 @@ def _binary(left: object, operator: str, right: object) -> BoundBinaryOp:
 
 
 def _eval(expression: BoundExpression, row: tuple[object, ...] = ()) -> object:
-    return evaluate(expression, row)  # type: ignore[arg-type]
+    return evaluate(expression, row)
 
 
 
@@ -109,14 +109,14 @@ _OR_TABLE = {
 
 
 @pytest.mark.parametrize("left, right", list(itertools.product(_TRUTH_INPUTS, _TRUTH_INPUTS)))
-def test_and_truth_table_is_exhaustive(left: object, right: object) -> None:
+def test_and_truth_table_is_exhaustive(left: int | None, right: int | None) -> None:
     assert _eval(_binary(left, "AND", right)) == _AND_TABLE[(left, right)]
 
 
 
 
 @pytest.mark.parametrize("left, right", list(itertools.product(_TRUTH_INPUTS, _TRUTH_INPUTS)))
-def test_or_truth_table_is_exhaustive(left: object, right: object) -> None:
+def test_or_truth_table_is_exhaustive(left: int | None, right: int | None) -> None:
     assert _eval(_binary(left, "OR", right)) == _OR_TABLE[(left, right)]
 
 
@@ -133,6 +133,47 @@ def test_and_or_treat_any_nonzero_number_as_true() -> None:
     # SQL has no boolean type; `WHERE 7` is valid and true.
     assert _eval(_binary(7, "AND", 1)) == 1
     assert _eval(_binary(-3, "OR", 0)) == 1
+
+
+
+
+def test_and_short_circuits_on_a_false_left_operand() -> None:
+    """A decisive left operand means the right side is never evaluated, so
+    an expression that would raise doesn't get the chance to abort a scan
+    over rows that already failed the first test. `poison` is only poison
+    here because this evaluator refuses text+int -- real sqlite3's affinity
+    would coerce `'a'` to 0 and never raise, so this behavior is quilldb's
+    own answer, not something observable in the reference implementation.
+    """
+    poison = BoundBinaryOp(_lit("a"), "+", _lit(1))
+    assert _eval(BoundBinaryOp(_lit(0), "AND", poison)) == 0
+
+
+
+
+def test_or_short_circuits_on_a_true_left_operand() -> None:
+    poison = BoundBinaryOp(_lit("a"), "+", _lit(1))
+    assert _eval(BoundBinaryOp(_lit(1), "OR", poison)) == 1
+
+
+
+
+def test_and_still_evaluates_the_right_side_when_the_left_is_not_decisive() -> None:
+    poison = BoundBinaryOp(_lit("a"), "+", _lit(1))
+    with pytest.raises(TypeMismatchError):
+        _eval(BoundBinaryOp(_lit(1), "AND", poison))
+    with pytest.raises(TypeMismatchError):
+        _eval(BoundBinaryOp(_lit(None), "AND", poison))
+
+
+
+
+def test_or_still_evaluates_the_right_side_when_the_left_is_not_decisive() -> None:
+    poison = BoundBinaryOp(_lit("a"), "+", _lit(1))
+    with pytest.raises(TypeMismatchError):
+        _eval(BoundBinaryOp(_lit(0), "OR", poison))
+    with pytest.raises(TypeMismatchError):
+        _eval(BoundBinaryOp(_lit(None), "OR", poison))
 
 
 
@@ -205,8 +246,8 @@ def test_is_not_null_is_never_null() -> None:
 
 def test_where_null_equals_null_rejects_but_is_null_accepts() -> None:
     """Concretely why `= NULL` is a bug and `IS NULL` is the fix."""
-    assert where_passes(_eval(_binary(None, "=", None))) is False  # type: ignore[arg-type]
-    assert where_passes(_eval(BoundIsNull(_lit(None), False))) is True  # type: ignore[arg-type]
+    assert where_passes(_eval(_binary(None, "=", None))) is False
+    assert where_passes(_eval(BoundIsNull(_lit(None), False))) is True
 
 
 
@@ -550,7 +591,7 @@ def test_like_through_evaluate_returns_an_integer() -> None:
     ],
 )
 def test_where_passes(value: object, expected: bool) -> None:
-    assert where_passes(value) is expected  # type: ignore[arg-type]
+    assert where_passes(value) is expected
 
 
 
@@ -565,8 +606,8 @@ def test_a_predicate_and_its_negation_both_reject_a_null_row() -> None:
     predicate = BoundBinaryOp(age, ">", _lit(30))
 
 
-    assert where_passes(_eval(predicate, row)) is False  # type: ignore[arg-type]
-    assert where_passes(_eval(BoundUnaryOp("NOT", predicate), row)) is False  # type: ignore[arg-type]
+    assert where_passes(_eval(predicate, row)) is False
+    assert where_passes(_eval(BoundUnaryOp("NOT", predicate), row)) is False
 
 
 
@@ -589,11 +630,11 @@ def test_a_compound_predicate_over_a_row() -> None:
         "AND",
         BoundBinaryOp(name, "LIKE", _lit("a%")),
     )
-    assert where_passes(_eval(predicate, row)) is True  # type: ignore[arg-type]
+    assert where_passes(_eval(predicate, row)) is True
 
 
-    assert where_passes(_eval(predicate, (2, "bob", 36))) is False  # type: ignore[arg-type]
-    assert where_passes(_eval(predicate, (3, "amy", 20))) is False  # type: ignore[arg-type]
+    assert where_passes(_eval(predicate, (2, "bob", 36))) is False
+    assert where_passes(_eval(predicate, (3, "amy", 20))) is False
 
 
 

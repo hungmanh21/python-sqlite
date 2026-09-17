@@ -28,8 +28,6 @@ Two properties this module exists to guarantee:
 
 from dataclasses import dataclass
 from typing import Protocol
-
-
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
@@ -54,8 +52,6 @@ from quilldb.sql.ast import (
 )
 
 
-
-
 class SchemaSource(Protocol):
     """The only thing binding needs from a catalog: name -> TableSchema.
 
@@ -66,17 +62,12 @@ class SchemaSource(Protocol):
     fact about the types rather than a convention.
     """
 
-
     def get_table(self, name: str) -> TableSchema: ...
-
-
 
 
 @dataclass(frozen=True)
 class BoundLiteral:
     value: Value
-
-
 
 
 @dataclass(frozen=True)
@@ -86,14 +77,10 @@ class BoundColumn:
     data_type: DataType
 
 
-
-
 @dataclass(frozen=True)
 class BoundUnaryOp:
     operator: str
     operand: "BoundExpression"
-
-
 
 
 @dataclass(frozen=True)
@@ -103,15 +90,10 @@ class BoundBinaryOp:
     right: "BoundExpression"
 
 
-
-
 @dataclass(frozen=True)
 class BoundIsNull:
     operand: "BoundExpression"
     negated: bool = False
-
-
-
 
 type BoundExpression = BoundLiteral | BoundColumn | BoundUnaryOp | BoundBinaryOp | BoundIsNull
 

@@ -285,17 +285,36 @@ def _binary(expression: BoundBinaryOp, row: Row) -> Value:
     operator = expression.operator
 
 
-    # AND/OR are evaluated before the NULL short-circuit below, because they
+    # AND/OR are handled before the NULL short-circuit below, because they
     # are the two operators where a definite operand can outvote an unknown
     # one: `FALSE AND NULL` is FALSE, `TRUE OR NULL` is TRUE.
-    if operator in ("AND", "OR"):
+    #
+    # They also SHORT-CIRCUIT, which is not just an optimisation here. A
+    # decisive left operand means the right side is never evaluated, so
+    # `WHERE age > 150 AND <expression that would raise>` returns FALSE for
+    # the rows that fail the first test rather than aborting the scan. This
+    # can't be observed the same way in real sqlite3 -- its type affinity
+    # coerces text operands (`'a' + 1` is 1, not an error), so nothing on
+    # the right side ever raises for sqlite3 to skip. What IS verified
+    # against sqlite3 is the truth table itself (all nine AND/OR cells);
+    # the short-circuit is this evaluator's own answer to a case sqlite3's
+    # semantics never put to the test.
+    if operator == "AND":
         left = _truth(evaluate(expression.left, row))
+        if left is False:
+            return 0
         right = _truth(evaluate(expression.right, row))
-        if operator == "AND":
-            if left is False or right is False:
-                return 0
-            return None if left is None or right is None else 1
-        if left is True or right is True:
+        if right is False:
+            return 0
+        return None if left is None or right is None else 1
+
+
+    if operator == "OR":
+        left = _truth(evaluate(expression.left, row))
+        if left is True:
+            return 1
+        right = _truth(evaluate(expression.right, row))
+        if right is True:
             return 1
         return None if left is None or right is None else 0
 
@@ -484,7 +503,3 @@ def _modulo(a: float, b: float) -> Value:
     if isinstance(a, float) or isinstance(b, float):
         return float(remainder)
     return remainder
-
-
-
-
