@@ -88,3 +88,26 @@ class TableAlreadyExistsError(CatalogError):
 
 class ColumnNotFoundError(SQLError):
     """A statement named a column that does not exist in its input row."""
+
+
+class ColumnCountError(SQLError):
+    """A statement supplied a different number of values than the table has
+    columns.
+
+    Not TypeMismatchError: nothing here is the wrong *type*, there are just
+    the wrong number of them, and conflating the two makes the message
+    useless ("INSERT INTO t VALUES (1)" against a three-column table is an
+    arity mistake, not a type mistake).
+    """
+
+
+class ParameterCountError(SQLError):
+    """The number of supplied values does not match the number of `?` markers."""
+
+
+class TypeMismatchError(SQLError):
+    """A value is incompatible with a declared column type."""
+
+
+class ConstraintError(SQLError):
+    """Base class for data-integrity failures."""
