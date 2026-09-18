@@ -22,12 +22,20 @@ ending up in the left half, never the smallest key in the right half -- get
 that one-off in either direction and descent still looks fine everywhere
 except for the one key that lands exactly on the new separator, which becomes
 silently unreachable.
+
+
+Keys are generic (each function declares its own `KeyT`), not hardcoded to
+`int`: neither function here ever
+compares two keys, only indexes into the list and hands one back, so the same
+partition logic serves btree/index.py's decoded-tuple keys too (index.py's
+own comparisons -- descent, duplicate detection -- go through compare_keys,
+never Python's `<`/`>`, exactly because a key can mix NULL/int/text/blob).
 """
 
 
-def split_cells(
-    cells: list[bytes], keys: list[int], is_rightmost: bool
-) -> tuple[list[bytes], list[bytes], int]:
+def split_cells[KeyT](
+    cells: list[bytes], keys: list[KeyT], is_rightmost: bool
+) -> tuple[list[bytes], list[bytes], KeyT]:
     """Partition a full leaf's cells into a left and right half, and pick the
     separator that must be promoted into the parent.
 
@@ -113,13 +121,13 @@ def _closest_to_half_by_bytes(cells: list[bytes]) -> int:
 
 
 
-def split_interior_cells(
+def split_interior_cells[KeyT](
     cells: list[bytes],
-    keys: list[int],
+    keys: list[KeyT],
     children: list[int],
     right_child: int,
     is_rightmost: bool,
-) -> tuple[list[bytes], int, list[bytes], int, int]:
+) -> tuple[list[bytes], int, list[bytes], int, KeyT]:
     """Partition a full interior page's cells into a left and right half,
     and pick the separator that must be promoted to ITS parent -- the
     cascading step _split_leaf() doesn't do yet (btree.py, a later task).
