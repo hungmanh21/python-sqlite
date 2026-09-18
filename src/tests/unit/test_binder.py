@@ -25,10 +25,11 @@ from quilldb.errors import (
     TypeMismatchError,
     UnsupportedFeatureError,
 )
-from quilldb.sql.ast import CreateTable, DataType
+from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
     BoundBinaryOp,
     BoundColumn,
+    BoundCreateIndex,
     BoundCreateTable,
     BoundInsert,
     BoundIsNull,
@@ -114,6 +115,32 @@ def test_create_table_does_not_need_the_table_to_exist() -> None:
     # catalog is fine -- no TableNotFoundError.
     bound = _bind("CREATE TABLE brand_new (id INTEGER)", catalog=_FakeCatalog())
     assert isinstance(bound, BoundCreateTable)
+
+
+
+
+# =====================================================================
+# CREATE INDEX: also a passthrough -- table/column resolution happens
+# inside Catalog.create_index(), not here (see BoundCreateIndex's docstring)
+# =====================================================================
+
+
+
+
+def test_create_index_binds_to_a_passthrough_wrapper() -> None:
+    statement = parse("CREATE INDEX idx_name ON users (name)")
+    assert isinstance(statement, CreateIndex)
+    bound = bind(statement, _FakeCatalog(_USERS))
+    assert bound == BoundCreateIndex(statement)
+
+
+
+
+def test_create_index_does_not_need_the_table_to_exist() -> None:
+    # Same reasoning as CREATE TABLE against an empty catalog: nothing here
+    # resolves `table`/`columns`, so a nonexistent table doesn't raise yet.
+    bound = _bind("CREATE INDEX idx_ghost ON ghost (col)", catalog=_FakeCatalog())
+    assert isinstance(bound, BoundCreateIndex)
 
 
 

@@ -48,6 +48,7 @@ from quilldb.exec.operators import Operator, build_operator
 from quilldb.sql.binder import (
     BoundBinaryOp,
     BoundColumn,
+    BoundCreateIndex,
     BoundCreateTable,
     BoundExpression,
     BoundInsert,
@@ -206,11 +207,11 @@ class Connection:
         """Parse, bind, and execute one statement.
 
 
-        CREATE TABLE and INSERT complete before this method returns. SELECT
-        leaves its operator open and streams rows through the returned
-        Cursor. Starting another execute() closes any still-open result
-        cursor on this connection; multiple active cursors arrive with
-        multiple connections.
+        CREATE TABLE, CREATE INDEX, and INSERT complete before this method
+        returns. SELECT leaves its operator open and streams rows through
+        the returned Cursor. Starting another execute() closes any
+        still-open result cursor on this connection; multiple active
+        cursors arrive with multiple connections.
         """
         if self._closed:
             raise ValueError("connection is closed")
@@ -224,6 +225,11 @@ class Connection:
 
         if isinstance(bound, BoundCreateTable):
             self.catalog.create_table(bound.statement, sql)
+            return Cursor(None, None, 0)
+
+
+        if isinstance(bound, BoundCreateIndex):
+            self.catalog.create_index(bound.statement, sql)
             return Cursor(None, None, 0)
 
 

@@ -28,6 +28,8 @@ Two properties this module exists to guarantee:
 
 from dataclasses import dataclass
 from typing import Protocol
+
+
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
@@ -39,6 +41,7 @@ from quilldb.errors import (
 from quilldb.sql.ast import (
     BinaryOp,
     Column,
+    CreateIndex,
     CreateTable,
     DataType,
     Expression,
@@ -52,6 +55,8 @@ from quilldb.sql.ast import (
 )
 
 
+
+
 class SchemaSource(Protocol):
     """The only thing binding needs from a catalog: name -> TableSchema.
 
@@ -62,12 +67,17 @@ class SchemaSource(Protocol):
     fact about the types rather than a convention.
     """
 
+
     def get_table(self, name: str) -> TableSchema: ...
+
+
 
 
 @dataclass(frozen=True)
 class BoundLiteral:
     value: Value
+
+
 
 
 @dataclass(frozen=True)
@@ -77,10 +87,14 @@ class BoundColumn:
     data_type: DataType
 
 
+
+
 @dataclass(frozen=True)
 class BoundUnaryOp:
     operator: str
     operand: "BoundExpression"
+
+
 
 
 @dataclass(frozen=True)
@@ -90,10 +104,15 @@ class BoundBinaryOp:
     right: "BoundExpression"
 
 
+
+
 @dataclass(frozen=True)
 class BoundIsNull:
     operand: "BoundExpression"
     negated: bool = False
+
+
+
 
 type BoundExpression = BoundLiteral | BoundColumn | BoundUnaryOp | BoundBinaryOp | BoundIsNull
 
@@ -109,6 +128,22 @@ class BoundCreateTable:
     in the parser; the reserved-prefix and already-exists checks belong to
     Catalog.create_table(), which is the thing that can actually see what
     exists on disk.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundCreateIndex:
+    statement: CreateIndex
+    """A passthrough wrapper too, for the same underlying reason as
+    BoundCreateTable, even though CREATE INDEX's `table`/`columns` DO refer
+    to something that must already exist: Catalog.create_index() is what
+    can see the table's actual schema on disk, and it needs the raw names
+    anyway to run the backfill, so resolving them here first would just be
+    duplicated work with nowhere to put the result (there's no per-row
+    executor downstream the way BoundInsert/BoundSelect have -- the
+    backfill loop lives entirely inside create_index()).
     """
 
 
@@ -131,7 +166,7 @@ class BoundSelect:
 
 
 
-type BoundStatement = BoundCreateTable | BoundInsert | BoundSelect
+type BoundStatement = BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect
 
 
 
@@ -172,6 +207,8 @@ def bind(
 
     if isinstance(statement, CreateTable):
         bound: BoundStatement = BoundCreateTable(statement)
+    elif isinstance(statement, CreateIndex):
+        bound = BoundCreateIndex(statement)
     elif isinstance(statement, Insert):
         bound = binder.bind_insert(statement)
     elif isinstance(statement, Select):
