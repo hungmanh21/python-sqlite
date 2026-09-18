@@ -100,7 +100,7 @@ def test_missing_table_name_raises() -> None:
 
 def test_unsupported_statement_raises() -> None:
     with pytest.raises(SQLSyntaxError):
-        parse("DELETE FROM t")
+        parse("DROP TABLE t")
 
 
 def test_empty_input_raises() -> None:

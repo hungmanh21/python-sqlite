@@ -11,11 +11,16 @@ another call-stack layer.
 
 from quilldb.errors import SQLSyntaxError
 from quilldb.sql.ast import (
+    Analyze,
+    Assignment,
     BinaryOp,
     Column,
     ColumnDef,
+    CreateIndex,
     CreateTable,
     DataType,
+    Delete,
+    Explain,
     Expression,
     Insert,
     IsNull,
@@ -24,6 +29,7 @@ from quilldb.sql.ast import (
     Select,
     Statement,
     UnaryOp,
+    Update,
 )
 from quilldb.sql.tokenizer import tokenize
 from quilldb.sql.tokens import Token, TokenType
@@ -105,14 +111,22 @@ class Parser:
     def parse_statement(self) -> Statement:
         token = self._peek()
         if token.type is TokenType.CREATE:
-            statement = self._create_table()
+            statement = self._create()
         elif token.type is TokenType.INSERT:
             statement = self._insert()
         elif token.type is TokenType.SELECT:
             statement = self._select()
+        elif token.type is TokenType.DELETE:
+            statement = self._delete()
+        elif token.type is TokenType.UPDATE:
+            statement = self._update()
+        elif token.type is TokenType.ANALYZE:
+            statement = self._analyze()
+        elif token.type is TokenType.EXPLAIN:
+            statement = self._explain()
         else:
             raise SQLSyntaxError(
-                f"expected CREATE, INSERT, or SELECT, found {token.lexeme!r} at position {token.position}"
+                f"expected a statement, found {token.lexeme!r} at position {token.position}"
             )
 
 
@@ -122,8 +136,24 @@ class Parser:
         return statement
 
 
-    def _create_table(self) -> Statement:
+    def _create(self) -> Statement:
         self._expect(TokenType.CREATE, "expected CREATE")
+
+
+        unique = False
+        if self._peek().type is TokenType.UNIQUE:
+            self._advance()
+            unique = True
+
+
+        if unique or self._peek().type is TokenType.INDEX:
+            return self._create_index(unique)
+
+
+        return self._create_table()
+
+
+    def _create_table(self) -> CreateTable:
         self._expect(TokenType.TABLE, "expected TABLE")
         name = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
         self._expect(TokenType.LEFT_PAREN, "expected '(' after table name")
@@ -154,7 +184,25 @@ class Parser:
         return CreateTable(name, tuple(columns))
 
 
-    def _insert(self) -> Statement:
+    def _create_index(self, unique: bool) -> CreateIndex:
+        self._expect(TokenType.INDEX, "expected INDEX")
+        name = self._expect(TokenType.IDENTIFIER, "expected an index name").lexeme
+        self._expect(TokenType.ON, "expected ON")
+        table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        self._expect(TokenType.LEFT_PAREN, "expected '(' before the column list")
+
+
+        columns = [self._expect(TokenType.IDENTIFIER, "expected a column name").lexeme]
+        while self._peek().type is TokenType.COMMA:
+            self._advance()
+            columns.append(self._expect(TokenType.IDENTIFIER, "expected a column name").lexeme)
+
+
+        self._expect(TokenType.RIGHT_PAREN, "expected ')' to close the column list")
+        return CreateIndex(name, table, tuple(columns), unique)
+
+
+    def _insert(self) -> Insert:
         self._expect(TokenType.INSERT, "expected INSERT")
         self._expect(TokenType.INTO, "expected INTO")
         table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
@@ -172,7 +220,7 @@ class Parser:
         return Insert(table, tuple(values))
 
 
-    def _select(self) -> Statement:
+    def _select(self) -> Select:
         self._expect(TokenType.SELECT, "expected SELECT")
 
 
@@ -199,6 +247,66 @@ class Parser:
 
 
         return Select(expressions, table, where)
+
+
+    def _delete(self) -> Delete:
+        self._expect(TokenType.DELETE, "expected DELETE")
+        self._expect(TokenType.FROM, "expected FROM")
+        table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+
+
+        where: Expression | None = None
+        if self._peek().type is TokenType.WHERE:
+            self._advance()
+            where = self._expression()
+
+
+        return Delete(table, where)
+
+
+    def _update(self) -> Update:
+        self._expect(TokenType.UPDATE, "expected UPDATE")
+        table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        self._expect(TokenType.SET, "expected SET")
+
+
+        assignments = [self._assignment()]
+        while self._peek().type is TokenType.COMMA:
+            self._advance()
+            assignments.append(self._assignment())
+
+
+        where: Expression | None = None
+        if self._peek().type is TokenType.WHERE:
+            self._advance()
+            where = self._expression()
+
+
+        return Update(table, tuple(assignments), where)
+
+
+    def _assignment(self) -> Assignment:
+        column = self._expect(TokenType.IDENTIFIER, "expected a column name").lexeme
+        self._expect(TokenType.EQ, "expected '=' in SET clause")
+        value = self._expression()
+        return Assignment(column, value)
+
+
+    def _analyze(self) -> Analyze:
+        self._expect(TokenType.ANALYZE, "expected ANALYZE")
+        target: str | None = None
+        if self._peek().type is TokenType.IDENTIFIER:
+            target = self._advance().lexeme
+        return Analyze(target)
+
+
+    def _explain(self) -> Explain:
+        self._expect(TokenType.EXPLAIN, "expected EXPLAIN")
+        analyze = False
+        if self._peek().type is TokenType.ANALYZE:
+            self._advance()
+            analyze = True
+        return Explain(self._select(), analyze)
 
 
     def _expression(self, min_binding_power: int = 0) -> Expression:
