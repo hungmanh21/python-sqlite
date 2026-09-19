@@ -115,6 +115,7 @@ for a hand-built multi-level table B-tree, verified against counts you can
 independently check (e.g. via existing test fixtures that already build
 multi-page trees).
 
+[STATUS: COMPLETE]
 
 ## Step 4 — ANALYZE: measure a real index B-tree (TODO(human))
 
@@ -143,6 +144,7 @@ example but derived from real inserted rows instead of a literal string).
 **Done when:** `measure_index` on a real multi-level index B-tree produces
 `rows_per_prefix` matching hand-counted expectations.
 
+[STATUS: COMPLETE]
 
 ## Step 5 — `quill_stat1` persistence + `StatisticsCatalog`
 
