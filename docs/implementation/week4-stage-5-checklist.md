@@ -173,6 +173,7 @@ behavior when unanalyzed).
 **Done when:** `ANALYZE` (invoked directly through `StatisticsCatalog`, not
 yet through SQL) persists real numbers that survive a reload.
 
+[STATUS: COMPLETE]
 
 ## Step 6 — Bind and execute `ANALYZE`, connect stats into the planner
 

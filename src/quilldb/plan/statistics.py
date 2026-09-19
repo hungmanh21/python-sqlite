@@ -28,11 +28,9 @@ Two invariants this module has to hold, straight from §12.6:
 
 from dataclasses import dataclass
 
-
 from quilldb.catalog.schema import IndexSchema
 from quilldb.errors import CorruptDatabaseError
 from quilldb.plan.planner import AccessPath
-
 
 # SQLite's own fallback for an unanalyzed table (optoverview.html): assume
 # 1,000,000 rows so an unindexed scan looks expensive relative to any seek,
@@ -156,6 +154,15 @@ def parse_stat1(stat: str, index: IndexSchema) -> IndexStats:
     return IndexStats(numbers[0], tuple(numbers[1:]))
 
 
+
+
+def encode_stat1_row(stats: IndexStats) -> str:
+    """Inverse of `parse_stat1`: pack an IndexStats back into the K+1
+    space-separated integers `quill_stat1.stat` stores -- row_count first,
+    then `rows_per_prefix` in order. `parse_stat1(encode_stat1_row(s), index)
+    == s` for any `s` whose `rows_per_prefix` length matches `index.columns`.
+    """
+    return " ".join(str(n) for n in (stats.row_count, *stats.rows_per_prefix))
 
 
 def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats: TableStats) -> AccessPath:

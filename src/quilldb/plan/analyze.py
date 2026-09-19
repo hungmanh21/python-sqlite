@@ -19,18 +19,40 @@ purpose -- that's validate_btree()'s job, not this module's.
 """
 
 
+from quilldb.btree.btree import BTree
 from quilldb.btree.cells import (
     decode_interior_index_cell,
     decode_interior_table_cell,
     decode_leaf_index_cell,
 )
-from quilldb.codec.record import Value, decode_record
+from quilldb.btree.cursor import TableCursor
+from quilldb.catalog.catalog import Catalog
+from quilldb.catalog.schema import IndexSchema, TableSchema
+from quilldb.codec.record import Value, decode_record, encode_record
 from quilldb.constants import PageType
-from quilldb.plan.statistics import IndexStats, TableStats
+from quilldb.errors import CorruptDatabaseError, TableNotFoundError
+from quilldb.plan.statistics import (
+    IndexStats,
+    TableStats,
+    default_index_stats,
+    default_table_stats,
+    encode_stat1_row,
+    parse_stat1,
+)
+from quilldb.sql.ast import CreateTable
+from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import read_overflow_chain
 from quilldb.storage.page import parse_page
 from quilldb.storage.pager import Pager
+
+# quill_stat1 mirrors sqlite_stat1's own shape exactly (chapter 12 §12.5):
+# three columns, `idx IS NULL` for the table's own row. It is an ordinary
+# table -- created once via Catalog.create_table(), like any user table --
+# not a special file-format structure, which is why it's fine for its
+# schema to live entirely in this module instead of constants.py.
+_STAT1_TABLE_NAME = "quill_stat1"
+_STAT1_TABLE_SQL = f"CREATE TABLE {_STAT1_TABLE_NAME} (tbl TEXT, idx TEXT, stat TEXT)"
 
 
 
@@ -244,3 +266,182 @@ def _rows_per_prefix(leaf_keys: list[tuple[Value, ...]], n_key_columns: int) -> 
 
         result.append(sum(run_lengths) // len(run_lengths))
     return tuple(result)
+
+
+
+
+class StatisticsCatalog:
+    """Owns `quill_stat1` and turns Steps 3-4's measurements into durable
+    rows: `analyze()` writes them, `table_stats()`/`index_stats()` read
+    them back (or fall back to the Stage-2 defaults when a target has never
+    been analyzed).
+
+
+    Constructed once per Connection, alongside Catalog -- see Step 6.
+    `quill_stat1` is created lazily on first use (not in __init__ eagerly
+    calling create_table, which would raise TableAlreadyExistsError on a
+    second `connect()` against the same file); __init__ instead looks the
+    table up via `catalog.get_table()` and only creates it on a miss, the
+    same get-or-create shape `Catalog.load()` itself doesn't need but
+    plenty of real sqlite_master bootstrapping code does.
+    """
+
+
+    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog) -> None:
+        self.pager = pager
+        self.pool = pool
+        self.catalog = catalog
+        self._table = self._ensure_table()
+
+
+    def _ensure_table(self) -> TableSchema:
+        try:
+            return self.catalog.get_table(_STAT1_TABLE_NAME)
+        except TableNotFoundError:
+            statement = parse(_STAT1_TABLE_SQL)
+            assert isinstance(statement, CreateTable)
+            return self.catalog.create_table(statement, _STAT1_TABLE_SQL)
+
+
+    # ------------------------------------------------------------------
+    # Row-level helpers: every method below works in terms of one
+    # (tbl, idx) key, `idx` being None for a table's own row -- analyze()
+    # composes these instead of touching TableCursor/BTree directly.
+    # ------------------------------------------------------------------
+
+
+    def _find_row(self, tbl: str, idx: str | None) -> str | None:
+        """The `stat` string for (tbl, idx), or None if no such row exists yet."""
+        with TableCursor(self.pager, self.pool, self._table.root_page) as cursor:
+            cursor.first()
+            while cursor.valid:
+                row_tbl, row_idx, stat = self._decode_row(cursor.record())
+                if row_tbl == tbl and row_idx == idx:
+                    return stat
+                cursor.next()
+        return None
+
+
+    @staticmethod
+    def _decode_row(payload: bytes) -> tuple[str, str | None, str]:
+        """decode_record() returns `Value` (any storable type) per column --
+        narrow it back to quill_stat1's own (TEXT, TEXT, TEXT) shape, the
+        same isinstance-narrowing pattern Catalog.load() uses for
+        sqlite_schema's own rows, since nothing else has already validated
+        a stray hand-edited row.
+        """
+        tbl, idx, stat = decode_record(payload)
+        if not isinstance(tbl, str) or not isinstance(stat, str) or not (idx is None or isinstance(idx, str)):
+            raise CorruptDatabaseError(f"quill_stat1 row has non-text tbl/idx/stat: {(tbl, idx, stat)!r}")
+        return tbl, idx, stat
+
+
+    def _clear_rows(self, tbl: str, idx: str | None) -> None:
+        """Delete every existing row for (tbl, idx) -- ANALYZE replaces
+        stale numbers rather than accumulating duplicate rows on a re-run.
+        Collects matching rowids before deleting any of them: mutating a
+        table while a TableCursor is mid-walk over it is exactly what
+        cursor.py's own module docstring says isn't promised to work.
+        """
+        stale_rowids = []
+        with TableCursor(self.pager, self.pool, self._table.root_page) as cursor:
+            cursor.first()
+            while cursor.valid:
+                row_tbl, row_idx, _ = self._decode_row(cursor.record())
+                if row_tbl == tbl and row_idx == idx:
+                    stale_rowids.append(cursor.rowid())
+                cursor.next()
+        bt = BTree(self.pager, self.pool, self._table.root_page)
+        for rowid in stale_rowids:
+            bt.delete(rowid)
+
+
+    def _write_row(self, tbl: str, idx: str | None, stat: str) -> None:
+        """Append one fresh row -- caller is responsible for having already
+        cleared any stale row for this same (tbl, idx) via _clear_rows().
+        """
+        payload = encode_record((tbl, idx, stat))
+        BTree(self.pager, self.pool, self._table.root_page).insert(self._next_rowid(), payload)
+
+
+    def _next_rowid(self) -> int:
+        """Same convention as exec/operators.py's Insert._next_rowid()."""
+        with TableCursor(self.pager, self.pool, self._table.root_page) as cursor:
+            cursor.last()
+            return cursor.rowid() + 1 if cursor.valid else 1
+
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+
+    def analyze(self, target: str | None = None) -> None:
+        """Measure real B-tree stats and persist them into `quill_stat1`.
+
+        One row per table (idx IS NULL) plus one row per index on it,
+        matching real sqlite_stat1's convention -- table_stats()/index_stats()
+        look up by (tbl, idx) independently, so a table with two indexes
+        gets three rows, not one.
+
+        Args:
+            target: a table name, to (re-)measure just that table and every
+                index on it; or None, to do the same for every table in the
+                catalog.
+        Raises:
+            TableNotFoundError: `target` names a table that doesn't exist --
+                let catalog.get_table()'s own error propagate, don't catch
+                or reword it.
+        """
+
+        if target is None:
+            for table in self.catalog.list_tables():
+                if table.name == _STAT1_TABLE_NAME:
+                    continue  # quill_stat1 isn't ANALYZE-able
+                self._analyze_table(table)
+        else:
+            self._analyze_table(self.catalog.get_table(target))
+
+
+    def _analyze_table(self, table: TableSchema) -> None:
+        """Measure one table and every index on it, replacing their
+        quill_stat1 rows -- the shared body both branches of analyze() call.
+        """
+        table_stats = measure_table(self.pager, self.pool, table.root_page)
+        self._clear_rows(table.name, None)
+        self._write_row(table.name, None, str(table_stats.row_count))
+        for index in self.catalog.indexes_for(table.name):
+            index_stats = measure_index(self.pager, self.pool, index.root_page, len(index.columns))
+            self._clear_rows(table.name, index.name)
+            self._write_row(table.name, index.name, encode_stat1_row(index_stats))
+
+    def table_stats(self, name: str) -> TableStats:
+        """This table's real stats, or the Stage-2 default if it has never
+        been ANALYZEd. Raises TableNotFoundError via catalog.get_table() if
+        `name` isn't a real table -- a typo shouldn't silently fall back to
+        the default the way "never analyzed" does.
+        """
+        self.catalog.get_table(name)  # validate the name; raises if unknown
+        stat = self._find_row(name, None)
+        if stat is None:
+            return default_table_stats()
+        return TableStats(row_count=int(stat))
+
+
+    def index_stats(self, index: IndexSchema) -> IndexStats:
+        """This index's real stats, or the Stage-2 default (derived from
+        this index's TABLE stats, same as default_index_stats() elsewhere)
+        if it has never been ANALYZEd.
+
+
+        Takes the IndexSchema itself rather than a bare name -- every
+        existing caller (build_operator's Step-2 wiring, iterating
+        catalog.indexes_for(table)) already has it in hand, and
+        default_index_stats() itself needs the schema too (to size
+        rows_per_prefix to len(index.columns)), so there's no lookup this
+        signature would save.
+        """
+        stat = self._find_row(index.table, index.name)
+        if stat is None:
+            return default_index_stats(index, self.table_stats(index.table))
+        return parse_stat1(stat, index)

@@ -9,18 +9,29 @@ real on-disk table.
 """
 
 
+import pytest
+
 from quilldb.btree.cells import decode_interior_table_cell
+from quilldb.btree.cursor import TableCursor
 from quilldb.catalog.catalog import Catalog
+from quilldb.codec.record import decode_record
 from quilldb.constants import PageType
+from quilldb.errors import TableNotFoundError
 from quilldb.exec.operators import Insert
-from quilldb.plan.analyze import measure_index, measure_table
+from quilldb.plan.analyze import StatisticsCatalog, measure_index, measure_table
+from quilldb.plan.statistics import (
+    IndexStats,
+    default_index_stats,
+    default_table_stats,
+    encode_stat1_row,
+    parse_stat1,
+)
 from quilldb.sql.ast import CreateIndex, CreateTable
 from quilldb.sql.binder import BoundInsert, bind
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import parse_page
 from quilldb.storage.pager import Pager
-
 
 _USERS_SQL = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 
@@ -285,3 +296,197 @@ def test_measure_index_leaves_no_pins(tmp_path) -> None:
     measure_index(pager, pool, index.root_page, n_key_columns=1)
     assert sum(entry.pin_count for entry in pool._cache.values()) == 0
     pager.close()
+
+
+
+
+# =====================================================================
+# Step 5: quill_stat1 persistence + StatisticsCatalog
+# =====================================================================
+
+
+
+
+def test_encode_stat1_row_round_trips_through_parse_stat1(tmp_path) -> None:
+    pager, _pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_name_age ON users (name, age)")
+
+
+    stats = IndexStats(row_count=6, rows_per_prefix=(3, 2))
+    assert parse_stat1(encode_stat1_row(stats), index) == stats
+    pager.close()
+
+
+
+
+def test_statistics_catalog_creates_quill_stat1_table(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+
+
+    StatisticsCatalog(pager, pool, catalog)
+
+
+    table = catalog.get_table("quill_stat1")
+    assert [c.name for c in table.columns] == ["tbl", "idx", "stat"]
+    pager.close()
+
+
+
+
+def test_statistics_catalog_reopen_does_not_recreate_table(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+
+
+    StatisticsCatalog(pager, pool, catalog)
+    StatisticsCatalog(pager, pool, catalog)  # must not raise TableAlreadyExistsError
+
+
+    pager.close()
+
+
+
+
+def test_table_stats_falls_back_to_default_before_analyze(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    assert stats_catalog.table_stats("users") == default_table_stats()
+    pager.close()
+
+
+
+
+def test_table_stats_unknown_table_raises(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    with pytest.raises(TableNotFoundError):
+        stats_catalog.table_stats("ghost")
+    pager.close()
+
+
+
+
+def test_index_stats_falls_back_to_default_before_analyze(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    assert stats_catalog.index_stats(index) == default_index_stats(index, default_table_stats())
+    pager.close()
+
+
+
+
+def test_analyze_one_table_persists_real_table_and_index_stats(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 11)])
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    stats_catalog.analyze("users")
+
+
+    assert stats_catalog.table_stats("users").row_count == 10
+    index_stats = stats_catalog.index_stats(index)
+    assert index_stats.row_count == 10
+    assert index_stats.rows_per_prefix == (1,)  # every age is distinct
+    pager.close()
+
+
+
+
+def test_analyze_unknown_target_raises(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    with pytest.raises(TableNotFoundError):
+        stats_catalog.analyze("ghost")
+    pager.close()
+
+
+
+
+def test_analyze_with_no_target_measures_every_table(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 4)])
+    orders_sql = "CREATE TABLE orders (id INTEGER, user_id INTEGER)"
+    orders_statement = parse(orders_sql)
+    assert isinstance(orders_statement, CreateTable)
+    catalog.create_table(orders_statement, orders_sql)
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+
+
+    stats_catalog.analyze(None)
+
+
+    assert stats_catalog.table_stats("users").row_count == 3
+    assert stats_catalog.table_stats("orders").row_count == 0
+    pager.close()
+
+
+
+
+def test_analyze_rerun_replaces_rather_than_duplicates_rows(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 4)])
+    stats_catalog = StatisticsCatalog(pager, pool, catalog)
+    stats_catalog.analyze("users")
+
+
+    _insert(pager, pool, catalog, (4, "u4", 4), (5, "u5", 5))
+    stats_catalog.analyze("users")
+
+
+    assert stats_catalog.table_stats("users").row_count == 5
+    stat1_table = catalog.get_table("quill_stat1")
+    with TableCursor(pager, pool, stat1_table.root_page) as cursor:
+        cursor.first()
+        matches = 0
+        while cursor.valid:
+            tbl, idx, _ = decode_record(cursor.record())
+            if (tbl, idx) == ("users", None):
+                matches += 1
+            cursor.next()
+    assert matches == 1
+    pager.close()
+
+
+
+
+def test_analyze_survives_reload(tmp_path) -> None:
+    path = tmp_path / "t.db"
+    pager = Pager.create(path)
+    pool = BufferPool(pager, capacity=64)
+    catalog = Catalog(pager, pool)
+    catalog.load()
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 8)])
+    StatisticsCatalog(pager, pool, catalog).analyze("users")
+    pool.flush_all()
+    pager.close()
+
+
+    reopened_pager = Pager.open(path)
+    reopened_pool = BufferPool(reopened_pager)
+    reopened_catalog = Catalog(reopened_pager, reopened_pool)
+    reopened_catalog.load()
+    reopened_stats = StatisticsCatalog(reopened_pager, reopened_pool, reopened_catalog)
+
+
+    reopened_index = reopened_catalog.indexes_for("users")[0]
+    assert reopened_stats.table_stats("users").row_count == 7
+    assert reopened_stats.index_stats(reopened_index).row_count == 7
+    reopened_pager.close()
