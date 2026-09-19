@@ -234,12 +234,12 @@ class Connection:
 
 
         if isinstance(bound, BoundInsert):
-            with build_operator(bound, self.pager, self.pool) as operator:
+            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
                 operator.next()
             return Cursor(None, None, 1)
 
 
-        operator = build_operator(bound, self.pager, self.pool)
+        operator = build_operator(bound, self.pager, self.pool, self.catalog)
         operator.open()
         description = tuple((_display_name(e),) for e in bound.expressions)
         cursor = Cursor(operator, description, -1)

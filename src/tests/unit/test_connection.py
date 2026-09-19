@@ -17,6 +17,7 @@ import pytest
 
 
 import quilldb
+from quilldb.btree.index import IndexBTree
 from quilldb.errors import (
     ColumnNotFoundError,
     ParameterCountError,
@@ -508,4 +509,43 @@ def test_create_index_on_missing_table_raises_before_a_cursor_opens() -> None:
     with pytest.raises(TableNotFoundError):
         db.execute("CREATE INDEX idx_ghost ON ghosts (col)")
     assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+# =====================================================================
+# Insert index maintenance, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_insert_after_create_index_keeps_the_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    index = db.catalog.indexes_for("users")[0]
+    assert list(IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False).seek_eq(["ada"])) == [1]
+    db.close()
+
+
+
+
+def test_insert_violating_a_unique_index_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    with pytest.raises(UniqueViolationError):
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "ada", 41))
+
+
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36)]
     db.close()

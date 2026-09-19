@@ -29,13 +29,17 @@ there.
 
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Self
 
 
 from quilldb.btree.btree import BTree
 from quilldb.btree.cursor import TableCursor
-from quilldb.catalog.schema import TableSchema
+from quilldb.btree.index import IndexBTree
+from quilldb.catalog.catalog import Catalog
+from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.codec.record import decode_record, encode_record
+from quilldb.errors import UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
 from quilldb.sql.binder import BoundExpression, BoundInsert, BoundSelect
 from quilldb.storage.bufferpool import BufferPool
@@ -226,13 +230,33 @@ class Insert(Operator):
     Returns no rows at all -- an INSERT has no result set, so next() answers
     None even on the call that does the write. The API layer reports the
     row count instead (Cursor.rowcount).
+
+
+    `indexes` is every index on this table (Catalog.indexes_for(), resolved
+    once by build_operator() -- there's no per-row loop here to hoist it
+    out of, since one Insert instance ever writes exactly one row). Every
+    UNIQUE index among them is checked for a conflict before the table row
+    -- or anything else -- is written, mirroring create_index()'s backfill
+    (week-4 doc rule 2: "a UNIQUE violation raises before any page is
+    written"). The table row is written before any index entry: absent
+    transactions until week 5, a row that exists but is momentarily
+    missing from an index is recoverable (DROP INDEX and recreate); an
+    index entry pointing at a rowid that was never actually written would
+    not be.
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, statement: BoundInsert) -> None:
+    def __init__(
+        self,
+        pager: Pager,
+        pool: BufferPool,
+        statement: BoundInsert,
+        indexes: Sequence[IndexSchema] = (),
+    ) -> None:
         self.pager = pager
         self.pool = pool
         self.statement = statement
+        self.indexes = indexes
         self._attempted = False
 
 
@@ -249,9 +273,34 @@ class Insert(Operator):
         self._attempted = True
 
 
+        table = self.statement.table
+        values = self.statement.values
+        keyed_indexes = [
+            (index, [values[table.column_index(column)] for column in index.columns])
+            for index in self.indexes
+        ]
+
+
+        for index, key in keyed_indexes:
+            if not index.unique:
+                continue
+            probe = IndexBTree(self.pager, self.pool, index.root_page, n_key_columns=len(index.columns), unique=True)
+            if probe.find_conflict(key) is not None:
+                raise UniqueViolationError(index.name, tuple(key))
+
+
         rowid = self._next_rowid()
-        payload = encode_record(self.statement.values)
-        BTree(self.pager, self.pool, self.statement.table.root_page).insert(rowid, payload)
+        payload = encode_record(values)
+        BTree(self.pager, self.pool, table.root_page).insert(rowid, payload)
+
+
+        for index, key in keyed_indexes:
+            ibt = IndexBTree(
+                self.pager, self.pool, index.root_page, n_key_columns=len(index.columns), unique=index.unique
+            )
+            ibt.insert(key, rowid)
+
+
         return None
 
 
@@ -269,7 +318,8 @@ class Insert(Operator):
 
     def close(self) -> None:
         # Nothing held between calls: _next_rowid()'s cursor is closed by its
-        # own `with`, and BTree.insert() unpins everything it touches.
+        # own `with`, and BTree.insert()/IndexBTree.insert() unpin everything
+        # they touch.
         pass
 
 
@@ -283,6 +333,7 @@ def build_operator(
     statement: BoundSelect | BoundInsert,
     pager: Pager,
     pool: BufferPool,
+    catalog: Catalog,
 ) -> Operator:
     """Translate a bound statement into the Week 3 fixed plan.
 
@@ -300,9 +351,14 @@ def build_operator(
     IndexScan, without changing any operator contract above; that's the
     payoff for keeping the choice here rather than inlining it into
     Connection.execute().
+
+    `catalog` isn't used by the SELECT plan yet -- it exists so INSERT can
+    resolve which indexes need maintaining (Catalog.indexes_for()), and so
+    this signature doesn't have to change again once IndexScan needs it too.
     """
     if isinstance(statement, BoundInsert):
-        return Insert(pager, pool, statement)
+        indexes = catalog.indexes_for(statement.table.name)
+        return Insert(pager, pool, statement, indexes)
 
 
     source: Operator = SeqScan(pager, pool, statement.table)

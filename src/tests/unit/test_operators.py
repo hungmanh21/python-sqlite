@@ -13,11 +13,12 @@ PoolExhaustedError somewhere unrelated, so it has to be asserted directly.
 import pytest
 
 
+from quilldb.btree.index import IndexBTree
 from quilldb.catalog.catalog import Catalog
-from quilldb.catalog.schema import TableSchema
-from quilldb.errors import TypeMismatchError
+from quilldb.catalog.schema import IndexSchema, TableSchema
+from quilldb.errors import TypeMismatchError, UniqueViolationError
 from quilldb.exec.operators import Filter, Insert, Operator, Project, SeqScan, build_operator
-from quilldb.sql.ast import CreateTable, DataType
+from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
     BoundBinaryOp,
     BoundColumn,
@@ -50,6 +51,14 @@ def _create_users(catalog: Catalog) -> TableSchema:
     statement = parse(_USERS_SQL)
     assert isinstance(statement, CreateTable)
     return catalog.create_table(statement, _USERS_SQL)
+
+
+
+
+def _create_index(catalog: Catalog, sql: str) -> IndexSchema:
+    statement = parse(sql)
+    assert isinstance(statement, CreateIndex)
+    return catalog.create_index(statement, sql)
 
 
 
@@ -563,7 +572,7 @@ def test_build_operator_builds_project_over_filter_over_seqscan(tmp_path) -> Non
     _create_users(catalog)
 
 
-    plan = build_operator(_select(catalog, "SELECT name FROM users WHERE age > 30"), pager, pool)
+    plan = build_operator(_select(catalog, "SELECT name FROM users WHERE age > 30"), pager, pool, catalog)
     assert plan.explain() == "Project\n└─ Filter\n   └─ SeqScan users"
     pager.close()
 
@@ -575,7 +584,7 @@ def test_build_operator_omits_filter_without_a_where(tmp_path) -> None:
     _create_users(catalog)
 
 
-    plan = build_operator(_select(catalog, "SELECT name FROM users"), pager, pool)
+    plan = build_operator(_select(catalog, "SELECT name FROM users"), pager, pool, catalog)
     assert plan.explain() == "Project\n└─ SeqScan users"
     pager.close()
 
@@ -589,7 +598,7 @@ def test_build_operator_builds_an_insert(tmp_path) -> None:
 
     bound = bind(parse("INSERT INTO users VALUES (1, 'ada', 36)"), catalog)
     assert isinstance(bound, BoundInsert)
-    plan = build_operator(bound, pager, pool)
+    plan = build_operator(bound, pager, pool, catalog)
     assert isinstance(plan, Insert)
     assert plan.explain() == "Insert users"
     pager.close()
@@ -613,6 +622,7 @@ def test_the_whole_pipeline_end_to_end(tmp_path) -> None:
         _select(catalog, "SELECT name, age + 1 FROM users WHERE age > ? AND name LIKE 'a%'", 30),
         pager,
         pool,
+        catalog,
     )
     assert _drain(plan) == [("ada", 37), ("amy", 42)]
     assert _outstanding_pins(pool) == 0
@@ -627,7 +637,7 @@ def test_select_star_through_the_pipeline(tmp_path) -> None:
     _insert(pager, pool, catalog, (1, "ada", 36))
 
 
-    plan = build_operator(_select(catalog, "SELECT * FROM users"), pager, pool)
+    plan = build_operator(_select(catalog, "SELECT * FROM users"), pager, pool, catalog)
     assert _drain(plan) == [(1, "ada", 36)]
     pager.close()
 
@@ -639,6 +649,109 @@ def test_select_on_an_empty_table_returns_no_rows_not_an_error(tmp_path) -> None
     _create_users(catalog)
 
 
-    plan = build_operator(_select(catalog, "SELECT * FROM users WHERE age > 30"), pager, pool)
+    plan = build_operator(_select(catalog, "SELECT * FROM users WHERE age > 30"), pager, pool, catalog)
     assert _drain(plan) == []
+    pager.close()
+
+
+
+
+# =====================================================================
+# Insert: index maintenance
+# =====================================================================
+
+
+
+
+def _insert_via_build_operator(pager: Pager, pool: BufferPool, catalog: Catalog, row: tuple[object, ...]) -> None:
+    bound = bind(parse("INSERT INTO users VALUES (?, ?, ?)"), catalog, row)
+    assert isinstance(bound, BoundInsert)
+    with build_operator(bound, pager, pool, catalog) as operator:
+        operator.next()
+
+
+
+
+def test_insert_adds_an_entry_to_every_index_on_the_table(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    name_index = _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    age_index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+
+
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+
+
+    assert list(IndexBTree(pager, pool, name_index.root_page, n_key_columns=1, unique=False).seek_eq(["ada"])) == [1]
+    assert list(IndexBTree(pager, pool, age_index.root_page, n_key_columns=1, unique=False).seek_eq([36])) == [1]
+    pager.close()
+
+
+
+
+def test_insert_ignores_a_table_with_no_indexes(tmp_path) -> None:
+    """Insert(indexes=()) is the default -- confirms a table with no
+    indexes doesn't even try to touch one.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+
+
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+
+
+    assert _drain(SeqScan(pager, pool, catalog.get_table("users"))) == [(1, "ada", 36)]
+    pager.close()
+
+
+
+
+def test_insert_checks_unique_conflict_before_writing_anything(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+    _create_index(catalog, "CREATE UNIQUE INDEX idx_name ON users (name)")
+    page_count_before = pager.page_count
+
+
+    with pytest.raises(UniqueViolationError) as excinfo:
+        _insert_via_build_operator(pager, pool, catalog, (2, "ada", 41))
+
+
+    assert excinfo.value.index_name == "idx_name"
+    assert excinfo.value.key == ("ada",)
+    assert pager.page_count == page_count_before  # nothing allocated on the failure path
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 36)]  # the second row was never written
+    pager.close()
+
+
+
+
+def test_insert_allows_many_nulls_in_a_unique_indexed_column(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE UNIQUE INDEX idx_name ON users (name)")
+
+
+    _insert_via_build_operator(pager, pool, catalog, (1, None, 36))
+    _insert_via_build_operator(pager, pool, catalog, (2, None, 41))  # must not raise
+
+
+    assert _drain(SeqScan(pager, pool, catalog.get_table("users"))) == [(1, None, 36), (2, None, 41)]
+    pager.close()
+
+
+
+
+def test_insert_with_indexes_leaves_no_pins(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+
+
+    for i in range(1, 21):
+        _insert_via_build_operator(pager, pool, catalog, (i, f"u{i}", i))
+
+
+    assert _outstanding_pins(pool) == 0
     pager.close()
