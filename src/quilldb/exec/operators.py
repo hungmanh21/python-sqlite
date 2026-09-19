@@ -29,23 +29,26 @@ there.
 
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Self
 
 
 from quilldb.btree.btree import BTree
 from quilldb.btree.cursor import TableCursor
-from quilldb.btree.index import IndexBTree
+from quilldb.btree.index import IndexBTree, compare_keys
 from quilldb.catalog.catalog import Catalog
 from quilldb.catalog.schema import IndexSchema, TableSchema
-from quilldb.codec.record import decode_record, encode_record
+from quilldb.codec.record import Value, decode_record, encode_record
 from quilldb.errors import PageFullError, UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
+from quilldb.plan.planner import AccessPath
+from quilldb.plan.predicates import Predicate
 from quilldb.sql.binder import (
     BoundAssignment,
     BoundDelete,
     BoundExpression,
     BoundInsert,
+    BoundLiteral,
     BoundSelect,
     BoundUpdate,
 )
@@ -156,6 +159,202 @@ class SeqScan(Operator):
 
     def explain(self, depth: int = 0) -> str:
         return _explain_line(depth, f"SeqScan {self.table.name}")
+
+
+
+
+def _literal_value(predicate: Predicate) -> Value:
+    """A seek_term's literal value -- always a BoundLiteral once a Predicate
+    is sargable (classify_predicate's contract, plan/predicates.py), so this
+    narrows what mypy still sees as the general BoundExpression union.
+    """
+    assert isinstance(predicate.value, BoundLiteral), (
+        f"seek_term {predicate.column!r} has a non-literal value: {type(predicate.value).__name__}"
+    )
+    return predicate.value.value
+
+
+
+
+class IndexScan(Operator):
+    """Stream rows by seeking an index, then point-looking-up each matching
+    rowid in the table.
+
+
+    `IndexBTree.seek_eq`/`seek_range` yield rowids only -- an index entry's
+    payload is (key values, rowid), never the table's other columns. So
+    every IndexScan does two lookups per row: seek the index for the rowids
+    that satisfy `path.seek_terms`, then `TableCursor.seek(rowid)` to fetch
+    the actual row. That two-step shape is why `assign_cost` (plan/cost.py)
+    prices every IndexScan with a per-row `RANDOM_PAGE_COST * table height`
+    term -- there is no covering-index case yet where that second lookup
+    could be skipped.
+
+
+    `path.residual` is NOT applied here -- it becomes a Filter above this
+    operator in build_operator(), same as SeqScan never filters its own
+    output. This operator's only job is "produce exactly the rows this
+    index seek matches," nothing more.
+    """
+
+
+    def __init__(self, pager: Pager, pool: BufferPool, table: TableSchema, path: AccessPath) -> None:
+        self.pager = pager
+        self.pool = pool
+        self.table = table
+        self.path = path
+        self._rowids: Iterator[int] | None = None
+        self._cursor: TableCursor | None = None
+
+
+    def open(self) -> None:
+        """Position this scan at the start of its rowid stream.
+
+
+        Build the IndexBTree for `self.path.index` (same constructor shape
+        Insert/Delete/Update already use elsewhere in this file:
+        `IndexBTree(self.pager, self.pool, index.root_page,
+        n_key_columns=len(index.columns), unique=index.unique)`), then call
+        either `seek_eq` or `seek_range` on it, and store the resulting
+        rowid iterator on `self._rowids`.
+
+
+        Which method to call depends on the SHAPE of `self.path.seek_terms`
+        (chapter 12 §12.3, the same leading-column rule `_match_index_prefix`
+        in plan/planner.py already used to build these seek_terms):
+
+
+          - If every seek_term is an equality (`operator in ("=", "IS")`),
+            the seek is a single POINT: call `seek_eq(values)` where `values`
+            is the seek_terms' literal values, in index-column order. (A
+            future `IN`-as-equality case would mean more than one point --
+            not reachable yet, since nothing upstream produces two equality
+            predicates on the same column today.)
+          - If the LAST seek_term is an inequality (`<`, `<=`, `>`, `>=`) --
+            the sandwich case -- everything before it is still a leading
+            equality prefix. Call `seek_range(low, high, low_inclusive=...,
+            high_inclusive=...)` where `low`/`high` are each the leading
+            equality values PLUS that column's lower/upper bound (only
+            whichever bounds are actually present -- `low`/`high` each
+            default to None for "unbounded" on that side). `compare_keys`
+            (btree/index.py) already handles a probe shorter than a stored
+            key by comparing only the shared prefix, so a `low`/`high` probe
+            that's just the equality prefix plus one bound is exactly what
+            seek_range expects.
+
+
+        A literal value comes out of a `Predicate` via `predicate.value` --
+        always a `BoundLiteral` once this predicate reached here, so
+        `predicate.value.value` is the actual Value to pass to IndexBTree.
+
+
+        This operator does its own per-row table lookups in next() through
+        a single reused TableCursor -- build it here as
+        `self._cursor = TableCursor(self.pager, self.pool, self.table.root_page)`,
+        matching how SeqScan.open() builds its cursor. Re-opening must reset
+        rather than leak, same rule as SeqScan.open().
+        """
+        index = self.path.index
+        self.close()  # re-opening resets rather than leaking the old cursor
+        if not index:
+            return
+        btree = IndexBTree(self.pager, self.pool, index.root_page, n_key_columns=len(index.columns), unique=index.unique)
+        self._cursor = TableCursor(self.pager, self.pool, self.table.root_page)
+
+
+        # check if seek terms is all equal comparison
+        all_eq = True
+
+
+        for predicate in self.path.seek_terms:
+            if predicate.operator not in ["=", "IS"]:
+                all_eq = False
+
+
+        if all_eq:
+            # get all the predicates
+            values = [_literal_value(predicate) for predicate in self.path.seek_terms]
+            self._rowids = btree.seek_eq(values)
+        else:
+            equality_prefix = [_literal_value(predicate) for predicate in self.path.seek_terms if predicate.operator in ["=", "IS"]]
+            low_bound: list[Value] = []
+            high_bound: list[Value] = []
+            low_inclusive = high_inclusive = True
+
+
+            for predicate in self.path.seek_terms:
+                value = _literal_value(predicate)
+                if predicate.operator in ["<", "<="]:
+                    # keep the TIGHTEST (smallest) upper bound seen -- two
+                    # same-direction inequalities on one column (e.g. a
+                    # redundant `age<10 AND age<7`) must narrow, not just
+                    # take whichever appears last in seek_terms.
+                    if not high_bound or compare_keys([value], high_bound) < 0:
+                        high_bound = [value]
+                        high_inclusive = predicate.operator == "<="
+                    elif compare_keys([value], high_bound) == 0 and predicate.operator == "<":
+                        high_inclusive = False
+                elif predicate.operator in [">", ">="]:
+                    # keep the TIGHTEST (largest) lower bound seen, same
+                    # reasoning as above but for the other direction.
+                    if not low_bound or compare_keys([value], low_bound) > 0:
+                        low_bound = [value]
+                        low_inclusive = predicate.operator == ">="
+                    elif compare_keys([value], low_bound) == 0 and predicate.operator == ">":
+                        low_inclusive = False
+
+
+            # An equality prefix confines the seek to that prefix even with
+            # no explicit inequality on this side -- None here would mean
+            # "fully unbounded", which spills past the prefix into the next
+            # distinct value of the leading column(s) (e.g. name='ada' AND
+            # age>20 must not also match name='bob').
+            lower_bounds = equality_prefix + low_bound if (equality_prefix or low_bound) else None
+            higher_bounds = equality_prefix + high_bound if (equality_prefix or high_bound) else None
+            self._rowids = btree.seek_range(
+                low=lower_bounds,
+                high=higher_bounds,
+                low_inclusive=low_inclusive,
+                high_inclusive=high_inclusive
+            )
+
+
+
+
+    def next(self) -> Row | None:
+        if self._rowids is None or self._cursor is None:
+            return None
+        try:
+            for rowid in self._rowids:
+                # seek() closes and repositions the SAME cursor -- each
+                # rowid is an independent point lookup, so there is nothing
+                # to carry over between them the way SeqScan carries a
+                # standing position forward.
+                found = self._cursor.seek(rowid)
+                if not found:
+                    # The index entry exists but the table row is gone --
+                    # can't happen within one statement (no concurrent
+                    # writers yet), but skipping rather than raising keeps
+                    # this scan's own resource discipline self-contained.
+                    continue
+                return decode_record(self._cursor.record())
+            self._rowids = None
+            return None
+        except Exception:
+            self.close()
+            raise
+
+
+    def close(self) -> None:
+        if self._cursor is not None:
+            self._cursor.close()
+            self._cursor = None
+        self._rowids = None
+
+
+    def explain(self, depth: int = 0) -> str:
+        index_name = self.path.index.name if self.path.index is not None else "?"
+        return _explain_line(depth, f"IndexScan {index_name}")
 
 
 
