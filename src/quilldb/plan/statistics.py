@@ -46,14 +46,35 @@ _DEFAULT_TABLE_ROWS = 1_000_000
 _DEFAULT_ROWS_PER_VALUE = 10
 
 
+# Neither quill_stat1's K+1-integer format nor sqlite_stat1's covers page
+# counts or B-tree height -- ANALYZE would have to measure those by
+# walking the real B-tree, which isn't wired up yet. Stage 3's shape
+# fields fall back to one flat, documented fanout assumption instead:
+# ~100 rows/entries per page, which is also why _DEFAULT_TABLE_ROWS
+# (1,000,000) is 100**3 -- a fallback table and a fallback index both
+# land at height 3 under this assumption, so the two defaults tell one
+# consistent story instead of two unrelated magic numbers.
+_DEFAULT_ROWS_PER_PAGE = 100
+_DEFAULT_PAGE_COUNT = _DEFAULT_TABLE_ROWS // _DEFAULT_ROWS_PER_PAGE
+_DEFAULT_HEIGHT = 3
+
+
 
 
 @dataclass(frozen=True)
 class TableStats:
-    """`quill_stat1`'s row for a table with `idx IS NULL`: just a row count."""
+    """`quill_stat1`'s row for a table with `idx IS NULL` (`row_count`),
+    plus the B-tree shape numbers stage 3's cost model needs and
+    quill_stat1 never stored: `page_count` prices a SeqScan's page reads,
+    `height` prices the one random lookup an IndexScan pays per fetched
+    row to find the matching table row. Both default to the flat fanout
+    fallback above when real numbers aren't available.
+    """
 
 
     row_count: int
+    page_count: int = _DEFAULT_PAGE_COUNT
+    height: int = _DEFAULT_HEIGHT
 
 
 
@@ -61,7 +82,14 @@ class TableStats:
 @dataclass(frozen=True)
 class IndexStats:
     """One index's decoded `quill_stat1` row: the K+1 integers from the
-    `stat` column, unpacked into names stage 2 can index into directly.
+    `stat` column, unpacked into names stage 2 can index into directly --
+    plus `height` and `leaf_pages` (this index's TOTAL leaf page count,
+    not a per-scan count), the same kind of B-tree shape fields as
+    TableStats, needed for stage 3's IndexScan cost and, like them, absent
+    from quill_stat1's own format. A scan that only fetches a fraction of
+    `row_count` rows walks that same fraction of `leaf_pages` -- stage 3
+    derives the per-scan leaf-page count from this ratio rather than
+    storing it directly, since it depends on how selective the seek is.
 
 
     `row_count` is the first integer (rows in the index -- always equal to
@@ -82,6 +110,8 @@ class IndexStats:
 
     row_count: int
     rows_per_prefix: tuple[int, ...]
+    height: int = _DEFAULT_HEIGHT
+    leaf_pages: int = _DEFAULT_PAGE_COUNT
 
 
 
@@ -129,8 +159,7 @@ def parse_stat1(stat: str, index: IndexSchema) -> IndexStats:
 
 
 def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats: TableStats) -> AccessPath:
-    """TODO(human): fill in `rows_fetched` and `est_rows` (chapter 12 §12.6
-    stage 2).
+    """Fill in `rows_fetched` and `est_rows` (chapter 12 §12.6 stage 2).
 
 
     Args:

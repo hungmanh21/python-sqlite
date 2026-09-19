@@ -20,6 +20,25 @@ from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.plan.predicates import Predicate
 
 
+@dataclass(frozen=True)
+class PlanCost:
+    """A path's page-read-equivalent cost (chapter 12 §12.6 stage 3).
+
+
+    `startup`: cost paid before the first row comes out (an IndexScan's
+    root-to-leaf descent; 0 for a SeqScan, which starts producing rows
+    from the first page it reads).
+    `total`: startup plus every further page read and per-row CPU cost
+    to exhaust the whole path. `total` is what choose_access_path()
+    (not yet built) ranks candidates on; `startup` only matters once a
+    LIMIT or an ORDER BY makes "first row fast" worth something on its
+    own.
+    """
+
+
+    startup: float
+    total: float
+
 
 
 @dataclass(frozen=True)
@@ -38,6 +57,8 @@ class AccessPath:
     `rows_fetched` and `est_rows` are 0 until stage 2
     (plan/statistics.py's estimate_row_counts) fills them in -- stage 1
     only decides legality, so it has nothing to estimate from yet.
+    `cost` is None until stage 3 (plan/cost.py's assign_cost) fills it
+    in, for the same reason.
     """
 
 
@@ -47,6 +68,7 @@ class AccessPath:
     residual: tuple[Predicate, ...]
     rows_fetched: int = 0
     est_rows: int = 0
+    cost: PlanCost | None = None
 
 
 
