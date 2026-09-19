@@ -128,7 +128,10 @@ class CreateIndex:
 @dataclass(frozen=True)
 class Analyze:
     target: str | None = None
-    """A table or index name, or None to analyze everything."""
+    """A table name, or None to analyze every table. Unlike real SQLite,
+    an index name here is not resolved to its owning table -- StatisticsCatalog.analyze()
+    treats `target` strictly as a table name and raises TableNotFoundError
+    otherwise."""
 
 
 

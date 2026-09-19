@@ -203,6 +203,8 @@ rows/value beats x_idx at ~5,000").
 IndexScan and `ANALYZE; SELECT ... WHERE low_selectivity_col = ?` picks a
 SeqScan, both driven by real measured statistics, not the flat default.
 
+[STATUS: COMPLETE]
+
 
 ## Step 7 — `EXPLAIN` and `EXPLAIN ANALYZE`
 

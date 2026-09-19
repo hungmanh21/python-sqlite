@@ -32,7 +32,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from typing import Self
 
-
 from quilldb.btree.btree import BTree
 from quilldb.btree.cursor import TableCursor
 from quilldb.btree.index import IndexBTree, compare_keys
@@ -41,6 +40,7 @@ from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.codec.record import Value, decode_record, encode_record
 from quilldb.errors import PageFullError, UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
+from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.plan.cost import assign_cost
 from quilldb.plan.planner import AccessPath, enumerate_access_paths
 from quilldb.plan.predicates import Predicate, classify_predicate, extract_conjuncts
@@ -58,8 +58,6 @@ from quilldb.sql.binder import (
 )
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
-
-
 
 
 class Operator(ABC):
@@ -880,11 +878,12 @@ def build_operator(
     pager: Pager,
     pool: BufferPool,
     catalog: Catalog,
+    stats: StatisticsCatalog | None = None,
 ) -> Operator:
     """Translate a bound statement into an executable operator tree.
 
 
-    The SELECT plan is now cost-based (chapter 12 §12.6, stages 1-4 from
+    The SELECT plan is cost-based (chapter 12 §12.6, stages 1-4 from
     plan/predicates.py, plan/planner.py, plan/statistics.py, plan/cost.py,
     plan/search.py):
 
@@ -894,14 +893,17 @@ def build_operator(
            └─ SeqScan | IndexScan
 
 
-    ANALYZE doesn't exist yet (that's Steps 3-6 of the stage-5 checklist),
-    so every candidate is costed against the flat, documented fallback
-    stats (`default_table_stats`/`default_index_stats`) rather than real
-    measurements -- `choose_access_path` still picks correctly among
-    legal candidates, it just can't yet tell a genuinely selective index
-    apart from a mediocre one. That's fine: this step is specifically
-    scoped to prove the wiring is correct BEFORE real statistics exist, so
-    a bug here can't later be confused with a bug in ANALYZE's arithmetic.
+    `stats` is where real ANALYZE numbers enter the planner (stage-5 Step
+    6): when a StatisticsCatalog is supplied, every candidate is costed
+    against its `table_stats()`/`index_stats()` -- real measurements when
+    the table/index has been ANALYZEd, the same flat documented fallback
+    as before when it hasn't (StatisticsCatalog itself owns that
+    fallback, so there's nothing left for this function to fall back to).
+    `stats=None` (the default) skips StatisticsCatalog entirely and costs
+    every candidate against the flat fallback directly -- this is what
+    lets Step 2's own tests keep calling build_operator() without a live
+    Catalog-backed StatisticsCatalog of their own, exactly the isolation
+    those tests were written under before ANALYZE existed.
 
 
     `Filter` is built ONLY from what the chosen path doesn't already
@@ -935,11 +937,16 @@ def build_operator(
     predicates, non_sargable = _extract_predicates(statement.where)
 
 
-    table_stats = default_table_stats()
+    table_stats = stats.table_stats(statement.table.name) if stats is not None else default_table_stats()
     candidates = enumerate_access_paths(statement.table, list(indexes), predicates)
     costed_candidates = []
     for candidate in candidates:
-        index_stats = default_index_stats(candidate.index, table_stats) if candidate.index is not None else None
+        if candidate.index is None:
+            index_stats = None
+        elif stats is not None:
+            index_stats = stats.index_stats(candidate.index)
+        else:
+            index_stats = default_index_stats(candidate.index, table_stats)
         candidate = estimate_row_counts(candidate, index_stats, table_stats)
         candidate = assign_cost(candidate, index_stats, table_stats)
         costed_candidates.append(candidate)

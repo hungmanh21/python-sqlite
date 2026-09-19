@@ -12,9 +12,7 @@ DB-API fetch/close contract from docs/implementation/week-3-sql.md §20.
 
 from pathlib import Path
 
-
 import pytest
-
 
 import quilldb
 from quilldb.btree.index import IndexBTree
@@ -25,7 +23,7 @@ from quilldb.errors import (
     TypeMismatchError,
     UniqueViolationError,
 )
-
+from quilldb.plan.statistics import default_table_stats
 
 _USERS_SQL = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 
@@ -693,3 +691,94 @@ def test_update_survives_close_and_reopen(tmp_path: Path) -> None:
 
     with quilldb.connect(path) as db:
         assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 40)]
+
+
+
+
+# =====================================================================
+# ANALYZE: stage-5 Step 6 -- bound, dispatched, and connected to real stats
+# =====================================================================
+
+
+
+
+def test_analyze_runs_through_execute_and_leaves_no_pins() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("ANALYZE")
+    assert cursor.rowcount == 0
+    assert cursor.description is None
+    assert _outstanding_pins(db) == 0
+    assert db.stats.table_stats("users").row_count == 1
+    db.close()
+
+
+
+
+def test_analyze_with_a_target_measures_only_that_table() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("ANALYZE users")
+
+
+    assert db.stats.table_stats("users").row_count == 1
+    assert db.stats.table_stats("orders") == default_table_stats()  # never analyzed -- still the flat default
+    db.close()
+
+
+
+
+def test_analyze_unknown_target_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+
+
+    with pytest.raises(TableNotFoundError):
+        db.execute("ANALYZE ghost")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_analyze_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 41))
+        db.execute("ANALYZE")
+
+
+    with quilldb.connect(path) as db:
+        assert db.stats.table_stats("users").row_count == 2
+
+
+
+
+def test_analyze_never_changes_query_results() -> None:
+    """Chapter 12 §12.6 trap #3, at the Connection seam this time: whether
+    or not ANALYZE has run, the same query returns the same rows --
+    ANALYZE is only allowed to change which plan answers a query, never
+    the answer itself.
+    """
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_age ON users (age)")
+    for row in [(1, "ada", 36), (2, "bob", 41), (3, "cleo", 22)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    before = db.execute("SELECT * FROM users WHERE age > 30").fetchall()
+    db.execute("ANALYZE")
+    after = db.execute("SELECT * FROM users WHERE age > 30").fetchall()
+
+
+    assert before == after == [(1, "ada", 36), (2, "bob", 41)]
+    db.close()

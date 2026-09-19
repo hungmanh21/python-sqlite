@@ -328,7 +328,7 @@ def test_statistics_catalog_creates_quill_stat1_table(tmp_path) -> None:
 
 
     table = catalog.get_table("quill_stat1")
-    assert [c.name for c in table.columns] == ["tbl", "idx", "stat"]
+    assert [c.name for c in table.columns] == ["tbl", "idx", "stat", "page_count", "height"]
     pager.close()
 
 
@@ -386,7 +386,7 @@ def test_index_stats_falls_back_to_default_before_analyze(tmp_path) -> None:
 
 def test_analyze_one_table_persists_real_table_and_index_stats(tmp_path) -> None:
     pager, pool, catalog = _db(tmp_path)
-    _create_users(catalog)
+    table = _create_users(catalog)
     index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
     _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 11)])
     stats_catalog = StatisticsCatalog(pager, pool, catalog)
@@ -395,10 +395,24 @@ def test_analyze_one_table_persists_real_table_and_index_stats(tmp_path) -> None
     stats_catalog.analyze("users")
 
 
-    assert stats_catalog.table_stats("users").row_count == 10
+    # Pin against measure_table/measure_index directly, independent of
+    # StatisticsCatalog's own persistence -- the same "provable, not
+    # guessed" discipline Steps 3-4's tests use.
+    expected_table = measure_table(pager, pool, table.root_page)
+    expected_index = measure_index(pager, pool, index.root_page, n_key_columns=1)
+
+
+    table_stats = stats_catalog.table_stats("users")
+    assert table_stats.row_count == 10
+    assert table_stats.page_count == expected_table.page_count
+    assert table_stats.height == expected_table.height
+
+
     index_stats = stats_catalog.index_stats(index)
     assert index_stats.row_count == 10
     assert index_stats.rows_per_prefix == (1,)  # every age is distinct
+    assert index_stats.leaf_pages == expected_index.leaf_pages
+    assert index_stats.height == expected_index.height
     pager.close()
 
 
@@ -455,7 +469,7 @@ def test_analyze_rerun_replaces_rather_than_duplicates_rows(tmp_path) -> None:
         cursor.first()
         matches = 0
         while cursor.valid:
-            tbl, idx, _ = decode_record(cursor.record())
+            tbl, idx, *_ = decode_record(cursor.record())
             if (tbl, idx) == ("users", None):
                 matches += 1
             cursor.next()

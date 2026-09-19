@@ -13,9 +13,7 @@ PoolExhaustedError somewhere unrelated, so it has to be asserted directly.
 import pathlib
 import tempfile
 
-
 import pytest
-
 
 from quilldb.btree.cells import encode_leaf_table_cell
 from quilldb.btree.index import IndexBTree
@@ -34,6 +32,7 @@ from quilldb.exec.operators import (
     Update,
     build_operator,
 )
+from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
     BoundBinaryOp,
@@ -49,7 +48,6 @@ from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, serialize_page
 from quilldb.storage.pager import Pager
-
 
 _USERS_SQL = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 
@@ -636,6 +634,48 @@ def test_build_operator_chooses_index_scan_for_an_indexed_equality(tmp_path) -> 
     plan = build_operator(_select(catalog, "SELECT * FROM users WHERE age = 7"), pager, pool, catalog)
     assert plan.explain() == "Project\n└─ IndexScan idx_age"
     assert _drain(plan) == [(7, "u7", 7)]
+    pager.close()
+
+
+
+
+def test_build_operator_uses_real_analyzed_stats_to_choose_between_indexes(tmp_path) -> None:
+    """Chapter 12's own ANALYZE demonstration (§12.6, stage-5 Step 6): a
+    genuinely selective index (`age`, unique per row) is chosen over a
+    genuinely unselective one (`name`, one of two values shared by every
+    row) only once real numbers exist -- default_index_stats() treats
+    every index as equally (10 rows/value) selective, so this contrast is
+    only visible once StatisticsCatalog.analyze() has run.
+
+
+    1,000 padded-string rows, not the usual handful: with only a page or
+    two of data, a real (small) table height makes SeqScan cheap enough to
+    beat any IndexScan outright, selective or not -- there's no contrast
+    to observe until the table is big enough that a full scan actually
+    costs more than a seek plus a handful of row fetches.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(
+        pager, pool, catalog,
+        *[(i, "even_padded_for_size_xxx" if i % 2 == 0 else "odd_padded_for_size_xxxx", i) for i in range(1, 1001)],
+    )
+    stats = StatisticsCatalog(pager, pool, catalog)
+    stats.analyze("users")
+
+
+    selective_plan = build_operator(
+        _select(catalog, "SELECT * FROM users WHERE age = 7"), pager, pool, catalog, stats
+    )
+    assert selective_plan.explain() == "Project\n└─ IndexScan idx_age"
+
+
+    unselective_plan = build_operator(
+        _select(catalog, "SELECT * FROM users WHERE name = 'even_padded_for_size_xxx'"), pager, pool, catalog, stats
+    )
+    assert unselective_plan.explain() == "Project\n└─ Filter\n   └─ SeqScan users"
     pager.close()
 
 

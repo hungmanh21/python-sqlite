@@ -29,7 +29,6 @@ Two properties this module exists to guarantee:
 from dataclasses import dataclass
 from typing import Protocol
 
-
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
@@ -39,6 +38,7 @@ from quilldb.errors import (
     UnsupportedFeatureError,
 )
 from quilldb.sql.ast import (
+    Analyze,
     BinaryOp,
     Column,
     CreateIndex,
@@ -55,8 +55,6 @@ from quilldb.sql.ast import (
     UnaryOp,
     Update,
 )
-
-
 
 
 class SchemaSource(Protocol):
@@ -206,7 +204,23 @@ class BoundUpdate:
 
 
 
-type BoundStatement = BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect | BoundDelete | BoundUpdate
+@dataclass(frozen=True)
+class BoundAnalyze:
+    statement: Analyze
+    """A passthrough wrapper, same reasoning as BoundCreateTable/
+    BoundCreateIndex: `target` names a table (or is None, for "every
+    table"), and whether that name actually resolves is a question only
+    StatisticsCatalog.analyze() can answer -- it already has to walk
+    catalog.list_tables()/get_table() itself, so resolving `target` here
+    first would just be duplicated work with nowhere to put the result.
+    """
+
+
+
+
+type BoundStatement = (
+    BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect | BoundDelete | BoundUpdate | BoundAnalyze
+)
 
 
 
@@ -257,6 +271,8 @@ def bind(
         bound = binder.bind_delete(statement)
     elif isinstance(statement, Update):
         bound = binder.bind_update(statement)
+    elif isinstance(statement, Analyze):
+        bound = BoundAnalyze(statement)
     else:
         raise UnsupportedFeatureError(f"cannot bind a {type(statement).__name__} statement")
 

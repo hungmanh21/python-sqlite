@@ -40,12 +40,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Self
 
-
 from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
 from quilldb.errors import UnsupportedFeatureError
 from quilldb.exec.operators import Operator, build_operator
+from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.binder import (
+    BoundAnalyze,
     BoundBinaryOp,
     BoundColumn,
     BoundCreateIndex,
@@ -62,7 +63,6 @@ from quilldb.sql.binder import (
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
-
 
 _MEMORY_PATH = ":memory:"
 
@@ -197,10 +197,11 @@ class Connection:
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog) -> None:
+    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog, stats: StatisticsCatalog) -> None:
         self.pager = pager
         self.pool = pool
         self.catalog = catalog
+        self.stats = stats
         self._open_cursor: Cursor | None = None
         self._closed = False
 
@@ -235,6 +236,11 @@ class Connection:
             return Cursor(None, None, 0)
 
 
+        if isinstance(bound, BoundAnalyze):
+            self.stats.analyze(bound.statement.target)
+            return Cursor(None, None, 0)
+
+
         if isinstance(bound, BoundInsert):
             with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
                 operator.next()
@@ -247,7 +253,7 @@ class Connection:
             return Cursor(None, None, operator.rows_affected)
 
 
-        operator = build_operator(bound, self.pager, self.pool, self.catalog)
+        operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats)
         operator.open()
         description = tuple((_display_name(e),) for e in bound.expressions)
         cursor = Cursor(operator, description, -1)
@@ -295,4 +301,5 @@ def connect(path: str | Path) -> Connection:
     pool = BufferPool(pager)
     catalog = Catalog(pager, pool)
     catalog.load()
-    return Connection(pager, pool, catalog)
+    stats = StatisticsCatalog(pager, pool, catalog)
+    return Connection(pager, pool, catalog, stats)

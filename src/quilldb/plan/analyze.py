@@ -19,6 +19,8 @@ purpose -- that's validate_btree()'s job, not this module's.
 """
 
 
+from dataclasses import dataclass
+
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import (
     decode_interior_index_cell,
@@ -46,13 +48,24 @@ from quilldb.storage.overflow import read_overflow_chain
 from quilldb.storage.page import parse_page
 from quilldb.storage.pager import Pager
 
-# quill_stat1 mirrors sqlite_stat1's own shape exactly (chapter 12 §12.5):
-# three columns, `idx IS NULL` for the table's own row. It is an ordinary
-# table -- created once via Catalog.create_table(), like any user table --
-# not a special file-format structure, which is why it's fine for its
-# schema to live entirely in this module instead of constants.py.
+# quill_stat1's `tbl`/`idx`/`stat` columns mirror sqlite_stat1's own shape
+# exactly (chapter 12 §12.5), `idx IS NULL` for the table's own row -- but
+# real sqlite_stat1's format has no room for page counts or B-tree height
+# (documented in statistics.py: cost.py's stage 3 needs them and falls back
+# to a flat assumption when they're missing). Rather than leave an ANALYZEd
+# table's cost pricing stuck on that flat assumption forever, quill_stat1
+# adds two columns real sqlite_stat1 doesn't have: `page_count` (a table
+# row's TableStats.page_count, or an index row's IndexStats.leaf_pages --
+# same column, different meaning per row kind, exactly how `stat` already
+# means something different for a table row vs an index row) and `height`.
+# It is an ordinary table either way -- created once via
+# Catalog.create_table(), like any user table -- not a special file-format
+# structure, which is why it's fine for its schema to live entirely in this
+# module instead of constants.py.
 _STAT1_TABLE_NAME = "quill_stat1"
-_STAT1_TABLE_SQL = f"CREATE TABLE {_STAT1_TABLE_NAME} (tbl TEXT, idx TEXT, stat TEXT)"
+_STAT1_TABLE_SQL = (
+    f"CREATE TABLE {_STAT1_TABLE_NAME} (tbl TEXT, idx TEXT, stat TEXT, page_count INTEGER, height INTEGER)"
+)
 
 
 
@@ -270,6 +283,22 @@ def _rows_per_prefix(leaf_keys: list[tuple[Value, ...]], n_key_columns: int) -> 
 
 
 
+@dataclass(frozen=True)
+class _Stat1Row:
+    """One decoded quill_stat1 row -- internal to StatisticsCatalog, never
+    handed to a caller outside this module (table_stats()/index_stats()
+    unpack it into the real TableStats/IndexStats dataclasses instead).
+    """
+
+    tbl: str
+    idx: str | None
+    stat: str
+    page_count: int
+    height: int
+
+
+
+
 class StatisticsCatalog:
     """Owns `quill_stat1` and turns Steps 3-4's measurements into durable
     rows: `analyze()` writes them, `table_stats()`/`index_stats()` read
@@ -310,30 +339,36 @@ class StatisticsCatalog:
     # ------------------------------------------------------------------
 
 
-    def _find_row(self, tbl: str, idx: str | None) -> str | None:
-        """The `stat` string for (tbl, idx), or None if no such row exists yet."""
+    def _find_row(self, tbl: str, idx: str | None) -> "_Stat1Row | None":
+        """The row for (tbl, idx), or None if no such row exists yet."""
         with TableCursor(self.pager, self.pool, self._table.root_page) as cursor:
             cursor.first()
             while cursor.valid:
-                row_tbl, row_idx, stat = self._decode_row(cursor.record())
-                if row_tbl == tbl and row_idx == idx:
-                    return stat
+                row = self._decode_row(cursor.record())
+                if row.tbl == tbl and row.idx == idx:
+                    return row
                 cursor.next()
         return None
 
 
     @staticmethod
-    def _decode_row(payload: bytes) -> tuple[str, str | None, str]:
+    def _decode_row(payload: bytes) -> "_Stat1Row":
         """decode_record() returns `Value` (any storable type) per column --
-        narrow it back to quill_stat1's own (TEXT, TEXT, TEXT) shape, the
-        same isinstance-narrowing pattern Catalog.load() uses for
-        sqlite_schema's own rows, since nothing else has already validated
-        a stray hand-edited row.
+        narrow it back to quill_stat1's own declared shape, the same
+        isinstance-narrowing pattern Catalog.load() uses for sqlite_schema's
+        own rows, since nothing else has already validated a stray
+        hand-edited row.
         """
-        tbl, idx, stat = decode_record(payload)
-        if not isinstance(tbl, str) or not isinstance(stat, str) or not (idx is None or isinstance(idx, str)):
-            raise CorruptDatabaseError(f"quill_stat1 row has non-text tbl/idx/stat: {(tbl, idx, stat)!r}")
-        return tbl, idx, stat
+        tbl, idx, stat, page_count, height = decode_record(payload)
+        if (
+            not isinstance(tbl, str)
+            or not isinstance(stat, str)
+            or not (idx is None or isinstance(idx, str))
+            or not isinstance(page_count, int)
+            or not isinstance(height, int)
+        ):
+            raise CorruptDatabaseError(f"quill_stat1 row is malformed: {(tbl, idx, stat, page_count, height)!r}")
+        return _Stat1Row(tbl, idx, stat, page_count, height)
 
 
     def _clear_rows(self, tbl: str, idx: str | None) -> None:
@@ -347,8 +382,8 @@ class StatisticsCatalog:
         with TableCursor(self.pager, self.pool, self._table.root_page) as cursor:
             cursor.first()
             while cursor.valid:
-                row_tbl, row_idx, _ = self._decode_row(cursor.record())
-                if row_tbl == tbl and row_idx == idx:
+                row = self._decode_row(cursor.record())
+                if row.tbl == tbl and row.idx == idx:
                     stale_rowids.append(cursor.rowid())
                 cursor.next()
         bt = BTree(self.pager, self.pool, self._table.root_page)
@@ -356,11 +391,13 @@ class StatisticsCatalog:
             bt.delete(rowid)
 
 
-    def _write_row(self, tbl: str, idx: str | None, stat: str) -> None:
+    def _write_row(self, tbl: str, idx: str | None, stat: str, page_count: int, height: int) -> None:
         """Append one fresh row -- caller is responsible for having already
         cleared any stale row for this same (tbl, idx) via _clear_rows().
+        `page_count` is TableStats.page_count for a table row, or
+        IndexStats.leaf_pages for an index row.
         """
-        payload = encode_record((tbl, idx, stat))
+        payload = encode_record((tbl, idx, stat, page_count, height))
         BTree(self.pager, self.pool, self._table.root_page).insert(self._next_rowid(), payload)
 
 
@@ -409,11 +446,14 @@ class StatisticsCatalog:
         """
         table_stats = measure_table(self.pager, self.pool, table.root_page)
         self._clear_rows(table.name, None)
-        self._write_row(table.name, None, str(table_stats.row_count))
+        self._write_row(table.name, None, str(table_stats.row_count), table_stats.page_count, table_stats.height)
         for index in self.catalog.indexes_for(table.name):
             index_stats = measure_index(self.pager, self.pool, index.root_page, len(index.columns))
             self._clear_rows(table.name, index.name)
-            self._write_row(table.name, index.name, encode_stat1_row(index_stats))
+            self._write_row(
+                table.name, index.name, encode_stat1_row(index_stats), index_stats.leaf_pages, index_stats.height
+            )
+
 
     def table_stats(self, name: str) -> TableStats:
         """This table's real stats, or the Stage-2 default if it has never
@@ -422,10 +462,10 @@ class StatisticsCatalog:
         the default the way "never analyzed" does.
         """
         self.catalog.get_table(name)  # validate the name; raises if unknown
-        stat = self._find_row(name, None)
-        if stat is None:
+        row = self._find_row(name, None)
+        if row is None:
             return default_table_stats()
-        return TableStats(row_count=int(stat))
+        return TableStats(row_count=int(row.stat), page_count=row.page_count, height=row.height)
 
 
     def index_stats(self, index: IndexSchema) -> IndexStats:
@@ -441,7 +481,8 @@ class StatisticsCatalog:
         rows_per_prefix to len(index.columns)), so there's no lookup this
         signature would save.
         """
-        stat = self._find_row(index.table, index.name)
-        if stat is None:
+        row = self._find_row(index.table, index.name)
+        if row is None:
             return default_index_stats(index, self.table_stats(index.table))
-        return parse_stat1(stat, index)
+        base = parse_stat1(row.stat, index)
+        return IndexStats(base.row_count, base.rows_per_prefix, height=row.height, leaf_pages=row.page_count)
