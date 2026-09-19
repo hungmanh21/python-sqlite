@@ -13,22 +13,37 @@ PoolExhaustedError somewhere unrelated, so it has to be asserted directly.
 import pytest
 
 
+from quilldb.btree.cells import encode_leaf_table_cell
 from quilldb.btree.index import IndexBTree
 from quilldb.catalog.catalog import Catalog
 from quilldb.catalog.schema import IndexSchema, TableSchema
-from quilldb.errors import TypeMismatchError, UniqueViolationError
-from quilldb.exec.operators import Filter, Insert, Operator, Project, SeqScan, build_operator
+from quilldb.codec.record import encode_record
+from quilldb.constants import PageType
+from quilldb.errors import PageFullError, TypeMismatchError, UniqueViolationError
+from quilldb.exec.operators import (
+    Delete,
+    Filter,
+    Insert,
+    Operator,
+    Project,
+    SeqScan,
+    Update,
+    build_operator,
+)
 from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
     BoundBinaryOp,
     BoundColumn,
+    BoundDelete,
     BoundInsert,
     BoundLiteral,
     BoundSelect,
+    BoundUpdate,
     bind,
 )
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
+from quilldb.storage.page import PageBody, serialize_page
 from quilldb.storage.pager import Pager
 
 
@@ -99,6 +114,22 @@ def _outstanding_pins(pool: BufferPool) -> int:
 def _select(catalog: Catalog, sql: str, *parameters: object) -> BoundSelect:
     bound = bind(parse(sql), catalog, parameters)
     assert isinstance(bound, BoundSelect)
+    return bound
+
+
+
+
+def _delete(catalog: Catalog, sql: str, *parameters: object) -> BoundDelete:
+    bound = bind(parse(sql), catalog, parameters)
+    assert isinstance(bound, BoundDelete)
+    return bound
+
+
+
+
+def _update(catalog: Catalog, sql: str, *parameters: object) -> BoundUpdate:
+    bound = bind(parse(sql), catalog, parameters)
+    assert isinstance(bound, BoundUpdate)
     return bound
 
 
@@ -753,5 +784,391 @@ def test_insert_with_indexes_leaves_no_pins(tmp_path) -> None:
         _insert_via_build_operator(pager, pool, catalog, (i, f"u{i}", i))
 
 
+    assert _outstanding_pins(pool) == 0
+    pager.close()
+
+
+
+
+# =====================================================================
+# Delete
+# =====================================================================
+
+
+
+
+def _delete_via_build_operator(
+    pager: Pager, pool: BufferPool, catalog: Catalog, sql: str, *parameters: object
+) -> int:
+    bound = _delete(catalog, sql, *parameters)
+    with build_operator(bound, pager, pool, catalog) as operator:
+        operator.next()
+        return operator.rows_affected
+
+
+
+
+def test_build_operator_builds_a_delete(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+
+
+    plan = build_operator(_delete(catalog, "DELETE FROM users WHERE age > 30"), pager, pool, catalog)
+    assert isinstance(plan, Delete)
+    assert plan.explain() == "Delete users"
+    pager.close()
+
+
+
+
+def test_delete_with_where_removes_only_matching_rows(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20), (3, "amy", 41))
+
+
+    affected = _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users WHERE age < 30")
+    assert affected == 1
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 36), (3, "amy", 41)]
+    pager.close()
+
+
+
+
+def test_delete_with_no_where_removes_every_row(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20))
+
+
+    affected = _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users")
+    assert affected == 2
+    assert _drain(SeqScan(pager, pool, table)) == []
+    pager.close()
+
+
+
+
+def test_delete_matching_nothing_leaves_the_table_untouched(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36))
+
+
+    affected = _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users WHERE age > 1000")
+    assert affected == 0
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 36)]
+    pager.close()
+
+
+
+
+def test_delete_on_an_empty_table_returns_zero(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+
+
+    assert _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users") == 0
+    pager.close()
+
+
+
+
+def test_delete_substitutes_a_parameter_in_where(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20))
+
+
+    affected = _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users WHERE id = ?", 2)
+    assert affected == 1
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 36)]
+    pager.close()
+
+
+
+
+def test_delete_removes_index_entries_for_deleted_rows_only(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    name_index = _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+    _insert_via_build_operator(pager, pool, catalog, (2, "bob", 20))
+
+
+    _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users WHERE name = 'ada'")
+
+
+    index = IndexBTree(pager, pool, name_index.root_page, n_key_columns=1, unique=False)
+    assert list(index.seek_eq(["ada"])) == []
+    assert list(index.seek_eq(["bob"])) == [2]
+    pager.close()
+
+
+
+
+def test_delete_leaves_no_pins(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    for i in range(1, 51):
+        _insert_via_build_operator(pager, pool, catalog, (i, f"u{i}", i))
+
+
+    _delete_via_build_operator(pager, pool, catalog, "DELETE FROM users WHERE age > 25")
+    assert _outstanding_pins(pool) == 0
+    pager.close()
+
+
+
+
+# =====================================================================
+# Update
+# =====================================================================
+
+
+
+
+def _update_via_build_operator(
+    pager: Pager, pool: BufferPool, catalog: Catalog, sql: str, *parameters: object
+) -> int:
+    bound = _update(catalog, sql, *parameters)
+    with build_operator(bound, pager, pool, catalog) as operator:
+        operator.next()
+        return operator.rows_affected
+
+
+
+
+def test_build_operator_builds_an_update(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+
+
+    plan = build_operator(_update(catalog, "UPDATE users SET age = 1"), pager, pool, catalog)
+    assert isinstance(plan, Update)
+    assert plan.explain() == "Update users"
+    pager.close()
+
+
+
+
+def test_update_sets_a_column_on_matching_rows_only(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20))
+
+
+    affected = _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = 100 WHERE id = 1")
+    assert affected == 1
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 100), (2, "bob", 20)]
+    pager.close()
+
+
+
+
+def test_update_with_no_where_updates_every_row(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20))
+
+
+    affected = _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = 0")
+    assert affected == 2
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 0), (2, "bob", 0)]
+    pager.close()
+
+
+
+
+def test_update_expression_reads_the_old_value(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36))
+
+
+    _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = age + 1")
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 37)]
+    pager.close()
+
+
+
+
+def test_update_simultaneous_assignment_swaps_rather_than_clobbers(tmp_path) -> None:
+    """SET id = age, age = id must both read the ORIGINAL row -- not each
+    other's just-written value -- or this becomes (age, age) instead of a
+    swap.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36))
+
+
+    _update_via_build_operator(pager, pool, catalog, "UPDATE users SET id = age, age = id")
+    assert _drain(SeqScan(pager, pool, table)) == [(36, "ada", 1)]
+    pager.close()
+
+
+
+
+def test_update_rewrites_a_non_unique_index_when_the_key_changes(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    name_index = _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+
+
+    _update_via_build_operator(pager, pool, catalog, "UPDATE users SET name = 'ines' WHERE id = 1")
+
+
+    index = IndexBTree(pager, pool, name_index.root_page, n_key_columns=1, unique=False)
+    assert list(index.seek_eq(["ada"])) == []
+    assert list(index.seek_eq(["ines"])) == [1]
+    pager.close()
+
+
+
+
+def test_update_of_an_unindexed_column_leaves_the_index_alone(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    name_index = _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+
+
+    _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = 99 WHERE id = 1")
+
+
+    index = IndexBTree(pager, pool, name_index.root_page, n_key_columns=1, unique=False)
+    assert list(index.seek_eq(["ada"])) == [1]
+    pager.close()
+
+
+
+
+def test_update_allows_setting_a_unique_column_to_its_own_current_value(tmp_path) -> None:
+    """The row's OWN old index entry must not look like a conflict with
+    its own new key -- the self-exclusion Update._apply()'s docstring
+    calls out.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE UNIQUE INDEX idx_name ON users (name)")
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+
+
+    affected = _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = 40 WHERE id = 1")
+    assert affected == 1
+    pager.close()
+
+
+
+
+def test_update_raises_unique_violation_before_writing_anything(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+    _insert_via_build_operator(pager, pool, catalog, (2, "bob", 20))
+    _create_index(catalog, "CREATE UNIQUE INDEX idx_name ON users (name)")
+
+
+    with pytest.raises(UniqueViolationError) as excinfo:
+        _update_via_build_operator(pager, pool, catalog, "UPDATE users SET name = 'ada' WHERE id = 2")
+
+
+    assert excinfo.value.index_name == "idx_name"
+    assert _drain(SeqScan(pager, pool, table)) == [(1, "ada", 36), (2, "bob", 20)]
+    pager.close()
+
+
+
+
+def test_update_detects_a_conflict_between_two_rows_in_the_same_statement(tmp_path) -> None:
+    """Row 2's new key collides with row 1's new key, not with anything
+    that existed before this UPDATE started -- which only shows up if row
+    1 is fully applied, index entry included, before row 2 is checked.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _insert_via_build_operator(pager, pool, catalog, (1, "ada", 36))
+    _insert_via_build_operator(pager, pool, catalog, (2, "bob", 20))
+    _create_index(catalog, "CREATE UNIQUE INDEX idx_name ON users (name)")
+
+
+    with pytest.raises(UniqueViolationError):
+        _update_via_build_operator(pager, pool, catalog, "UPDATE users SET name = 'same'")
+    pager.close()
+
+
+
+
+def _write_row_cell(rowid: int, name_len: int, age: int) -> bytes:
+    """A LEAF_TABLE cell for (rowid, 'x' * name_len, age), a real encoded
+    record -- unlike test_btree_splits.py's raw-bytes cells, this has to
+    decode_record() cleanly, since Update reads it back through the real
+    SeqScan-shaped path (_scan_matching_rows).
+    """
+    payload = encode_record((rowid, "x" * name_len, age))
+    return encode_leaf_table_cell(rowid, len(payload), payload)
+
+
+
+
+def test_update_restores_the_old_row_when_the_new_value_cannot_be_written(tmp_path) -> None:
+    """docs/theory/btree/10-deletion-and-space-reuse.md Sec10.5 rule 3: an
+    UPDATE must not leave a row deleted if re-inserting its new value
+    fails. Hand-builds the same "no valid two-way split" leaf shape
+    test_btree_splits.py's test_insert_raises_cleanly_when_no_two_way_
+    split_exists uses (three cells sized so a too-big middle cell fits
+    beside neither neighbor), sized via real encode_record() calls so
+    Update's own decode_record() reads them back correctly.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+
+
+    with pool.pinned(table.root_page, dirty=True) as raw:
+        raw[:] = serialize_page(PageBody(
+            PageType.LEAF_TABLE,
+            cells=[
+                _write_row_cell(1, 1892, 10),
+                _write_row_cell(3, 44, 30),
+                _write_row_cell(5, 1012, 50),
+            ],
+        ))
+
+
+    with pytest.raises(PageFullError):
+        _update_via_build_operator(pager, pool, catalog, "UPDATE users SET name = ? WHERE id = 3", "x" * 3272)
+
+
+    assert _drain(SeqScan(pager, pool, table)) == [
+        (1, "x" * 1892, 10),
+        (3, "x" * 44, 30),
+        (5, "x" * 1012, 50),
+    ]
+    pager.close()
+
+
+
+
+def test_update_on_an_empty_table_returns_zero(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    assert _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = 1") == 0
+    pager.close()
+
+
+
+
+def test_update_leaves_no_pins(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_name ON users (name)")
+    for i in range(1, 31):
+        _insert_via_build_operator(pager, pool, catalog, (i, f"u{i}", i))
+
+
+    _update_via_build_operator(pager, pool, catalog, "UPDATE users SET age = age + 1")
     assert _outstanding_pins(pool) == 0
     pager.close()

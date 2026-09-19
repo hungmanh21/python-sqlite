@@ -549,3 +549,147 @@ def test_insert_violating_a_unique_index_raises_before_a_cursor_opens() -> None:
     assert _outstanding_pins(db) == 0
     assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36)]
     db.close()
+
+
+
+
+# =====================================================================
+# DELETE, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_delete_removes_matching_rows_and_reports_rowcount() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 20), (3, "amy", 41)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    cursor = db.execute("DELETE FROM users WHERE age < 30")
+    assert cursor.rowcount == 1
+    assert cursor.description is None
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (3, "amy", 41)]
+    db.close()
+
+
+
+
+def test_delete_with_no_where_removes_every_row_and_leaves_no_pins() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("DELETE FROM users")
+    assert cursor.rowcount == 1
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+
+
+
+
+def test_delete_keeps_an_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("DELETE FROM users WHERE id = 1")
+
+
+    index = db.catalog.indexes_for("users")[0]
+    assert list(IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False).seek_eq(["ada"])) == []
+    db.close()
+
+
+
+
+def test_delete_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 20))
+        db.execute("DELETE FROM users WHERE id = 1")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(2, "bob", 20)]
+
+
+
+
+# =====================================================================
+# UPDATE, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_update_sets_a_column_and_reports_rowcount() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("UPDATE users SET age = 40 WHERE id = 1")
+    assert cursor.rowcount == 1
+    assert cursor.description is None
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 40)]
+    db.close()
+
+
+
+
+def test_update_keeps_an_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("UPDATE users SET name = 'ines' WHERE id = 1")
+
+
+    index = db.catalog.indexes_for("users")[0]
+    ibt = IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False)
+    assert list(ibt.seek_eq(["ada"])) == []
+    assert list(ibt.seek_eq(["ines"])) == [1]
+    db.close()
+
+
+
+
+def test_update_violating_a_unique_index_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 20))
+
+
+    with pytest.raises(UniqueViolationError):
+        db.execute("UPDATE users SET name = 'ada' WHERE id = 2")
+
+
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (2, "bob", 20)]
+    db.close()
+
+
+
+
+def test_update_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("UPDATE users SET age = 40 WHERE id = 1")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 40)]

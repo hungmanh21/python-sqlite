@@ -39,9 +39,16 @@ from quilldb.btree.index import IndexBTree
 from quilldb.catalog.catalog import Catalog
 from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.codec.record import decode_record, encode_record
-from quilldb.errors import UniqueViolationError
+from quilldb.errors import PageFullError, UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
-from quilldb.sql.binder import BoundExpression, BoundInsert, BoundSelect
+from quilldb.sql.binder import (
+    BoundAssignment,
+    BoundDelete,
+    BoundExpression,
+    BoundInsert,
+    BoundSelect,
+    BoundUpdate,
+)
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
 
@@ -49,6 +56,9 @@ from quilldb.storage.pager import Pager
 
 
 class Operator(ABC):
+    rows_affected: int = 0  # meaningful only for Insert/Delete/Update; SELECT streams instead
+
+
     @abstractmethod
     def open(self) -> None:
         """Acquire whatever this operator needs to produce rows.
@@ -329,8 +339,299 @@ class Insert(Operator):
 
 
 
+def _scan_matching_rows(
+    pager: Pager, pool: BufferPool, table: TableSchema, predicate: BoundExpression | None
+) -> list[tuple[int, Row]]:
+    """Every (rowid, row) pair passing `predicate`, fully materialized.
+
+
+    Delete and Update both need this instead of composing through SeqScan:
+    they mutate the same b-tree they are scanning, and TableCursor makes no
+    promise about staying valid across a mutation to its own tree
+    (btree/cursor.py's documented policy) -- so every match has to be
+    collected before the first write happens, not discovered one row at a
+    time while writes to that same tree are already underway.
+    """
+    matches: list[tuple[int, Row]] = []
+    with TableCursor(pager, pool, table.root_page) as cursor:
+        cursor.first()
+        positioned = cursor.valid
+        while positioned:
+            row = decode_record(cursor.record())
+            if predicate is None or where_passes(evaluate(predicate, row)):
+                matches.append((cursor.rowid(), row))
+            positioned = cursor.next()
+    return matches
+
+
+
+
+class Delete(Operator):
+    """Delete every row matching an optional predicate, and every index
+    entry it owned.
+
+
+    Every match comes from _scan_matching_rows() -- collected before this
+    operator mutates anything, for the reason given in that function's
+    docstring. Index entries for a row are removed before the row itself:
+    absent transactions until week 5, "row exists, stale index entry" is
+    recoverable (DROP INDEX and recreate); "index entry pointing at a
+    rowid that no longer exists" is not. Same ordering rule as Insert's
+    UNIQUE-check-then-table-row-then-index-entries, read back to front.
+    """
+
+
+    def __init__(
+        self,
+        pager: Pager,
+        pool: BufferPool,
+        table: TableSchema,
+        predicate: BoundExpression | None,
+        indexes: Sequence[IndexSchema] = (),
+    ) -> None:
+        self.pager = pager
+        self.pool = pool
+        self.table = table
+        self.predicate = predicate
+        self.indexes = indexes
+        self._attempted = False
+
+
+    def open(self) -> None:
+        self._attempted = False
+        self.rows_affected = 0
+
+
+    def next(self) -> Row | None:
+        if self._attempted:
+            return None
+        self._attempted = True
+
+
+        matches = _scan_matching_rows(self.pager, self.pool, self.table, self.predicate)
+        for rowid, values in matches:
+            for index in self.indexes:
+                key = [values[self.table.column_index(column)] for column in index.columns]
+                IndexBTree(
+                    self.pager, self.pool, index.root_page, n_key_columns=len(index.columns), unique=index.unique
+                ).delete(key, rowid)
+            BTree(self.pager, self.pool, self.table.root_page).delete(rowid)
+
+
+        self.rows_affected = len(matches)
+        return None
+
+
+    def close(self) -> None:
+        pass
+
+
+    def explain(self, depth: int = 0) -> str:
+        return _explain_line(depth, f"Delete {self.table.name}")
+
+
+
+
+class Update(Operator):
+    """Apply assignments to every row matching an optional predicate, and
+    keep every index on the table current.
+
+
+    Same collect-before-mutating shape as Delete, for the same TableCursor
+    reason. There is no in-place "rewrite this rowid's payload" primitive
+    on BTree -- only insert() and delete() -- so a row is updated as
+    delete(rowid) followed by insert(rowid, new_payload): same rowid, new
+    bytes. Matches are applied one at a time, each one fully finished --
+    table row AND every index entry -- before the next one starts; see
+    _apply()'s docstring for why that ordering matters once a UNIQUE index
+    is involved.
+    """
+
+
+    def __init__(
+        self,
+        pager: Pager,
+        pool: BufferPool,
+        table: TableSchema,
+        assignments: tuple[BoundAssignment, ...],
+        predicate: BoundExpression | None,
+        indexes: Sequence[IndexSchema] = (),
+    ) -> None:
+        self.pager = pager
+        self.pool = pool
+        self.table = table
+        self.assignments = assignments
+        self.predicate = predicate
+        self.indexes = indexes
+        self._attempted = False
+
+
+    def open(self) -> None:
+        self._attempted = False
+        self.rows_affected = 0
+
+
+    def next(self) -> Row | None:
+        if self._attempted:
+            return None
+        self._attempted = True
+
+
+        matches = _scan_matching_rows(self.pager, self.pool, self.table, self.predicate)
+        for rowid, old_values in matches:
+            self._apply(rowid, old_values)
+
+
+        self.rows_affected = len(matches)
+        return None
+
+
+    def _apply(self, rowid: int, old_values: Row) -> None:
+        """Apply this row's assignments and keep every index on the table
+        current -- or raise UniqueViolationError before touching anything.
+
+
+        `old_values` is the row exactly as it was before this UPDATE
+        reached it. Every assignment's expression must be evaluate()d
+        against `old_values`, never against a value another assignment on
+        this same row just computed -- that is what makes
+        `SET a = b, b = a` a swap instead of clobbering `b` with the new
+        `a` before `b`'s own assignment gets to read the old one.
+
+
+        Steps, in order -- stitching together Insert's "check everything
+        before writing anything" rule with Delete's "index entries before
+        the table row" rule:
+
+
+        1. Build `new_values`: a mutable copy of `old_values`, with each
+           assignment's evaluate()d result written to its column_index.
+        2. For every UNIQUE index on the table, compute the OLD key and the
+           NEW key (index.columns -> self.table.column_index() -> values).
+           If they're equal, this index has nothing at stake for this row
+           -- skip it. Otherwise probe with an IndexBTree built the same
+           way Insert.next() builds one, via find_conflict(new_key). A
+           conflict is only real if the conflicting rowid is NOT this row's
+           own rowid: find_conflict has no way to know this row's old entry
+           is about to be replaced, so the caller has to exclude self. On a
+           real conflict, raise UniqueViolationError(index.name,
+           tuple(new_key)) before step 3 runs for ANY index.
+        3. Now that every index has passed its check: for every index
+           whose key actually changed, delete its OLD (key, rowid) entry.
+        4. BTree.delete(rowid), then BTree.insert(rowid,
+           encode_record(new_values)) -- same rowid, new payload. If that
+           insert raises PageFullError (the same rare "needs a three-way
+           split" case already accepted for a plain INSERT -- see
+           test_btree_splits.py's test for that), the row must not stay
+           deleted (docs/theory/btree/10-deletion-and-space-reuse.md
+           §10.5 rule 3): delete() only ever frees space, never costs it,
+           so re-inserting the OLD payload for this same rowid is
+           guaranteed to fit where it fit before, and restores the table
+           row before re-raising. Index entries already deleted in step 3
+           are NOT restored -- a row with a stale/missing index entry is
+           the same "recoverable via DROP INDEX/CREATE INDEX" gap Insert
+           and Delete already live with.
+        5. For every index whose key changed, insert its NEW (key, rowid)
+           entry.
+
+
+        Only steps 3-5 touch a page. Checking every UNIQUE index (step 2)
+        before mutating any of them is what stops a conflict on this row
+        from leaving one index updated and another not.
+        """
+        new_values = list(old_values)
+        for assignment in self.assignments:
+            new_values[assignment.column_index] = evaluate(assignment.value, old_values)
+       
+        for index in self.indexes:
+            if not index.unique:
+                continue
+
+
+            old_key = [old_values[self.table.column_index(column)] for column in index.columns]
+            new_key = [new_values[self.table.column_index(column)] for column in index.columns]
+
+
+            if old_key == new_key:
+                continue
+
+
+            tree = IndexBTree(
+                self.pager,
+                self.pool,
+                index.root_page,
+                n_key_columns=len(index.columns),
+                unique=True,
+            )
+            conflicting_rowid = tree.find_conflict(new_key)
+
+
+            if conflicting_rowid is not None and conflicting_rowid != rowid:
+                raise UniqueViolationError(index.name, tuple(new_key))
+       
+
+
+        for index in self.indexes:
+            old_key = [old_values[self.table.column_index(column)] for column in index.columns]
+            new_key = [new_values[self.table.column_index(column)] for column in index.columns]
+
+
+            if old_key != new_key:
+                tree = IndexBTree(
+                        self.pager,
+                        self.pool,
+                        index.root_page,
+                        n_key_columns=len(index.columns),
+                        unique=index.unique,
+                    )
+
+
+                tree.delete(old_key, rowid)
+       
+       
+        BTree(self.pager, self.pool, self.table.root_page).delete(rowid)
+        try:
+            BTree(self.pager, self.pool, self.table.root_page).insert(
+                rowid,
+                encode_record(new_values),
+            )
+        except PageFullError:
+            BTree(self.pager, self.pool, self.table.root_page).insert(rowid, encode_record(old_values))
+            raise
+
+
+        for index in self.indexes:
+            old_key = [old_values[self.table.column_index(column)] for column in index.columns]
+            new_key = [new_values[self.table.column_index(column)] for column in index.columns]
+
+
+            if old_key != new_key:
+                tree = IndexBTree(
+                        self.pager,
+                        self.pool,
+                        index.root_page,
+                        n_key_columns=len(index.columns),
+                        unique=index.unique,
+                    )
+
+
+                tree.insert(new_key, rowid)
+       
+       
+
+
+    def close(self) -> None:
+        pass
+
+
+    def explain(self, depth: int = 0) -> str:
+        return _explain_line(depth, f"Update {self.table.name}")
+
+
+
+
 def build_operator(
-    statement: BoundSelect | BoundInsert,
+    statement: BoundSelect | BoundInsert | BoundDelete | BoundUpdate,
     pager: Pager,
     pool: BufferPool,
     catalog: Catalog,
@@ -352,13 +653,25 @@ def build_operator(
     payoff for keeping the choice here rather than inlining it into
     Connection.execute().
 
-    `catalog` isn't used by the SELECT plan yet -- it exists so INSERT can
-    resolve which indexes need maintaining (Catalog.indexes_for()), and so
-    this signature doesn't have to change again once IndexScan needs it too.
+
+    `catalog` resolves which indexes need maintaining -- Catalog.indexes_for()
+    -- for INSERT, DELETE, and UPDATE alike. It isn't used by the SELECT plan
+    yet; it's threaded through regardless so this signature doesn't have to
+    change again once IndexScan needs it too.
     """
     if isinstance(statement, BoundInsert):
         indexes = catalog.indexes_for(statement.table.name)
         return Insert(pager, pool, statement, indexes)
+
+
+    if isinstance(statement, BoundDelete):
+        indexes = catalog.indexes_for(statement.table.name)
+        return Delete(pager, pool, statement.table, statement.where, indexes)
+
+
+    if isinstance(statement, BoundUpdate):
+        indexes = catalog.indexes_for(statement.table.name)
+        return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes)
 
 
     source: Operator = SeqScan(pager, pool, statement.table)

@@ -27,15 +27,18 @@ from quilldb.errors import (
 )
 from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
+    BoundAssignment,
     BoundBinaryOp,
     BoundColumn,
     BoundCreateIndex,
     BoundCreateTable,
+    BoundDelete,
     BoundInsert,
     BoundIsNull,
     BoundLiteral,
     BoundSelect,
     BoundUnaryOp,
+    BoundUpdate,
     bind,
 )
 from quilldb.sql.parser import parse
@@ -528,3 +531,128 @@ def test_text_column_accepts_str() -> None:
     bound = _bind("INSERT INTO types VALUES (1, 1.0, ?, ?)", "hello", b"x")
     assert isinstance(bound, BoundInsert)
     assert bound.values[2] == "hello"
+
+
+
+
+# =====================================================================
+# DELETE: resolves table and WHERE, exactly like SELECT
+# =====================================================================
+
+
+
+
+def test_delete_with_no_where_binds_a_none_predicate() -> None:
+    bound = _bind("DELETE FROM users")
+    assert isinstance(bound, BoundDelete)
+    assert bound.table is _USERS
+    assert bound.where is None
+
+
+
+
+def test_delete_where_binds_the_same_way_select_where_does() -> None:
+    bound = _bind("DELETE FROM users WHERE age > 30")
+    assert isinstance(bound, BoundDelete)
+    assert bound.where == BoundBinaryOp(BoundColumn(2, "age", DataType.INTEGER), ">", BoundLiteral(30))
+
+
+
+
+def test_delete_unknown_table_raises() -> None:
+    with pytest.raises(TableNotFoundError):
+        _bind("DELETE FROM ghosts")
+
+
+
+
+def test_delete_unknown_column_in_where_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind("DELETE FROM users WHERE nickname = 'ada'")
+
+
+
+
+def test_delete_substitutes_a_parameter_in_where() -> None:
+    bound = _bind("DELETE FROM users WHERE age > ?", 30)
+    assert isinstance(bound, BoundDelete)
+    assert bound.where == BoundBinaryOp(BoundColumn(2, "age", DataType.INTEGER), ">", BoundLiteral(30))
+
+
+
+
+# =====================================================================
+# UPDATE: assignments resolve to (column_index, BoundExpression)
+# =====================================================================
+
+
+
+
+def test_update_resolves_assignment_columns_to_indices() -> None:
+    bound = _bind("UPDATE users SET age = 37 WHERE id = 1")
+    assert isinstance(bound, BoundUpdate)
+    assert bound.assignments == (BoundAssignment(2, BoundLiteral(37)),)
+    assert bound.where == BoundBinaryOp(BoundColumn(0, "id", DataType.INTEGER), "=", BoundLiteral(1))
+
+
+
+
+def test_update_binds_multiple_comma_separated_assignments_in_order() -> None:
+    bound = _bind("UPDATE users SET name = 'ada', age = 36")
+    assert isinstance(bound, BoundUpdate)
+    assert bound.assignments == (
+        BoundAssignment(1, BoundLiteral("ada")),
+        BoundAssignment(2, BoundLiteral(36)),
+    )
+
+
+
+
+def test_update_set_value_may_reference_a_column_unlike_insert() -> None:
+    """SET age = age + 1 -- this is exactly what INSERT's narrower
+    _constant() rejects (there's no row yet at INSERT time), and exactly
+    what UPDATE's _expression() has to allow (there's always a row by the
+    time SET runs).
+    """
+    bound = _bind("UPDATE users SET age = age + 1")
+    assert isinstance(bound, BoundUpdate)
+    age = BoundColumn(2, "age", DataType.INTEGER)
+    assert bound.assignments == (BoundAssignment(2, BoundBinaryOp(age, "+", BoundLiteral(1))),)
+
+
+
+
+def test_update_with_no_where_binds_a_none_predicate() -> None:
+    bound = _bind("UPDATE users SET age = 1")
+    assert isinstance(bound, BoundUpdate)
+    assert bound.where is None
+
+
+
+
+def test_update_unknown_table_raises() -> None:
+    with pytest.raises(TableNotFoundError):
+        _bind("UPDATE ghosts SET x = 1")
+
+
+
+
+def test_update_unknown_assignment_column_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind("UPDATE users SET nickname = 'ada'")
+
+
+
+
+def test_update_unknown_column_in_where_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind("UPDATE users SET age = 1 WHERE nickname = 'ada'")
+
+
+
+
+def test_update_substitutes_parameters_across_set_and_where() -> None:
+    bound = _bind("UPDATE users SET age = ? WHERE id = ?", 37, 1)
+    assert isinstance(bound, BoundUpdate)
+    assert bound.assignments == (BoundAssignment(2, BoundLiteral(37)),)
+    assert bound.where == BoundBinaryOp(BoundColumn(0, "id", DataType.INTEGER), "=", BoundLiteral(1))

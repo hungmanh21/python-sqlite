@@ -44,6 +44,7 @@ from quilldb.sql.ast import (
     CreateIndex,
     CreateTable,
     DataType,
+    Delete,
     Expression,
     Insert,
     IsNull,
@@ -52,6 +53,7 @@ from quilldb.sql.ast import (
     Select,
     Statement,
     UnaryOp,
+    Update,
 )
 
 
@@ -166,7 +168,45 @@ class BoundSelect:
 
 
 
-type BoundStatement = BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect
+@dataclass(frozen=True)
+class BoundDelete:
+    table: TableSchema
+    where: BoundExpression | None
+    """Unlike BoundCreateTable/BoundCreateIndex, this one DOES resolve:
+    `where` is bound against `table` through the exact same _expression()
+    call BoundSelect.where uses, since a DELETE's predicate is evaluated
+    per row exactly the way a SELECT's is -- the only difference is what
+    happens to a row that passes it.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundAssignment:
+    column_index: int
+    value: BoundExpression
+    """`value` is bound with the general _expression() resolver, not
+    INSERT's narrower _constant() -- UPDATE's SET clause is allowed to
+    reference the row being updated (`SET age = age + 1`), which only
+    makes sense once there is a row to evaluate against at exec time.
+    INSERT has no row yet, which is exactly why it's restricted to
+    constants.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundUpdate:
+    table: TableSchema
+    assignments: tuple[BoundAssignment, ...]
+    where: BoundExpression | None
+
+
+
+
+type BoundStatement = BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect | BoundDelete | BoundUpdate
 
 
 
@@ -213,6 +253,10 @@ def bind(
         bound = binder.bind_insert(statement)
     elif isinstance(statement, Select):
         bound = binder.bind_select(statement)
+    elif isinstance(statement, Delete):
+        bound = binder.bind_delete(statement)
+    elif isinstance(statement, Update):
+        bound = binder.bind_update(statement)
     else:
         raise UnsupportedFeatureError(f"cannot bind a {type(statement).__name__} statement")
 
@@ -270,6 +314,22 @@ class _Binder:
 
         where = None if statement.where is None else self._expression(statement.where, table)
         return BoundSelect(table, expressions, where)
+
+
+    def bind_delete(self, statement: Delete) -> BoundDelete:
+        table = self.catalog.get_table(statement.table)
+        where = None if statement.where is None else self._expression(statement.where, table)
+        return BoundDelete(table, where)
+
+
+    def bind_update(self, statement: Update) -> BoundUpdate:
+        table = self.catalog.get_table(statement.table)
+        assignments = tuple(
+            BoundAssignment(table.column_index(assignment.column), self._expression(assignment.value, table))
+            for assignment in statement.assignments
+        )
+        where = None if statement.where is None else self._expression(statement.where, table)
+        return BoundUpdate(table, assignments, where)
 
 
     def _expression(self, expression: Expression, table: TableSchema) -> BoundExpression:

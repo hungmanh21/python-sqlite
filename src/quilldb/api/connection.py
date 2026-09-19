@@ -30,9 +30,9 @@ can be:
    multiple connections, matching every DB-API's convention.
 
 
-CREATE TABLE and INSERT are executed to completion before execute() returns
--- there is nothing left to stream. SELECT is the one case that leaves an
-operator open past the call that created it.
+CREATE TABLE, INSERT, DELETE, and UPDATE are executed to completion before
+execute() returns -- there is nothing left to stream. SELECT is the one
+case that leaves an operator open past the call that created it.
 """
 
 
@@ -50,11 +50,13 @@ from quilldb.sql.binder import (
     BoundColumn,
     BoundCreateIndex,
     BoundCreateTable,
+    BoundDelete,
     BoundExpression,
     BoundInsert,
     BoundIsNull,
     BoundLiteral,
     BoundUnaryOp,
+    BoundUpdate,
     bind,
 )
 from quilldb.sql.parser import parse
@@ -207,11 +209,11 @@ class Connection:
         """Parse, bind, and execute one statement.
 
 
-        CREATE TABLE, CREATE INDEX, and INSERT complete before this method
-        returns. SELECT leaves its operator open and streams rows through
-        the returned Cursor. Starting another execute() closes any
-        still-open result cursor on this connection; multiple active
-        cursors arrive with multiple connections.
+        CREATE TABLE, CREATE INDEX, INSERT, DELETE, and UPDATE complete
+        before this method returns. SELECT leaves its operator open and
+        streams rows through the returned Cursor. Starting another
+        execute() closes any still-open result cursor on this connection;
+        multiple active cursors arrive with multiple connections.
         """
         if self._closed:
             raise ValueError("connection is closed")
@@ -237,6 +239,12 @@ class Connection:
             with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
                 operator.next()
             return Cursor(None, None, 1)
+
+
+        if isinstance(bound, (BoundDelete, BoundUpdate)):
+            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                operator.next()
+            return Cursor(None, None, operator.rows_affected)
 
 
         operator = build_operator(bound, self.pager, self.pool, self.catalog)
