@@ -782,3 +782,126 @@ def test_analyze_never_changes_query_results() -> None:
 
     assert before == after == [(1, "ada", 36), (2, "bob", 41)]
     db.close()
+
+
+
+
+# =====================================================================
+# EXPLAIN / EXPLAIN ANALYZE: stage-5 Step 7
+# =====================================================================
+
+
+_USERS_WITH_AGE_INDEX_SQL = "CREATE INDEX idx_age ON users (age)"
+
+
+def _connect_analyzed_users(n: int) -> quilldb.Connection:
+    """A big-enough table that a real ANALYZE actually favors IndexScan
+    over SeqScan for a selective equality (the same "too small to show a
+    contrast" fact test_operators.py's own ANALYZE test runs into at a
+    handful of rows -- see its docstring).
+    """
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute(_USERS_WITH_AGE_INDEX_SQL)
+    for i in range(1, n + 1):
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (i, f"user_number_{i}_padded_for_size", i))
+    db.execute("ANALYZE")
+    return db
+
+
+
+
+def test_explain_returns_one_row_one_column_without_running_the_query() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    cursor = db.execute("EXPLAIN SELECT * FROM users WHERE age = 7")
+    assert _outstanding_pins(db) == 0  # nothing from `users` itself has been touched yet
+    description = cursor.description
+    assert description is not None
+    assert description[0][0] == "QUERY PLAN"
+    rows = cursor.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "Project\n└─ IndexScan idx_age (age = 7) est_rows=1 startup=8.00 cost=16.01"
+    db.close()
+
+
+
+
+def test_explain_shows_seq_scan_plainly_without_annotations() -> None:
+    """Step 7 scopes the cost/row annotation to IndexScan specifically --
+    a SeqScan's EXPLAIN line stays exactly what build_operator()'s own
+    plain explain() already produced."""
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN SELECT * FROM users WHERE name = 'nobody'").fetchall()
+    assert rows == [("Project\n└─ Filter\n   └─ SeqScan users",)]
+    db.close()
+
+
+
+
+def test_explain_unknown_table_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+
+
+    with pytest.raises(TableNotFoundError):
+        db.execute("EXPLAIN SELECT * FROM ghost")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_explain_unknown_column_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+
+
+    with pytest.raises(ColumnNotFoundError):
+        db.execute("EXPLAIN SELECT ghost FROM users")
+    db.close()
+
+
+
+
+def test_explain_analyze_runs_the_query_and_appends_actual_rows() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE age = 7").fetchall()
+    assert len(rows) == 1
+    lines = rows[0][0].split("\n")
+    assert lines[0] == "Project"
+    assert lines[1] == "└─ IndexScan idx_age (age = 7) est_rows=1 startup=8.00 cost=16.01"
+    assert lines[2].startswith("actual_rows=1 elapsed=")
+    db.close()
+
+
+
+
+def test_explain_analyze_leaves_no_pins_after_draining() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE age = 7").fetchall()
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_plain_explain_does_not_run_the_query() -> None:
+    """The other half of EXPLAIN ANALYZE's contrast: plain EXPLAIN must
+    never execute the plan, so `actual_rows` never appears and nothing
+    from `users` gets pinned even after fetchall() drains the one
+    QUERY PLAN row.
+    """
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN SELECT * FROM users WHERE age = 7").fetchall()
+    assert "actual_rows" not in rows[0][0]
+    assert _outstanding_pins(db) == 0
+    db.close()

@@ -91,8 +91,18 @@ class Operator(ABC):
 
 
     @abstractmethod
-    def explain(self, depth: int = 0) -> str:
-        """A one-operator-per-line plan tree, deepest last."""
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        """A one-operator-per-line plan tree, deepest last.
+
+
+        `verbose=True` is EXPLAIN's own request (stage-5 Step 7) for the
+        cost/row-estimate annotations chapter 12 §12.6 shows on an
+        IndexScan line -- every other operator's plain label is unaffected,
+        so verbose is a no-op everywhere except IndexScan.explain(). Kept
+        False by default so every operator's ordinary `explain()` (used for
+        debugging and by every existing test predating EXPLAIN) keeps
+        producing today's terse text unchanged.
+        """
 
 
     def __enter__(self) -> Self:
@@ -159,7 +169,7 @@ class SeqScan(Operator):
         self._positioned = False
 
 
-    def explain(self, depth: int = 0) -> str:
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
         return _explain_line(depth, f"SeqScan {self.table.name}")
 
 
@@ -174,6 +184,22 @@ def _literal_value(predicate: Predicate) -> Value:
         f"seek_term {predicate.column!r} has a non-literal value: {type(predicate.value).__name__}"
     )
     return predicate.value.value
+
+
+
+
+def _literal_sql(value: Value) -> str:
+    """Render a Value as SQL literal text for EXPLAIN's predicate display
+    (e.g. `email = 'a@b.c'`, chapter 12 §12.6's own format) -- quoting and
+    doubling embedded quotes the way SQL text literals require, rather
+    than Python's `repr()` (right for a simple string, wrong the moment a
+    value contains a `'`).
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return str(value)
 
 
 
@@ -354,9 +380,24 @@ class IndexScan(Operator):
         self._rowids = None
 
 
-    def explain(self, depth: int = 0) -> str:
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
         index_name = self.path.index.name if self.path.index is not None else "?"
-        return _explain_line(depth, f"IndexScan {index_name}")
+        label = f"IndexScan {index_name}"
+        if not verbose:
+            return _explain_line(depth, label)
+
+
+        if self.path.seek_terms:
+            predicate_text = " AND ".join(
+                f"{p.column} {p.operator} {_literal_sql(_literal_value(p))}" for p in self.path.seek_terms
+            )
+            label += f" ({predicate_text})"
+
+
+        label += f" est_rows={self.path.est_rows}"
+        if self.path.cost is not None:
+            label += f" startup={self.path.cost.startup:.2f} cost={self.path.cost.total:.2f}"
+        return _explain_line(depth, label)
 
 
 
@@ -394,8 +435,8 @@ class Filter(Operator):
         self.child.close()
 
 
-    def explain(self, depth: int = 0) -> str:
-        return _explain_line(depth, "Filter") + "\n" + self.child.explain(depth + 1)
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        return _explain_line(depth, "Filter") + "\n" + self.child.explain(depth + 1, verbose)
 
 
 
@@ -428,8 +469,8 @@ class Project(Operator):
         self.child.close()
 
 
-    def explain(self, depth: int = 0) -> str:
-        return _explain_line(depth, "Project") + "\n" + self.child.explain(depth + 1)
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        return _explain_line(depth, "Project") + "\n" + self.child.explain(depth + 1, verbose)
 
 
 
@@ -534,7 +575,7 @@ class Insert(Operator):
         pass
 
 
-    def explain(self, depth: int = 0) -> str:
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
         return _explain_line(depth, f"Insert {self.statement.table.name}")
 
 
@@ -627,7 +668,7 @@ class Delete(Operator):
         pass
 
 
-    def explain(self, depth: int = 0) -> str:
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
         return _explain_line(depth, f"Delete {self.table.name}")
 
 
@@ -825,8 +866,39 @@ class Update(Operator):
         pass
 
 
-    def explain(self, depth: int = 0) -> str:
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
         return _explain_line(depth, f"Update {self.table.name}")
+
+
+class ExplainResult(Operator):
+    """Wraps one precomputed row (EXPLAIN's rendered plan text) as a
+    one-shot Operator, so Cursor's fetch machinery -- built to pull from
+    an Operator, for the "one result shape for every statement kind" rule
+    api/connection.py documents -- doesn't need a special case for a
+    result that was never backed by a B-tree scan to begin with.
+    """
+
+
+    def __init__(self, row: Row) -> None:
+        self._original_row = row
+        self._row: Row | None = None
+
+
+    def open(self) -> None:
+        self._row = self._original_row
+
+
+    def next(self) -> Row | None:
+        row, self._row = self._row, None
+        return row
+
+
+    def close(self) -> None:
+        self._row = None
+
+
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        return _explain_line(depth, "Result")
 
 
 def _extract_predicates(where: BoundExpression | None) -> tuple[list[Predicate], list[BoundExpression]]:

@@ -36,6 +36,7 @@ case that leaves an operator open past the call that created it.
 """
 
 
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Self
@@ -43,7 +44,7 @@ from typing import Self
 from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
 from quilldb.errors import UnsupportedFeatureError
-from quilldb.exec.operators import Operator, build_operator
+from quilldb.exec.operators import ExplainResult, Operator, build_operator
 from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.binder import (
     BoundAnalyze,
@@ -52,6 +53,7 @@ from quilldb.sql.binder import (
     BoundCreateIndex,
     BoundCreateTable,
     BoundDelete,
+    BoundExplain,
     BoundExpression,
     BoundInsert,
     BoundIsNull,
@@ -251,6 +253,30 @@ class Connection:
             with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
                 operator.next()
             return Cursor(None, None, operator.rows_affected)
+
+
+        if isinstance(bound, BoundExplain):
+            plan = build_operator(bound.select, self.pager, self.pool, self.catalog, self.stats)
+            text = plan.explain(verbose=True)
+            if bound.analyze:
+                # Drain for real, discarding rows -- EXPLAIN ANALYZE trades
+                # "free to run" for "the numbers are measured, not guessed",
+                # the same tradeoff chapter 12 makes for pages_read.
+                started = time.perf_counter()
+                actual_rows = 0
+                plan.open()
+                try:
+                    while plan.next() is not None:
+                        actual_rows += 1
+                finally:
+                    plan.close()
+                elapsed = time.perf_counter() - started
+                text += f"\nactual_rows={actual_rows} elapsed={elapsed:.6f}s"
+            result = ExplainResult((text,))
+            result.open()
+            cursor = Cursor(result, (("QUERY PLAN",),), -1)
+            self._open_cursor = cursor
+            return cursor
 
 
         operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats)

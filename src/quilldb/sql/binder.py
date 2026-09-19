@@ -45,6 +45,7 @@ from quilldb.sql.ast import (
     CreateTable,
     DataType,
     Delete,
+    Explain,
     Expression,
     Insert,
     IsNull,
@@ -218,8 +219,29 @@ class BoundAnalyze:
 
 
 
+@dataclass(frozen=True)
+class BoundExplain:
+    select: BoundSelect
+    analyze: bool
+    """Unlike BoundCreateTable/BoundAnalyze, this DOES resolve: the inner
+    SELECT is bound through the same bind_select() a bare SELECT uses, so
+    an EXPLAIN of an unknown table/column fails at bind time exactly like
+    the SELECT it wraps would -- there's no reason EXPLAIN should be more
+    forgiving about names than the query it's explaining.
+    """
+
+
+
+
 type BoundStatement = (
-    BoundCreateTable | BoundCreateIndex | BoundInsert | BoundSelect | BoundDelete | BoundUpdate | BoundAnalyze
+    BoundCreateTable
+    | BoundCreateIndex
+    | BoundInsert
+    | BoundSelect
+    | BoundDelete
+    | BoundUpdate
+    | BoundAnalyze
+    | BoundExplain
 )
 
 
@@ -273,6 +295,8 @@ def bind(
         bound = binder.bind_update(statement)
     elif isinstance(statement, Analyze):
         bound = BoundAnalyze(statement)
+    elif isinstance(statement, Explain):
+        bound = BoundExplain(binder.bind_select(statement.statement), statement.analyze)
     else:
         raise UnsupportedFeatureError(f"cannot bind a {type(statement).__name__} statement")
 

@@ -233,6 +233,8 @@ what the earlier steps already produced.
 chapter-12-shaped output against a real database, matching the demo chapter
 12 itself shows.
 
+[STATUS: COMPLETE]
+
 
 ---
 
