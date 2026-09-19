@@ -41,10 +41,14 @@ from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.codec.record import Value, decode_record, encode_record
 from quilldb.errors import PageFullError, UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
-from quilldb.plan.planner import AccessPath
-from quilldb.plan.predicates import Predicate
+from quilldb.plan.cost import assign_cost
+from quilldb.plan.planner import AccessPath, enumerate_access_paths
+from quilldb.plan.predicates import Predicate, classify_predicate, extract_conjuncts
+from quilldb.plan.search import choose_access_path
+from quilldb.plan.statistics import default_index_stats, default_table_stats, estimate_row_counts
 from quilldb.sql.binder import (
     BoundAssignment,
+    BoundBinaryOp,
     BoundDelete,
     BoundExpression,
     BoundInsert,
@@ -827,6 +831,48 @@ class Update(Operator):
         return _explain_line(depth, f"Update {self.table.name}")
 
 
+def _extract_predicates(where: BoundExpression | None) -> tuple[list[Predicate], list[BoundExpression]]:
+    """Split a WHERE clause into sargable Predicates (candidates for an
+    index seek) and the non-sargable conjuncts classify_predicate() rejected
+    (an OR, a computed comparison, `NOT ...`, etc). Non-sargable conjuncts
+    can never be consumed by any AccessPath's seek_terms -- no index will
+    ever make them go away -- so they always end up in the final Filter,
+    alongside whatever a chosen path's own `residual` leaves behind.
+    """
+    predicates: list[Predicate] = []
+    non_sargable: list[BoundExpression] = []
+    for conjunct in extract_conjuncts(where):
+        predicate = classify_predicate(conjunct)
+        if predicate is None:
+            non_sargable.append(conjunct)
+        else:
+            predicates.append(predicate)
+    return predicates, non_sargable
+
+
+
+
+def _residual_filter_expression(
+    non_sargable: list[BoundExpression], residual: tuple[Predicate, ...]
+) -> BoundExpression | None:
+    """AND together everything the chosen AccessPath doesn't already
+    guarantee: every non-sargable conjunct, plus each residual Predicate's
+    original `.source` -- `source` already IS the bound expression
+    classify_predicate started from, so there's nothing to reconstruct.
+    None when nothing is left over, so build_operator() can skip Filter
+    entirely, matching the Week 3 "Filter omitted when there is no WHERE"
+    behavior exactly (a full-seek equality plan with no other conjuncts
+    needs no Filter at all).
+    """
+    parts = list(non_sargable) + [predicate.source for predicate in residual]
+    if not parts:
+        return None
+    expression = parts[0]
+    for part in parts[1:]:
+        expression = BoundBinaryOp(expression, "AND", part)
+    return expression
+
+
 
 
 def build_operator(
@@ -835,28 +881,40 @@ def build_operator(
     pool: BufferPool,
     catalog: Catalog,
 ) -> Operator:
-    """Translate a bound statement into the Week 3 fixed plan.
+    """Translate a bound statement into an executable operator tree.
 
 
-    The SELECT plan is always:
+    The SELECT plan is now cost-based (chapter 12 §12.6, stages 1-4 from
+    plan/predicates.py, plan/planner.py, plan/statistics.py, plan/cost.py,
+    plan/search.py):
 
 
         Project
-        └─ Filter       # omitted when there is no WHERE
-           └─ SeqScan
+        └─ Filter       # omitted when nothing is left over to check
+           └─ SeqScan | IndexScan
 
 
-    That IS a planner -- just one with a single possible access path. Week 4
-    moves this function into plan/planner.py and teaches it to choose
-    IndexScan, without changing any operator contract above; that's the
-    payoff for keeping the choice here rather than inlining it into
-    Connection.execute().
+    ANALYZE doesn't exist yet (that's Steps 3-6 of the stage-5 checklist),
+    so every candidate is costed against the flat, documented fallback
+    stats (`default_table_stats`/`default_index_stats`) rather than real
+    measurements -- `choose_access_path` still picks correctly among
+    legal candidates, it just can't yet tell a genuinely selective index
+    apart from a mediocre one. That's fine: this step is specifically
+    scoped to prove the wiring is correct BEFORE real statistics exist, so
+    a bug here can't later be confused with a bug in ANALYZE's arithmetic.
+
+
+    `Filter` is built ONLY from what the chosen path doesn't already
+    guarantee -- the seek_terms a chosen IndexScan consumes are satisfied
+    by construction, so re-checking them would be redundant work. Getting
+    this residual set right is exactly chapter 12 §12.6 trap #3: "the
+    planner must never change results" -- a WHERE clause must return the
+    same rows whether or not a matching index exists.
 
 
     `catalog` resolves which indexes need maintaining -- Catalog.indexes_for()
-    -- for INSERT, DELETE, and UPDATE alike. It isn't used by the SELECT plan
-    yet; it's threaded through regardless so this signature doesn't have to
-    change again once IndexScan needs it too.
+    -- for INSERT, DELETE, and UPDATE alike, and now also which indexes are
+    available to seek for SELECT.
     """
     if isinstance(statement, BoundInsert):
         indexes = catalog.indexes_for(statement.table.name)
@@ -873,7 +931,29 @@ def build_operator(
         return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes)
 
 
-    source: Operator = SeqScan(pager, pool, statement.table)
-    if statement.where is not None:
-        source = Filter(source, statement.where)
+    indexes = catalog.indexes_for(statement.table.name)
+    predicates, non_sargable = _extract_predicates(statement.where)
+
+
+    table_stats = default_table_stats()
+    candidates = enumerate_access_paths(statement.table, list(indexes), predicates)
+    costed_candidates = []
+    for candidate in candidates:
+        index_stats = default_index_stats(candidate.index, table_stats) if candidate.index is not None else None
+        candidate = estimate_row_counts(candidate, index_stats, table_stats)
+        candidate = assign_cost(candidate, index_stats, table_stats)
+        costed_candidates.append(candidate)
+    path = choose_access_path(costed_candidates)
+
+
+    source: Operator
+    if path.kind == "index_scan":
+        source = IndexScan(pager, pool, statement.table, path)
+    else:
+        source = SeqScan(pager, pool, statement.table)
+
+
+    filter_expression = _residual_filter_expression(non_sargable, path.residual)
+    if filter_expression is not None:
+        source = Filter(source, filter_expression)
     return Project(source, statement.expressions)

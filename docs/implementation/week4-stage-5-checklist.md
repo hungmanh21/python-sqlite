@@ -84,6 +84,7 @@ creating it) and assert identical row sets.
 `build_operator()`'s output and the SAME rows a `SeqScan` plan would, for
 every existing operator test plus new index-specific ones.
 
+[STATUS: COMPLETE]
 
 ## Step 3 — ANALYZE: measure a real table B-tree
 

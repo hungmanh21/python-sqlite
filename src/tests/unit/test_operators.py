@@ -10,6 +10,10 @@ PoolExhaustedError somewhere unrelated, so it has to be asserted directly.
 """
 
 
+import pathlib
+import tempfile
+
+
 import pytest
 
 
@@ -82,7 +86,7 @@ def _insert(pager: Pager, pool: BufferPool, catalog: Catalog, *rows: tuple[objec
     for row in rows:
         bound = bind(parse("INSERT INTO users VALUES (?, ?, ?)"), catalog, row)
         assert isinstance(bound, BoundInsert)
-        operator = Insert(pager, pool, bound)
+        operator = Insert(pager, pool, bound, catalog.indexes_for("users"))
         operator.open()
         assert operator.next() is None  # an INSERT yields no rows
         operator.close()
@@ -618,6 +622,92 @@ def test_build_operator_omits_filter_without_a_where(tmp_path) -> None:
     plan = build_operator(_select(catalog, "SELECT name FROM users"), pager, pool, catalog)
     assert plan.explain() == "Project\n└─ SeqScan users"
     pager.close()
+
+
+
+
+def test_build_operator_chooses_index_scan_for_an_indexed_equality(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 21)])
+
+
+    plan = build_operator(_select(catalog, "SELECT * FROM users WHERE age = 7"), pager, pool, catalog)
+    assert plan.explain() == "Project\n└─ IndexScan idx_age"
+    assert _drain(plan) == [(7, "u7", 7)]
+    pager.close()
+
+
+
+
+def test_build_operator_falls_back_to_seq_scan_without_a_matching_index(tmp_path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20))
+
+
+    plan = build_operator(_select(catalog, "SELECT * FROM users WHERE age = 20"), pager, pool, catalog)
+    assert plan.explain() == "Project\n└─ Filter\n   └─ SeqScan users"
+    assert _drain(plan) == [(2, "bob", 20)]
+    pager.close()
+
+
+
+
+def test_build_operator_filter_applies_only_the_residual_predicate(tmp_path) -> None:
+    """`age > 10 AND name = 'u15'` on an index over `age` alone: the seek
+    consumes `age > 10` (an IndexScan), `name = 'u15'` can't be part of
+    that seek so it must survive as a Filter on top -- but ONLY that
+    predicate, not the whole original WHERE clause re-evaluated.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    _create_users(catalog)
+    _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 21)])
+
+
+    plan = build_operator(
+        _select(catalog, "SELECT * FROM users WHERE age > 10 AND name = 'u15'"), pager, pool, catalog
+    )
+    assert plan.explain() == "Project\n└─ Filter\n   └─ IndexScan idx_age"
+    assert _drain(plan) == [(15, "u15", 15)]
+    pager.close()
+
+
+
+
+def test_build_operator_index_and_seq_scan_plans_return_identical_rows(tmp_path) -> None:
+    """Trap #3 (chapter 12 SS12.6): the planner must never change results.
+    Run the same WHERE clauses against a table with and without a matching
+    index and assert identical row sets either way.
+    """
+    where_clauses = [
+        "age = 12",
+        "age > 15",
+        "age >= 5 AND age <= 9",
+        "age = 3 AND name = 'u3'",
+        "age = 999",  # matches nothing
+        "name = 'u10'",  # not indexed at all -- always a seq_scan
+    ]
+
+
+    def _rows_for(create_index: bool) -> dict[str, list[tuple[object, ...]]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            pager, pool, catalog = _db(pathlib.Path(tmp))
+            _create_users(catalog)
+            if create_index:
+                _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+            _insert(pager, pool, catalog, *[(i, f"u{i}", i) for i in range(1, 21)])
+            results = {}
+            for clause in where_clauses:
+                plan = build_operator(_select(catalog, f"SELECT * FROM users WHERE {clause}"), pager, pool, catalog)
+                results[clause] = sorted(_drain(plan))
+            pager.close()
+            return results
+
+
+    assert _rows_for(create_index=True) == _rows_for(create_index=False)
 
 
 
