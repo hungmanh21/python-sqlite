@@ -43,6 +43,14 @@ class TokenType(Enum):
     SELECT = auto()
     FROM = auto()
     WHERE = auto()
+    DELETE = auto()
+    UPDATE = auto()
+    SET = auto()
+    INDEX = auto()
+    ON = auto()
+    UNIQUE = auto()
+    ANALYZE = auto()
+    EXPLAIN = auto()
     INTEGER_TYPE = auto()
     REAL_TYPE = auto()
     TEXT_TYPE = auto()
@@ -81,6 +89,14 @@ KEYWORDS: dict[str, TokenType] = {
     "select": TokenType.SELECT,
     "from": TokenType.FROM,
     "where": TokenType.WHERE,
+    "delete": TokenType.DELETE,
+    "update": TokenType.UPDATE,
+    "set": TokenType.SET,
+    "index": TokenType.INDEX,
+    "on": TokenType.ON,
+    "unique": TokenType.UNIQUE,
+    "analyze": TokenType.ANALYZE,
+    "explain": TokenType.EXPLAIN,
     "integer": TokenType.INTEGER_TYPE,
     "real": TokenType.REAL_TYPE,
     "text": TokenType.TEXT_TYPE,

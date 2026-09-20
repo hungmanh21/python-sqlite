@@ -1,284 +1,907 @@
-"""Small DB-API-inspired public surface: `connect`, `Connection`, `Cursor`.
+"""Connection/Cursor tests: the public surface, not the internals below it.
 
 
-Every layer built so far (catalog, binder, evaluator, operators) is correct
-but unusable on its own -- a caller would need to know about Pager,
-BufferPool, and Catalog just to run one query. This module is the seam: it
-owns the three storage handles for the lifetime of one open database, and
-turns `execute()` into the one call a caller needs, whatever kind of
-statement it was.
-
-
-Three things this layer alone is responsible for, that no layer below it
-can be:
-
-
-1. UNIFORM RESULT SHAPE ACROSS STATEMENT KINDS. CREATE TABLE mutates the
-   catalog and produces no rows; INSERT writes one row and produces no rows
-   either, just a count; SELECT produces a lazy stream. execute() always
-   returns a Cursor -- description and rowcount are where the difference
-   surfaces, not the return type.
-2. THE STREAM SURVIVES THE HANDOFF. SeqScan/Filter/Project already refuse
-   to materialize a result set (exec/operators.py). If execute() drained an
-   operator into a list before returning, that guarantee would be undone
-   right at the boundary a caller actually touches. Cursor.fetchone() pulls
-   from the same still-open operator, one row at a time.
-3. ONE RULE FOR RESULT LIFETIME. A Cursor holds an open Operator, which
-   holds b-tree pins. Starting a new execute() on a connection closes
-   whatever cursor that connection still had open, so pins can't accumulate
-   silently across queries -- multiple *simultaneous* result sets require
-   multiple connections, matching every DB-API's convention.
-
-
-CREATE TABLE and INSERT are executed to completion before execute() returns
--- there is nothing left to stream. SELECT is the one case that leaves an
-operator open past the call that created it.
+Everything here goes through `quilldb.connect()` the way an actual caller
+would -- no Pager, BufferPool, or Catalog constructed directly. Lower
+layers already have their own focused tests; this file is about the seam
+those layers are hidden behind: one execute() shape for three different
+statement kinds, streaming that survives the handoff to Cursor, and the
+DB-API fetch/close contract from docs/implementation/week-3-sql.md §20.
 """
 
 
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Self
 
+import pytest
 
-from quilldb.catalog.catalog import Catalog
-from quilldb.codec.record import Value
-from quilldb.errors import UnsupportedFeatureError
-from quilldb.exec.operators import Operator, build_operator
-from quilldb.sql.binder import (
-    BoundBinaryOp,
-    BoundColumn,
-    BoundCreateTable,
-    BoundExpression,
-    BoundInsert,
-    BoundIsNull,
-    BoundLiteral,
-    BoundUnaryOp,
-    bind,
+import quilldb
+from quilldb.btree.index import IndexBTree
+from quilldb.errors import (
+    ColumnNotFoundError,
+    ParameterCountError,
+    TableNotFoundError,
+    TypeMismatchError,
+    UniqueViolationError,
 )
-from quilldb.sql.parser import parse
-from quilldb.storage.bufferpool import BufferPool
-from quilldb.storage.pager import Pager
+from quilldb.plan.statistics import default_table_stats
 
-
-_MEMORY_PATH = ":memory:"
+_USERS_SQL = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 
 
 
 
-class Cursor:
-    """One statement's result. `description`/`rowcount` are fixed at
-    creation; `fetch*` pulls from the operator underneath, one row at a
-    time, until it's exhausted or closed.
+def _outstanding_pins(connection: quilldb.Connection) -> int:
+    return sum(entry.pin_count for entry in connection.pool._cache.values())
+
+
+
+
+# =====================================================================
+# The roadmap's four-line example, and :memory:
+# =====================================================================
+
+
+
+
+def test_the_public_four_line_example_runs() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+    assert db.execute("SELECT name FROM users WHERE age > 30").fetchall() == [("ada",)]
+    db.close()
+
+
+
+
+def test_memory_creates_no_filesystem_entry(tmp_path: Path) -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+
+
+def test_a_path_literally_named_memory_is_a_real_file(tmp_path: Path) -> None:
+    """Only the exact string ":memory:" is special; a Path spelled the same
+    way is an ordinary path on disk.
     """
-
-
-    def __init__(
-        self,
-        operator: Operator | None,
-        description: tuple[tuple[str, ...], ...] | None,
-        rowcount: int,
-    ) -> None:
-        self._operator = operator
-        self._description = description
-        self._rowcount = rowcount
-        self._closed = False
-
-
-    @property
-    def description(self) -> tuple[tuple[str, ...], ...] | None:
-        """One tuple per output expression, or None for CREATE TABLE/INSERT.
-
-
-        Only element 0 (the display name) is guaranteed this week -- the
-        real DB-API's other six positions (type, size, precision...) have
-        no meaning quilldb can supply yet.
-        """
-        return self._description
-
-
-    @property
-    def rowcount(self) -> int:
-        """1 for a successful INSERT, 0 for CREATE TABLE, -1 for SELECT.
-
-
-        -1 rather than a real count: SELECT is a lazy stream, so "how many
-        rows" isn't known until fetch* has drained it, same as sqlite3's
-        own Cursor.
-        """
-        return self._rowcount
-
-
-    def fetchone(self) -> tuple[Value, ...] | None:
-        """One row, or None once exhausted -- and every call after that.
-
-
-        A row that raises (a TypeMismatchError from evaluate(), say) leaves
-        this cursor closed rather than merely exhausted: the operator chain
-        underneath already closed itself on the way out (exec/operators.py's
-        every-operator-closes-on-exception rule), so letting a later
-        fetchone() call reach it would just see "no cursor, return None" --
-        indistinguishable from a query that finished cleanly. A caller that
-        catches the error and keeps pulling deserves "cursor is closed", not
-        a silent lie that there were simply no more rows.
-        """
-        if self._closed:
-            raise ValueError("cursor is closed")
-        if self._operator is None:
-            return None
-        try:
-            row = self._operator.next()
-        except Exception:
-            self._operator = None
-            self._closed = True
-            raise
-        if row is None:
-            # Nothing left to stream: release the pins now rather than
-            # waiting for an explicit close() that may never come.
-            self._operator.close()
-            self._operator = None
-        return row
-
-
-    def fetchmany(self, size: int = 1) -> list[tuple[Value, ...]]:
-        if size < 0:
-            raise ValueError(f"fetchmany size must not be negative, got {size}")
-        rows: list[tuple[Value, ...]] = []
-        for _ in range(size):
-            row = self.fetchone()
-            if row is None:
-                break
-            rows.append(row)
-        return rows
-
-
-    def fetchall(self) -> list[tuple[Value, ...]]:
-        rows: list[tuple[Value, ...]] = []
-        while (row := self.fetchone()) is not None:
-            rows.append(row)
-        return rows
-
-
-    def close(self) -> None:
-        if self._operator is not None:
-            self._operator.close()
-            self._operator = None
-        self._closed = True
+    path = tmp_path / ":memory:"
+    db = quilldb.connect(path)
+    db.close()
+    assert path.exists()
 
 
 
 
-def _display_name(expression: BoundExpression) -> str:
-    """The source column name for a plain column, or SQL-ish reconstructed
-    text otherwise -- exactly what Cursor.description's element 0 needs.
+# =====================================================================
+# CREATE TABLE survives close and reopen
+# =====================================================================
+
+
+
+
+def test_create_table_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+
+
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "linus", None))
+
+
+    with quilldb.connect(path) as db:
+        cursor = db.execute("SELECT name FROM users WHERE age > ?", (30,))
+        description = cursor.description
+        assert description is not None
+        assert description[0][0] == "name"
+        assert cursor.fetchall() == [("ada",)]
+
+
+
+
+def test_reopening_an_existing_file_does_not_recreate_it(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+
+
+    with quilldb.connect(path) as db:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36)]
+
+
+
+
+# =====================================================================
+# rowcount per statement kind
+# =====================================================================
+
+
+
+
+def test_rowcount_is_zero_for_create_table() -> None:
+    db = quilldb.connect(":memory:")
+    assert db.execute(_USERS_SQL).rowcount == 0
+    db.close()
+
+
+
+
+def test_rowcount_is_one_for_insert() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    assert db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36)).rowcount == 1
+    db.close()
+
+
+
+
+def test_rowcount_is_negative_one_for_select() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    assert db.execute("SELECT * FROM users").rowcount == -1
+    db.close()
+
+
+
+
+# =====================================================================
+# description
+# =====================================================================
+
+
+
+
+def test_description_is_none_for_create_table_and_insert() -> None:
+    db = quilldb.connect(":memory:")
+    assert db.execute(_USERS_SQL).description is None
+    assert db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36)).description is None
+    db.close()
+
+
+
+
+def test_description_names_a_plain_column() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT name, age FROM users")
+    description = cursor.description
+    assert description is not None
+    assert description[0][0] == "name"
+    assert description[1][0] == "age"
+    db.close()
+
+
+
+
+def test_description_reconstructs_a_computed_expression() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT age + 1 FROM users")
+    description = cursor.description
+    assert description is not None
+    assert description[0][0] == "age + 1"
+    db.close()
+
+
+
+
+def test_description_expands_star() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT * FROM users")
+    description = cursor.description
+    assert description is not None
+    assert [column[0] for column in description] == ["id", "name", "age"]
+    db.close()
+
+
+
+
+# =====================================================================
+# fetchone / fetchmany / fetchall
+# =====================================================================
+
+
+
+
+def test_select_on_an_empty_table_returns_no_rows() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+
+
+
+
+def test_fetchone_keeps_returning_none_after_exhaustion() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("SELECT name FROM users")
+    assert cursor.fetchone() == ("ada",)
+    assert cursor.fetchone() is None
+    assert cursor.fetchone() is None
+    db.close()
+
+
+
+
+def test_fetchmany_default_size_is_one() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 41), (3, "amy", 20)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    cursor = db.execute("SELECT name FROM users")
+    assert cursor.fetchmany() == [("ada",)]
+    assert cursor.fetchmany(2) == [("bob",), ("amy",)]
+    assert cursor.fetchmany(2) == []
+    db.close()
+
+
+
+
+def test_fetchmany_zero_returns_an_empty_list_without_consuming_a_row() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("SELECT name FROM users")
+    assert cursor.fetchmany(0) == []
+    assert cursor.fetchone() == ("ada",)
+    db.close()
+
+
+
+
+def test_fetchmany_negative_size_raises() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT * FROM users")
+    with pytest.raises(ValueError):
+        cursor.fetchmany(-1)
+    db.close()
+
+
+
+
+def test_fetchall_drains_every_remaining_row() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 41), (3, "amy", 20)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    cursor = db.execute("SELECT name FROM users")
+    assert cursor.fetchone() == ("ada",)
+    assert cursor.fetchall() == [("bob",), ("amy",)]
+    db.close()
+
+
+
+
+def test_a_failed_fetch_closes_the_cursor_instead_of_masking_the_error() -> None:
+    """A row that raises leaves the cursor CLOSED, not merely exhausted --
+    otherwise a caller that catches the error and keeps pulling would see a
+    plain None on the next call, indistinguishable from a query that simply
+    ran out of rows.
     """
-    if isinstance(expression, BoundColumn):
-        return expression.name
-    if isinstance(expression, BoundLiteral):
-        return repr(expression.value)
-    if isinstance(expression, BoundUnaryOp):
-        return f"{expression.operator}{_display_name(expression.operand)}"
-    if isinstance(expression, BoundBinaryOp):
-        return f"{_display_name(expression.left)} {expression.operator} {_display_name(expression.right)}"
-    if isinstance(expression, BoundIsNull):
-        suffix = "IS NOT NULL" if expression.negated else "IS NULL"
-        return f"{_display_name(expression.operand)} {suffix}"
-    raise UnsupportedFeatureError(f"cannot describe a {type(expression).__name__}")
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "poison", None))
+
+
+    cursor = db.execute("SELECT name + 1 FROM users")
+    with pytest.raises(TypeMismatchError):
+        cursor.fetchone()
+    with pytest.raises(ValueError):
+        cursor.fetchone()
+    db.close()
 
 
 
 
-class Connection:
-    """Owns one Pager/BufferPool/Catalog for as long as the database is
-    open. `execute()` is the only entry point that touches them.
+# =====================================================================
+# close()
+# =====================================================================
+
+
+
+
+def test_fetching_after_close_raises() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT * FROM users")
+    cursor.close()
+    with pytest.raises(ValueError):
+        cursor.fetchone()
+    db.close()
+
+
+
+
+def test_cursor_close_is_idempotent() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("SELECT * FROM users")
+    cursor.close()
+    cursor.close()
+    db.close()
+
+
+
+
+def test_connection_close_is_idempotent() -> None:
+    db = quilldb.connect(":memory:")
+    db.close()
+    db.close()
+
+
+
+
+def test_executing_after_connection_close_raises() -> None:
+    db = quilldb.connect(":memory:")
+    db.close()
+    with pytest.raises(ValueError):
+        db.execute(_USERS_SQL)
+
+
+
+
+# =====================================================================
+# One open cursor per connection, and the pins that come with it
+# =====================================================================
+
+
+
+
+def test_a_new_execute_closes_the_previous_open_cursor() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    first = db.execute("SELECT * FROM users")
+    assert _outstanding_pins(db) > 0  # the SeqScan is holding its path
+
+
+    second = db.execute("SELECT * FROM users")  # abandons `first` mid-scan
+    with pytest.raises(ValueError):  # `first` was closed out from under it
+        first.fetchone()
+    assert second.fetchall() == [(1, "ada", 36)]
+    db.close()
+
+
+
+
+def test_no_pins_survive_a_full_session(tmp_path: Path) -> None:
+    db = quilldb.connect(tmp_path / "demo.db")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 41)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+    db.execute("SELECT * FROM users").fetchall()
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+# =====================================================================
+# Failures happen before any cursor opens
+# =====================================================================
+
+
+
+
+def test_unknown_table_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    with pytest.raises(TableNotFoundError):
+        db.execute("SELECT * FROM ghosts")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_unknown_column_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    with pytest.raises(ColumnNotFoundError):
+        db.execute("SELECT ghost FROM users")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_wrong_parameter_count_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    with pytest.raises(ParameterCountError):
+        db.execute("SELECT * FROM users WHERE age > ?")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+# =====================================================================
+# CREATE INDEX, through the same execute() seam as CREATE TABLE
+# =====================================================================
+
+
+
+
+def test_create_index_runs_through_execute_and_leaves_no_pins() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    cursor = db.execute("CREATE INDEX idx_name ON users (name)")
+    assert cursor.rowcount == 0
+    assert cursor.description is None
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_create_index_backfills_rows_inserted_before_it_existed() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 41)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+
+
+    # No index-aware query path yet (that's step 2) -- this just proves the
+    # backfill didn't corrupt anything a plain SELECT can already see.
+    assert db.execute("SELECT name FROM users WHERE age > 30").fetchall() == [("ada",), ("bob",)]
+    db.close()
+
+
+
+
+def test_create_index_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("CREATE INDEX idx_name ON users (name)")
+
+
+    with quilldb.connect(path) as db:
+        assert [i.name for i in db.catalog.indexes_for("users")] == ["idx_name"]
+
+
+
+
+def test_create_unique_index_on_duplicate_data_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "ada", 41))
+
+
+    with pytest.raises(UniqueViolationError):
+        db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+    assert _outstanding_pins(db) == 0
+    assert db.catalog.indexes_for("users") == ()
+    db.close()
+
+
+
+
+def test_create_index_on_missing_table_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    with pytest.raises(TableNotFoundError):
+        db.execute("CREATE INDEX idx_ghost ON ghosts (col)")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+# =====================================================================
+# Insert index maintenance, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_insert_after_create_index_keeps_the_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    index = db.catalog.indexes_for("users")[0]
+    assert list(IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False).seek_eq(["ada"])) == [1]
+    db.close()
+
+
+
+
+def test_insert_violating_a_unique_index_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    with pytest.raises(UniqueViolationError):
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "ada", 41))
+
+
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36)]
+    db.close()
+
+
+
+
+# =====================================================================
+# DELETE, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_delete_removes_matching_rows_and_reports_rowcount() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    for row in [(1, "ada", 36), (2, "bob", 20), (3, "amy", 41)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
+
+
+    cursor = db.execute("DELETE FROM users WHERE age < 30")
+    assert cursor.rowcount == 1
+    assert cursor.description is None
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (3, "amy", 41)]
+    db.close()
+
+
+
+
+def test_delete_with_no_where_removes_every_row_and_leaves_no_pins() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("DELETE FROM users")
+    assert cursor.rowcount == 1
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+
+
+
+
+def test_delete_keeps_an_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("DELETE FROM users WHERE id = 1")
+
+
+    index = db.catalog.indexes_for("users")[0]
+    assert list(IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False).seek_eq(["ada"])) == []
+    db.close()
+
+
+
+
+def test_delete_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 20))
+        db.execute("DELETE FROM users WHERE id = 1")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(2, "bob", 20)]
+
+
+
+
+# =====================================================================
+# UPDATE, through the same execute() seam
+# =====================================================================
+
+
+
+
+def test_update_sets_a_column_and_reports_rowcount() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("UPDATE users SET age = 40 WHERE id = 1")
+    assert cursor.rowcount == 1
+    assert cursor.description is None
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 40)]
+    db.close()
+
+
+
+
+def test_update_keeps_an_index_current() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("UPDATE users SET name = 'ines' WHERE id = 1")
+
+
+    index = db.catalog.indexes_for("users")[0]
+    ibt = IndexBTree(db.pager, db.pool, index.root_page, n_key_columns=1, unique=False)
+    assert list(ibt.seek_eq(["ada"])) == []
+    assert list(ibt.seek_eq(["ines"])) == [1]
+    db.close()
+
+
+
+
+def test_update_violating_a_unique_index_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE UNIQUE INDEX idx_name ON users (name)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 20))
+
+
+    with pytest.raises(UniqueViolationError):
+        db.execute("UPDATE users SET name = 'ada' WHERE id = 2")
+
+
+    assert _outstanding_pins(db) == 0
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (2, "bob", 20)]
+    db.close()
+
+
+
+
+def test_update_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("UPDATE users SET age = 40 WHERE id = 1")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 40)]
+
+
+
+
+# =====================================================================
+# ANALYZE: stage-5 Step 6 -- bound, dispatched, and connected to real stats
+# =====================================================================
+
+
+
+
+def test_analyze_runs_through_execute_and_leaves_no_pins() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    cursor = db.execute("ANALYZE")
+    assert cursor.rowcount == 0
+    assert cursor.description is None
+    assert _outstanding_pins(db) == 0
+    assert db.stats.table_stats("users").row_count == 1
+    db.close()
+
+
+
+
+def test_analyze_with_a_target_measures_only_that_table() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.execute("ANALYZE users")
+
+
+    assert db.stats.table_stats("users").row_count == 1
+    assert db.stats.table_stats("orders") == default_table_stats()  # never analyzed -- still the flat default
+    db.close()
+
+
+
+
+def test_analyze_unknown_target_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+
+
+    with pytest.raises(TableNotFoundError):
+        db.execute("ANALYZE ghost")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_analyze_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 41))
+        db.execute("ANALYZE")
+
+
+    with quilldb.connect(path) as db:
+        assert db.stats.table_stats("users").row_count == 2
+
+
+
+
+def test_analyze_never_changes_query_results() -> None:
+    """Chapter 12 §12.6 trap #3, at the Connection seam this time: whether
+    or not ANALYZE has run, the same query returns the same rows --
+    ANALYZE is only allowed to change which plan answers a query, never
+    the answer itself.
     """
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("CREATE INDEX idx_age ON users (age)")
+    for row in [(1, "ada", 36), (2, "bob", 41), (3, "cleo", 22)]:
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", row)
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog) -> None:
-        self.pager = pager
-        self.pool = pool
-        self.catalog = catalog
-        self._open_cursor: Cursor | None = None
-        self._closed = False
+    before = db.execute("SELECT * FROM users WHERE age > 30").fetchall()
+    db.execute("ANALYZE")
+    after = db.execute("SELECT * FROM users WHERE age > 30").fetchall()
 
 
-    def execute(self, sql: str, parameters: Sequence[Value] = ()) -> Cursor:
-        """Parse, bind, and execute one statement.
-
-
-        CREATE TABLE and INSERT complete before this method returns. SELECT
-        leaves its operator open and streams rows through the returned
-        Cursor. Starting another execute() closes any still-open result
-        cursor on this connection; multiple active cursors arrive with
-        multiple connections.
-        """
-        if self._closed:
-            raise ValueError("connection is closed")
-        if self._open_cursor is not None:
-            self._open_cursor.close()
-            self._open_cursor = None
-
-
-        bound = bind(parse(sql), self.catalog, tuple(parameters))
-
-
-        if isinstance(bound, BoundCreateTable):
-            self.catalog.create_table(bound.statement, sql)
-            return Cursor(None, None, 0)
-
-
-        if isinstance(bound, BoundInsert):
-            with build_operator(bound, self.pager, self.pool) as operator:
-                operator.next()
-            return Cursor(None, None, 1)
-
-
-        operator = build_operator(bound, self.pager, self.pool)
-        operator.open()
-        description = tuple((_display_name(e),) for e in bound.expressions)
-        cursor = Cursor(operator, description, -1)
-        self._open_cursor = cursor
-        return cursor
-
-
-    def close(self) -> None:
-        """Flush every dirty page and close the file. Idempotent."""
-        if self._closed:
-            return
-        if self._open_cursor is not None:
-            self._open_cursor.close()
-            self._open_cursor = None
-        self.pool.flush_all()
-        self.pager.close()
-        self._closed = True
-
-
-    def __enter__(self) -> Self:
-        return self
-
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.close()
+    assert before == after == [(1, "ada", 36), (2, "bob", 41)]
+    db.close()
 
 
 
 
-def connect(path: str | Path) -> Connection:
-    """Open an existing database or create a new one.
+# =====================================================================
+# EXPLAIN / EXPLAIN ANALYZE: stage-5 Step 7
+# =====================================================================
 
 
-    The exact string ":memory:" selects Pager.memory() and never creates a
-    file -- anything else, including a Path spelled ":memory:", is a real
-    path on disk.
+_USERS_WITH_AGE_INDEX_SQL = "CREATE INDEX idx_age ON users (age)"
+
+
+def _connect_analyzed_users(n: int) -> quilldb.Connection:
+    """A big-enough table that a real ANALYZE actually favors IndexScan
+    over SeqScan for a selective equality (the same "too small to show a
+    contrast" fact test_operators.py's own ANALYZE test runs into at a
+    handful of rows -- see its docstring).
     """
-    if path == _MEMORY_PATH:
-        pager = Pager.memory()
-    else:
-        path = Path(path)
-        pager = Pager.open(path) if path.exists() else Pager.create(path)
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute(_USERS_WITH_AGE_INDEX_SQL)
+    for i in range(1, n + 1):
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (i, f"user_number_{i}_padded_for_size", i))
+    db.execute("ANALYZE")
+    return db
 
 
-    pool = BufferPool(pager)
-    catalog = Catalog(pager, pool)
-    catalog.load()
-    return Connection(pager, pool, catalog)
+
+
+def test_explain_returns_one_row_one_column_without_running_the_query() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    cursor = db.execute("EXPLAIN SELECT * FROM users WHERE age = 7")
+    assert _outstanding_pins(db) == 0  # nothing from `users` itself has been touched yet
+    description = cursor.description
+    assert description is not None
+    assert description[0][0] == "QUERY PLAN"
+    rows = cursor.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "Project\n└─ IndexScan idx_age (age = 7) est_rows=1 startup=8.00 cost=16.01"
+    db.close()
+
+
+
+
+def test_explain_shows_seq_scan_plainly_without_annotations() -> None:
+    """Step 7 scopes the cost/row annotation to IndexScan specifically --
+    a SeqScan's EXPLAIN line stays exactly what build_operator()'s own
+    plain explain() already produced."""
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN SELECT * FROM users WHERE name = 'nobody'").fetchall()
+    assert rows == [("Project\n└─ Filter\n   └─ SeqScan users",)]
+    db.close()
+
+
+
+
+def test_explain_unknown_table_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+
+
+    with pytest.raises(TableNotFoundError):
+        db.execute("EXPLAIN SELECT * FROM ghost")
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_explain_unknown_column_raises_before_a_cursor_opens() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+
+
+    with pytest.raises(ColumnNotFoundError):
+        db.execute("EXPLAIN SELECT ghost FROM users")
+    db.close()
+
+
+
+
+def test_explain_analyze_runs_the_query_and_appends_actual_rows() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE age = 7").fetchall()
+    assert len(rows) == 1
+    lines = rows[0][0].split("\n")
+    assert lines[0] == "Project"
+    assert lines[1] == "└─ IndexScan idx_age (age = 7) est_rows=1 startup=8.00 cost=16.01"
+    assert lines[2].startswith("actual_rows=1 elapsed=")
+    db.close()
+
+
+
+
+def test_explain_analyze_leaves_no_pins_after_draining() -> None:
+    db = _connect_analyzed_users(1000)
+
+
+    db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE age = 7").fetchall()
+    assert _outstanding_pins(db) == 0
+    db.close()
+
+
+
+
+def test_plain_explain_does_not_run_the_query() -> None:
+    """The other half of EXPLAIN ANALYZE's contrast: plain EXPLAIN must
+    never execute the plan, so `actual_rows` never appears and nothing
+    from `users` gets pinned even after fetchall() drains the one
+    QUERY PLAN row.
+    """
+    db = _connect_analyzed_users(1000)
+
+
+    rows = db.execute("EXPLAIN SELECT * FROM users WHERE age = 7").fetchall()
+    assert "actual_rows" not in rows[0][0]
+    assert _outstanding_pins(db) == 0
+    db.close()

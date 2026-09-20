@@ -21,7 +21,6 @@ class DataType(Enum):
     TEXT = "TEXT"
     BLOB = "BLOB"
 
-
 @dataclass(frozen=True)
 class ColumnDef:
     name: str
@@ -100,4 +99,46 @@ class Select:
     where: Expression | None = None
 
 
-type Statement = CreateTable | Insert | Select
+@dataclass(frozen=True)
+class Delete:
+    table: str
+    where: Expression | None = None
+
+
+@dataclass(frozen=True)
+class Assignment:
+    column: str
+    value: Expression
+
+
+@dataclass(frozen=True)
+class Update:
+    table: str
+    assignments: tuple[Assignment, ...]
+    where: Expression | None = None
+
+@dataclass(frozen=True)
+class CreateIndex:
+    name: str
+    table: str
+    columns: tuple[str, ...]
+    unique: bool = False
+
+
+@dataclass(frozen=True)
+class Analyze:
+    target: str | None = None
+    """A table name, or None to analyze every table. Unlike real SQLite,
+    an index name here is not resolved to its owning table -- StatisticsCatalog.analyze()
+    treats `target` strictly as a table name and raises TableNotFoundError
+    otherwise."""
+
+
+
+@dataclass(frozen=True)
+class Explain:
+    statement: Select
+    analyze: bool = False
+
+
+type Statement = CreateTable | Insert | Select | Delete | Update | CreateIndex | Analyze | Explain

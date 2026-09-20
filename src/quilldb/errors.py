@@ -126,12 +126,27 @@ class TableAlreadyExistsError(CatalogError):
     """CREATE TABLE named an existing table."""
 
 
+class IndexAlreadyExistsError(CatalogError):
+    """CREATE INDEX named an existing table or index."""
+
+
+class UniqueViolationError(QuillDBError):
+    """An insert or update would duplicate a UNIQUE index key.
+
+
+    Raised BEFORE any page is modified. Carries the index name and the
+    conflicting key so the message is actionable.
+    """
+
+
+    def __init__(self, index_name: str, key: tuple[object, ...]) -> None:
+        self.index_name = index_name
+        self.key = key
+        super().__init__(f"UNIQUE constraint failed on index {index_name!r}: key {key!r} already exists")
 
 
 class ColumnNotFoundError(SQLError):
     """A statement named a column that does not exist in its input row."""
-
-
 
 
 class ColumnCountError(SQLError):
@@ -146,12 +161,8 @@ class ColumnCountError(SQLError):
     """
 
 
-
-
 class ParameterCountError(SQLError):
     """The number of supplied values does not match the number of `?` markers."""
-
-
 
 
 class TypeMismatchError(SQLError):

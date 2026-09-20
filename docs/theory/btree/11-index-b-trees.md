@@ -222,13 +222,21 @@ the same rows:
 
 Not one byte differs. So how is uniqueness enforced? **By comparing only the first N columns** — the
 declared key columns — and ignoring the trailing rowid during the uniqueness check, while still using
-it for ordering and addressing.
+it for ordering and addressing. The rowid is stored in every index entry; the *comparison routine*,
+not the key format, is what changes for `UNIQUE`.
 
+Storing the rowid even here is the right call, for two reasons that have nothing to do with
+disambiguating duplicates:
 
-That's the right call for two reasons. First, one key format and one comparison routine parameterized
-by "how many columns count for uniqueness," instead of two layouts and two code paths. Second, reason
-3 above still applies: even in a unique index you need to delete a *specific row's* entry, and the
-rowid is how you name it.
+1. **One key format, one comparison routine.** Every index — unique or not — stores the same
+   `(key columns..., rowid)` layout. Uniqueness becomes a parameter of the comparison ("only the
+   first N columns count"), not a second on-disk format. Dropping the rowid from unique indexes
+   would fork both the layout and the code that reads it.
+2. **Deletion still needs to be addressable (reason 3 above).** Even in a unique index, `DELETE FROM
+   t WHERE id = 92` must remove *that row's* entry, not just any entry with a matching key. Since the
+   key columns are unique, in practice there's only one entry to find — but the engine still needs
+   the rowid on hand to construct the key and locate it, and keeping it in the entry is what makes
+   that construction trivial and uniform across every index, unique or not.
 
 
 The same holds for indexes SQLite creates implicitly. `b TEXT UNIQUE` produces
@@ -539,16 +547,26 @@ differently.
 
 
 **3. Text needs a collation.** `'ADA' = 'ada'` depends on the collating sequence: `BINARY` (default,
-bytewise), `NOCASE` (ASCII case-insensitive), or `RTRIM` (ignores trailing spaces). The collation is a
+`NOCASE` (ASCII case-insensitive), or `RTRIM` (ignores trailing spaces). The collation is a
 property of the *index*, which produces a consequence people trip over: **an index built with one
 collation cannot serve a query that needs another.** `CREATE INDEX ON users(email)` is `BINARY`, so
 `WHERE email = 'ADA@X.COM' COLLATE NOCASE` cannot use it — the index's sort order isn't the order the
 query needs. This is the same principle as the leading-column rule in chapter 12: an index helps only
 when its ordering matches the ordering the query asks about.
 
+**What `BINARY` actually means.** It's not "compare as raw bytes" in the way rule 1 already ruled out
+— you still decode the record and get to a Python/Rust/whatever string. `BINARY` says: once you have
+that string, compare it byte-by-byte over its *encoded form* (UTF-8, for SQLite) with no
+transformation first. No case-folding (`'ADA'` and `'ada'` are unequal, and `'B' < 'a'` because
+uppercase bytes sort below lowercase in ASCII/UTF-8), no accent-stripping, no locale awareness — just
+`memcmp` on the bytes of the string once you're down to that one column. `NOCASE` and `RTRIM` are
+`BINARY` plus a transform applied before the comparison (uppercase everything; strip trailing spaces);
+they are not different byte-orderings, they're different *preprocessing*. That's also why `NOCASE`
+must stay ASCII-only in SQLite's built-in version — a real Unicode case fold needs locale-aware
+tables SQLite doesn't ship by default.
 
-quilldb implements `BINARY` only, which is the default and covers every test you'll write. Say so in
-the docs rather than leaving it implied.
+quilldb implements `BINARY` only — plain byte comparison of the UTF-8 string, no case-folding — which
+is the default and covers every test you'll write. Say so in the docs rather than leaving it implied.
 
 
 ---

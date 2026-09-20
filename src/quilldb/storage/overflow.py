@@ -15,7 +15,7 @@ rather than inventing a combined type -- that's the same pair test_bufferpool.py
 already wires together at every call site.
 
 
-See docs/theory/06-b-tree-mechanics.md §6.5.
+See docs/theory/btree/06-b-tree-mechanics.md §6.5.
 """
 
 
@@ -89,8 +89,8 @@ def read_overflow_chain(pager: Pager, pool: BufferPool, first_page: int, total_l
 
 
     Args:
-        pager: unused directly, but kept symmetric with write_overflow_chain
-            (a future free_overflow_chain would need it).
+        pager: unused directly, but kept symmetric with write_overflow_chain --
+            free_overflow_chain below is the one that actually needs it.
         pool: reads each page's bytes.
         first_page: the page number write_overflow_chain returned, or a
             cell's decoded overflow_page field.
@@ -137,3 +137,47 @@ def read_overflow_chain(pager: Pager, pool: BufferPool, first_page: int, total_l
 
 
 
+
+def free_overflow_chain(pager: Pager, pool: BufferPool, first_page: int) -> None:
+    """Free every page in the overflow chain starting at `first_page`.
+
+
+    The delete-side counterpart to write_overflow_chain: a deleted row's
+    local cell is gone the moment its leaf is repacked, but the chain
+    holding the rest of its payload is a separate set of pages that
+    nothing else points at once the cell is gone -- BTree.delete() must
+    reclaim them explicitly, or they leak (never corrupt, just permanently
+    unusable space, the same failure test_space_is_reused_not_just_freed
+    is designed to catch for leaf pages).
+
+
+    Args:
+        pager: frees each page via free_page() once the pool no longer
+            caches it.
+        pool: reads each page's `next` pointer before it's discarded --
+            same get_page/unpin pair read_overflow_chain uses, since a
+            page mid-chain may still be sitting in the shared cache.
+        first_page: a cell's decoded overflow_page field. A no-op if 0
+            (the payload never spilled, so there's no chain to free).
+    Raises:
+        OverflowCycleError: the chain revisits a page number it already
+            walked -- same corruption signal as read_overflow_chain.
+    """
+    visited: set[int] = set()
+    current_page = first_page
+
+
+    while current_page != 0:
+        if current_page in visited:
+            raise OverflowCycleError(f"page {current_page} revisited -- overflow chain loops")
+        visited.add(current_page)
+
+
+        raw = pool.get_page(current_page)
+        next_page = int.from_bytes(raw[0:4], "big")
+        pool.unpin(current_page)
+        pool.discard(current_page)
+        pager.free_page(current_page)
+
+
+        current_page = next_page

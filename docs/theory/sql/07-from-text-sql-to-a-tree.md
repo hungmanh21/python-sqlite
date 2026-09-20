@@ -524,7 +524,8 @@ partially consumed input.
 
 SQLite's parser actions feed code generation that ultimately produces VDBE bytecode. Doing that now
 would fuse syntax recognition, name resolution, and execution. You would lose the AST boundary that
-makes binder tests, a rule-based planner, `EXPLAIN`, and plan caching straightforward.
+makes binder tests, cost-based candidate generation and estimation, `EXPLAIN`, and plan caching
+straightforward.
 
 
 The road not taken is not "worse." SQLite's generated parser and bytecode VM are appropriate to its
@@ -541,12 +542,12 @@ handwritten parser and explicit intermediate trees.
 `docs/implementation/week-3-*.md` sessions 1–3:
 
 
-| File | Responsibility | Boundary it protects |
-|---|---|---|
-| `tokens.py` | token vocabulary and positions | parser never inspects raw characters |
-| `tokenizer.py` | characters → tokens | strings/comments/operators handled once |
-| `ast.py` | immutable syntax representation | later phases do not depend on parser state |
-| `parser.py` | tokens → one statement AST | execution never interprets SQL text |
+| File           | Responsibility                  | Boundary it protects                       |
+| -------------- | ------------------------------- | ------------------------------------------ |
+| `tokens.py`    | token vocabulary and positions  | parser never inspects raw characters       |
+| `tokenizer.py` | characters → tokens             | strings/comments/operators handled once    |
+| `ast.py`       | immutable syntax representation | later phases do not depend on parser state |
+| `parser.py`    | tokens → one statement AST      | execution never interprets SQL text        |
 
 
 The essential tests are independent:

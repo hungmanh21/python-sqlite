@@ -33,7 +33,7 @@ from quilldb.btree.split import (
 from quilldb.constants import PageType
 from quilldb.errors import DuplicateRowIDError, PageFullError
 from quilldb.storage.bufferpool import BufferPool
-from quilldb.storage.overflow import write_overflow_chain
+from quilldb.storage.overflow import free_overflow_chain, write_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
 
@@ -178,6 +178,143 @@ class BTree:
         finally:
             if leaf_is_pinned:
                 self.pool.unpin(page_id, dirty=dirty)
+
+
+    def delete(self, rowid: int) -> bool:
+        """Remove the row with this rowid.
+
+
+        Returns:
+            True if a row was removed, False if the rowid wasn't present.
+
+
+        Descends via `_find_leaf(rowid)` -- the same path shape
+        `_split_leaf`/`_promote_separator` use -- removes the cell if
+        present, and frees the leaf if it's now empty and isn't the root.
+
+
+        Freeing an empty leaf can leave ITS parent with zero children of
+        its own, which is exactly the same problem one level up: not "a
+        leaf case, then a separate interior case, then a separate root
+        case", just one uniform loop walking back up `path`, removing
+        whichever page just went empty from its own parent, until a
+        parent survives with at least one child left or the walk reaches
+        the root.
+
+
+        If the root itself empties out this way (every row gone), it's
+        rewritten in place as an empty leaf rather than left as a
+        childless interior page -- its page number can't change, since
+        sqlite_schema points at it. Short of that, quilldb tolerates a
+        root (or any interior page) left with a single surviving child
+        rather than collapsing it further: real, if minor, wasted height,
+        matching this codebase's other documented choice not to merge
+        underfull siblings (chapter 10 §10.3) -- fixing either one needs
+        the same rebalancing work, deliberately out of scope.
+
+
+        Two traps:
+          1. Removing a child from a parent is a *different* operation
+             from removing a row: the parent's cell is `[left
+             child][separator]`, no payload, removed by *slot index* (the
+             same child_slot `_find_leaf` recorded), not by searching for
+             a key.
+          2. Freeing a page must go through `self.pool.discard()` before
+             `self.pager.free_page()` for any page that was read through
+             the pool -- otherwise a later flush of its still-cached
+             bytes can overwrite whatever `allocate_page()` hands out
+             next for that page number.
+
+
+        Raises:
+            InvalidPageTypeError, MalformedCellError: propagated unchanged
+                from parse_page/decode_* if a page is corrupt.
+        """
+        path = self._find_leaf(rowid)
+        leaf_page_id, leaf_slot = path[-1]
+
+
+        raw = self.pool.get_page(leaf_page_id)
+        dirty = False
+        try:
+            body = parse_page(raw)
+            if leaf_slot >= len(body.cells):
+                return False
+            found_rowid, _, _, overflow_page = decode_leaf_table_cell(body.cells[leaf_slot])
+            if found_rowid != rowid:
+                return False
+
+
+            body.delete_cell(leaf_slot)
+            leaf_now_empty = not body.cells
+            raw[:] = serialize_page(body)
+            dirty = True
+        finally:
+            self.pool.unpin(leaf_page_id, dirty=dirty)
+
+
+        if overflow_page:
+            free_overflow_chain(self.pager, self.pool, overflow_page)
+
+
+        if not leaf_now_empty or leaf_page_id == self.root:
+            return True
+
+
+        # The leaf is empty and isn't the root: unlink it from its parent
+        # and free it, cascading upward through any interior page that in
+        # turn loses its last child.
+        child_to_free = leaf_page_id
+        level = len(path) - 2
+
+
+        while True:
+            parent_page_id, child_slot = path[level]
+            parent_raw = self.pool.get_page(parent_page_id)
+            dirty = False
+            try:
+                parent = parse_page(parent_raw)
+
+
+                if child_slot < len(parent.cells):
+                    parent.delete_cell(child_slot)
+                elif parent.cells:
+                    # The removed child was the right_child: the previous
+                    # cell's child takes over that slot, and its
+                    # separator -- nothing is left to its right anymore --
+                    # goes with it.
+                    new_right_child, _ = decode_interior_table_cell(parent.cells[-1])
+                    parent.delete_cell(len(parent.cells) - 1)
+                    parent.right_child = new_right_child
+                else:
+                    parent.right_child = 0
+
+
+                parent_is_empty = not parent.cells and parent.right_child == 0
+
+
+                if level == 0 and parent_is_empty:
+                    parent_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
+                else:
+                    parent_raw[:] = serialize_page(parent)
+                dirty = True
+            finally:
+                self.pool.unpin(parent_page_id, dirty=dirty)
+
+
+            self.pool.discard(child_to_free)
+            self.pager.free_page(child_to_free)
+
+
+            if level == 0 or not parent_is_empty:
+                return True
+
+
+            # This interior page just lost its last child too -- it's now
+            # the same kind of dead pass-through node the leaf was. Remove
+            # IT from ITS parent on the next iteration up.
+            child_to_free = parent_page_id
+            level -= 1
 
 
     def _find_leaf(self, rowid: int) -> list[tuple[int, int]]:

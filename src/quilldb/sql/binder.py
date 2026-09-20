@@ -28,6 +28,7 @@ Two properties this module exists to guarantee:
 
 from dataclasses import dataclass
 from typing import Protocol
+
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
@@ -37,10 +38,14 @@ from quilldb.errors import (
     UnsupportedFeatureError,
 )
 from quilldb.sql.ast import (
+    Analyze,
     BinaryOp,
     Column,
+    CreateIndex,
     CreateTable,
     DataType,
+    Delete,
+    Explain,
     Expression,
     Insert,
     IsNull,
@@ -49,6 +54,7 @@ from quilldb.sql.ast import (
     Select,
     Statement,
     UnaryOp,
+    Update,
 )
 
 
@@ -62,12 +68,17 @@ class SchemaSource(Protocol):
     fact about the types rather than a convention.
     """
 
+
     def get_table(self, name: str) -> TableSchema: ...
+
+
 
 
 @dataclass(frozen=True)
 class BoundLiteral:
     value: Value
+
+
 
 
 @dataclass(frozen=True)
@@ -77,10 +88,14 @@ class BoundColumn:
     data_type: DataType
 
 
+
+
 @dataclass(frozen=True)
 class BoundUnaryOp:
     operator: str
     operand: "BoundExpression"
+
+
 
 
 @dataclass(frozen=True)
@@ -90,10 +105,15 @@ class BoundBinaryOp:
     right: "BoundExpression"
 
 
+
+
 @dataclass(frozen=True)
 class BoundIsNull:
     operand: "BoundExpression"
     negated: bool = False
+
+
+
 
 type BoundExpression = BoundLiteral | BoundColumn | BoundUnaryOp | BoundBinaryOp | BoundIsNull
 
@@ -109,6 +129,22 @@ class BoundCreateTable:
     in the parser; the reserved-prefix and already-exists checks belong to
     Catalog.create_table(), which is the thing that can actually see what
     exists on disk.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundCreateIndex:
+    statement: CreateIndex
+    """A passthrough wrapper too, for the same underlying reason as
+    BoundCreateTable, even though CREATE INDEX's `table`/`columns` DO refer
+    to something that must already exist: Catalog.create_index() is what
+    can see the table's actual schema on disk, and it needs the raw names
+    anyway to run the backfill, so resolving them here first would just be
+    duplicated work with nowhere to put the result (there's no per-row
+    executor downstream the way BoundInsert/BoundSelect have -- the
+    backfill loop lives entirely inside create_index()).
     """
 
 
@@ -131,7 +167,82 @@ class BoundSelect:
 
 
 
-type BoundStatement = BoundCreateTable | BoundInsert | BoundSelect
+@dataclass(frozen=True)
+class BoundDelete:
+    table: TableSchema
+    where: BoundExpression | None
+    """Unlike BoundCreateTable/BoundCreateIndex, this one DOES resolve:
+    `where` is bound against `table` through the exact same _expression()
+    call BoundSelect.where uses, since a DELETE's predicate is evaluated
+    per row exactly the way a SELECT's is -- the only difference is what
+    happens to a row that passes it.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundAssignment:
+    column_index: int
+    value: BoundExpression
+    """`value` is bound with the general _expression() resolver, not
+    INSERT's narrower _constant() -- UPDATE's SET clause is allowed to
+    reference the row being updated (`SET age = age + 1`), which only
+    makes sense once there is a row to evaluate against at exec time.
+    INSERT has no row yet, which is exactly why it's restricted to
+    constants.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundUpdate:
+    table: TableSchema
+    assignments: tuple[BoundAssignment, ...]
+    where: BoundExpression | None
+
+
+
+
+@dataclass(frozen=True)
+class BoundAnalyze:
+    statement: Analyze
+    """A passthrough wrapper, same reasoning as BoundCreateTable/
+    BoundCreateIndex: `target` names a table (or is None, for "every
+    table"), and whether that name actually resolves is a question only
+    StatisticsCatalog.analyze() can answer -- it already has to walk
+    catalog.list_tables()/get_table() itself, so resolving `target` here
+    first would just be duplicated work with nowhere to put the result.
+    """
+
+
+
+
+@dataclass(frozen=True)
+class BoundExplain:
+    select: BoundSelect
+    analyze: bool
+    """Unlike BoundCreateTable/BoundAnalyze, this DOES resolve: the inner
+    SELECT is bound through the same bind_select() a bare SELECT uses, so
+    an EXPLAIN of an unknown table/column fails at bind time exactly like
+    the SELECT it wraps would -- there's no reason EXPLAIN should be more
+    forgiving about names than the query it's explaining.
+    """
+
+
+
+
+type BoundStatement = (
+    BoundCreateTable
+    | BoundCreateIndex
+    | BoundInsert
+    | BoundSelect
+    | BoundDelete
+    | BoundUpdate
+    | BoundAnalyze
+    | BoundExplain
+)
 
 
 
@@ -172,10 +283,20 @@ def bind(
 
     if isinstance(statement, CreateTable):
         bound: BoundStatement = BoundCreateTable(statement)
+    elif isinstance(statement, CreateIndex):
+        bound = BoundCreateIndex(statement)
     elif isinstance(statement, Insert):
         bound = binder.bind_insert(statement)
     elif isinstance(statement, Select):
         bound = binder.bind_select(statement)
+    elif isinstance(statement, Delete):
+        bound = binder.bind_delete(statement)
+    elif isinstance(statement, Update):
+        bound = binder.bind_update(statement)
+    elif isinstance(statement, Analyze):
+        bound = BoundAnalyze(statement)
+    elif isinstance(statement, Explain):
+        bound = BoundExplain(binder.bind_select(statement.statement), statement.analyze)
     else:
         raise UnsupportedFeatureError(f"cannot bind a {type(statement).__name__} statement")
 
@@ -233,6 +354,22 @@ class _Binder:
 
         where = None if statement.where is None else self._expression(statement.where, table)
         return BoundSelect(table, expressions, where)
+
+
+    def bind_delete(self, statement: Delete) -> BoundDelete:
+        table = self.catalog.get_table(statement.table)
+        where = None if statement.where is None else self._expression(statement.where, table)
+        return BoundDelete(table, where)
+
+
+    def bind_update(self, statement: Update) -> BoundUpdate:
+        table = self.catalog.get_table(statement.table)
+        assignments = tuple(
+            BoundAssignment(table.column_index(assignment.column), self._expression(assignment.value, table))
+            for assignment in statement.assignments
+        )
+        where = None if statement.where is None else self._expression(statement.where, table)
+        return BoundUpdate(table, assignments, where)
 
 
     def _expression(self, expression: Expression, table: TableSchema) -> BoundExpression:

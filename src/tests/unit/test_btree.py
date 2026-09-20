@@ -3,10 +3,12 @@ import pytest
 
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import (
+    decode_interior_table_cell,
     decode_leaf_table_cell,
     encode_interior_table_cell,
     encode_leaf_table_cell,
 )
+from quilldb.btree.validate import validate_btree
 from quilldb.constants import PageType
 from quilldb.errors import DuplicateRowIDError
 from quilldb.storage.bufferpool import BufferPool
@@ -316,3 +318,156 @@ def test_insert_does_not_leak_pins(pager) -> None:
         bt.insert(13, b"dup")
     with small_pool.pinned(leaf_lo), small_pool.pinned(leaf_mid):
         pass
+
+
+
+# =====================================================================
+# delete -- remove a leaf cell, reclaim empty leaves, and shrink the root.
+# =====================================================================
+
+
+
+
+def test_delete_removes_a_cell_and_reports_a_missing_rowid(pager, pool) -> None:
+    bt, _, leaf_mid, _ = _build_three_leaf_tree(pager, pool)
+
+
+    assert bt.delete(12) is True
+    assert bt.search(12) is None
+    assert bt.delete(12) is False
+
+
+    raw = pool.get_page(leaf_mid)
+    try:
+        assert [decode_leaf_table_cell(cell)[0] for cell in parse_page(raw).cells] == [10, 15]
+    finally:
+        pool.unpin(leaf_mid)
+    validate_btree(pager, pool, bt.root)
+
+
+
+
+def test_delete_empty_leaf_unlinks_it_from_a_parent_with_three_children(pager, pool) -> None:
+    bt, leaf_lo, leaf_mid, leaf_hi = _build_three_leaf_tree(pager, pool)
+
+
+    for rowid in [10, 12, 15]:
+        assert bt.delete(rowid) is True
+
+
+    root_raw = pool.get_page(bt.root)
+    try:
+        root = parse_page(root_raw)
+    finally:
+        pool.unpin(bt.root)
+
+
+    assert [(decode_interior_table_cell(cell)) for cell in root.cells] == [(leaf_lo, 5)]
+    assert root.right_child == leaf_hi
+    assert pager.allocate_page() == leaf_mid
+    validate_btree(pager, pool, bt.root)
+
+
+
+
+def test_delete_from_one_of_two_root_children_leaves_a_single_child_root(pager, pool) -> None:
+    """A root that drops from two children to one is tolerated, not
+    collapsed -- the same "less dense, still valid" trade this codebase
+    already makes for a non-root interior page (chapter 10 §10.3). Only a
+    root that empties out ENTIRELY is rewritten back to a leaf.
+    """
+    left = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(1)]))
+    right = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(2)]))
+    root = _write_page(
+        pager,
+        pool,
+        PageBody(
+            PageType.INTERIOR_TABLE,
+            cells=[encode_interior_table_cell(left, 1)],
+            right_child=right,
+        ),
+    )
+    bt = BTree(pager, pool, root)
+
+
+    assert bt.delete(1) is True
+    assert bt.root == root
+    assert bt.search(2) == (right, 0)
+
+
+    raw = pool.get_page(root)
+    try:
+        root_body = parse_page(raw)
+    finally:
+        pool.unpin(root)
+    assert root_body.page_type is PageType.INTERIOR_TABLE
+    assert root_body.cells == []
+    assert root_body.right_child == right
+    assert pager.allocate_page() == left
+    validate_btree(pager, pool, root)
+
+
+
+
+def test_delete_last_row_collapses_root_to_an_empty_leaf(pager, pool) -> None:
+    left = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(1)]))
+    right = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(2)]))
+    root = _write_page(
+        pager,
+        pool,
+        PageBody(
+            PageType.INTERIOR_TABLE,
+            cells=[encode_interior_table_cell(left, 1)],
+            right_child=right,
+        ),
+    )
+    bt = BTree(pager, pool, root)
+
+
+    assert bt.delete(1) is True
+    assert bt.delete(2) is True
+    assert bt.root == root
+    assert bt.search(1) is None
+    assert bt.search(2) is None
+
+
+    raw = pool.get_page(root)
+    try:
+        root_body = parse_page(raw)
+    finally:
+        pool.unpin(root)
+    assert root_body.page_type is PageType.LEAF_TABLE
+    assert root_body.cells == []
+    validate_btree(pager, pool, root)
+
+
+
+
+def test_delete_frees_an_overflow_chain_for_reuse(pager, pool) -> None:
+    """The counterpart to test_insert_spills_an_oversized_payload_to_overflow:
+    a deleted row's overflow pages must come back through the SAME freelist
+    allocate_page() draws from, not just vanish from the tree.
+    """
+    leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE))
+    bt = BTree(pager, pool, leaf)
+    payload = bytes((i * 3) % 256 for i in range(10_000))  # comfortably spills
+    bt.insert(99, payload)
+
+
+    page_id, slot = bt.search(99)
+    raw = pool.get_page(page_id)
+    overflow_page = decode_leaf_table_cell(parse_page(raw).cells[slot])[3]
+    pool.unpin(page_id)
+    assert overflow_page != 0
+
+
+    freelist_before = pager._header.freelist_count
+    assert bt.delete(99) is True
+    assert bt.search(99) is None
+    freed = pager._header.freelist_count - freelist_before
+    assert freed >= 1  # at least the overflow chain's own pages
+
+
+    reused = {pager.allocate_page() for _ in range(freed)}
+    assert overflow_page in reused
+    validate_btree(pager, pool, bt.root)

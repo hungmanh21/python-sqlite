@@ -3,7 +3,7 @@
 
 Caches raw PAGE_SIZE bytearrays keyed by page_id -- the same object is
 returned to every caller asking for the same page, which is the property
-that matters most here (see docs/theory/04-the-buffer-pool.md §4.2 point 3):
+that matters most here (see docs/theory/storage/04-the-buffer-pool.md §4.2 point 3):
 two callers asking for page 47 must get one shared, mutable object, not two
 independent copies that can silently clobber each other.
 
@@ -153,6 +153,35 @@ class BufferPool:
             self.flush_page(page_id)
 
 
+    def discard(self, page_id: int) -> None:
+        """Drop a page's cache entry without writing it back.
+
+
+        For a page about to be freed: its in-memory content no longer
+        matters, and letting a later flush write stale bytes over whatever
+        allocate_page() hands out for the same page number next would
+        corrupt an unrelated page. Same rule _evict_one enforces under LRU
+        pressure (never drop a pinned page) -- this is that rule, invoked
+        directly by a caller that knows a page is now garbage rather than
+        waiting for eviction to notice.
+
+
+        A no-op if page_id isn't cached (already evicted, or never touched
+        through the pool at all -- e.g. a page catalog.py freed straight
+        through the pager).
+
+
+        Raises:
+            ValueError: page_id is cached and still pinned.
+        """
+        entry = self._cache.get(page_id)
+        if entry is None:
+            return
+        if entry.pin_count > 0:
+            raise ValueError(f"page {page_id} is still pinned")
+        del self._cache[page_id]
+
+
     @contextmanager
     def pinned(self, page_id: int, dirty: bool = False) -> Generator[bytearray]:
         """get_page(page_id), yield it, unpin(page_id, dirty) on the way out
@@ -163,6 +192,3 @@ class BufferPool:
             yield page
         finally:
             self.unpin(page_id, dirty)
-
-
-

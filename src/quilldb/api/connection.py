@@ -30,36 +30,41 @@ can be:
    multiple connections, matching every DB-API's convention.
 
 
-CREATE TABLE and INSERT are executed to completion before execute() returns
--- there is nothing left to stream. SELECT is the one case that leaves an
-operator open past the call that created it.
+CREATE TABLE, INSERT, DELETE, and UPDATE are executed to completion before
+execute() returns -- there is nothing left to stream. SELECT is the one
+case that leaves an operator open past the call that created it.
 """
 
 
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Self
 
-
 from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
 from quilldb.errors import UnsupportedFeatureError
-from quilldb.exec.operators import Operator, build_operator
+from quilldb.exec.operators import ExplainResult, Operator, build_operator
+from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.binder import (
+    BoundAnalyze,
     BoundBinaryOp,
     BoundColumn,
+    BoundCreateIndex,
     BoundCreateTable,
+    BoundDelete,
+    BoundExplain,
     BoundExpression,
     BoundInsert,
     BoundIsNull,
     BoundLiteral,
     BoundUnaryOp,
+    BoundUpdate,
     bind,
 )
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
-
 
 _MEMORY_PATH = ":memory:"
 
@@ -194,10 +199,11 @@ class Connection:
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog) -> None:
+    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog, stats: StatisticsCatalog) -> None:
         self.pager = pager
         self.pool = pool
         self.catalog = catalog
+        self.stats = stats
         self._open_cursor: Cursor | None = None
         self._closed = False
 
@@ -206,11 +212,11 @@ class Connection:
         """Parse, bind, and execute one statement.
 
 
-        CREATE TABLE and INSERT complete before this method returns. SELECT
-        leaves its operator open and streams rows through the returned
-        Cursor. Starting another execute() closes any still-open result
-        cursor on this connection; multiple active cursors arrive with
-        multiple connections.
+        CREATE TABLE, CREATE INDEX, INSERT, DELETE, and UPDATE complete
+        before this method returns. SELECT leaves its operator open and
+        streams rows through the returned Cursor. Starting another
+        execute() closes any still-open result cursor on this connection;
+        multiple active cursors arrive with multiple connections.
         """
         if self._closed:
             raise ValueError("connection is closed")
@@ -227,13 +233,53 @@ class Connection:
             return Cursor(None, None, 0)
 
 
+        if isinstance(bound, BoundCreateIndex):
+            self.catalog.create_index(bound.statement, sql)
+            return Cursor(None, None, 0)
+
+
+        if isinstance(bound, BoundAnalyze):
+            self.stats.analyze(bound.statement.target)
+            return Cursor(None, None, 0)
+
+
         if isinstance(bound, BoundInsert):
-            with build_operator(bound, self.pager, self.pool) as operator:
+            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
                 operator.next()
             return Cursor(None, None, 1)
 
 
-        operator = build_operator(bound, self.pager, self.pool)
+        if isinstance(bound, (BoundDelete, BoundUpdate)):
+            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                operator.next()
+            return Cursor(None, None, operator.rows_affected)
+
+
+        if isinstance(bound, BoundExplain):
+            plan = build_operator(bound.select, self.pager, self.pool, self.catalog, self.stats)
+            text = plan.explain(verbose=True)
+            if bound.analyze:
+                # Drain for real, discarding rows -- EXPLAIN ANALYZE trades
+                # "free to run" for "the numbers are measured, not guessed",
+                # the same tradeoff chapter 12 makes for pages_read.
+                started = time.perf_counter()
+                actual_rows = 0
+                plan.open()
+                try:
+                    while plan.next() is not None:
+                        actual_rows += 1
+                finally:
+                    plan.close()
+                elapsed = time.perf_counter() - started
+                text += f"\nactual_rows={actual_rows} elapsed={elapsed:.6f}s"
+            result = ExplainResult((text,))
+            result.open()
+            cursor = Cursor(result, (("QUERY PLAN",),), -1)
+            self._open_cursor = cursor
+            return cursor
+
+
+        operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats)
         operator.open()
         description = tuple((_display_name(e),) for e in bound.expressions)
         cursor = Cursor(operator, description, -1)
@@ -281,4 +327,5 @@ def connect(path: str | Path) -> Connection:
     pool = BufferPool(pager)
     catalog = Catalog(pager, pool)
     catalog.load()
-    return Connection(pager, pool, catalog)
+    stats = StatisticsCatalog(pager, pool, catalog)
+    return Connection(pager, pool, catalog, stats)

@@ -31,16 +31,16 @@ README, ADRs, benchmark table and test-count table do that same job at small sca
 ## Week 8 deliverables
 
 
-| # | Deliverable | Hours |
-|---|---|---|
-| 45 | README — pitch, install, usage, architecture, features, benchmarks, limitations, testing | 3 |
-| 46 | Demo GIF / asciinema at the top of the README | 1.5 |
-| 47 | `docs/architecture.md`, `file-format.md`, `durability.md`, `concurrency.md` | 2.5 |
-| 48 | 6–8 ADRs in `docs/decisions/` | 1.5 |
-| 49 | Benchmark harness and results table | 2 |
-| 50 | CI: pytest + coverage + mypy strict + ruff on 3.11/3.12/3.13, badges | 1 |
-| 51 | CLI: `inspect`, `pages`, `btree`, `validate`, `bench`, `shell` | 1.5 |
-| 52 | 5-minute demo script, rehearsed out loud twice | 1 |
+| #   | Deliverable                                                                              | Hours |
+| --- | ---------------------------------------------------------------------------------------- | ----- |
+| 45  | README — pitch, install, usage, architecture, features, benchmarks, limitations, testing | 3     |
+| 46  | Demo GIF / asciinema at the top of the README                                            | 1.5   |
+| 47  | `docs/architecture.md`, `file-format.md`, `durability.md`, `concurrency.md`              | 2.5   |
+| 48  | 6–8 ADRs in `docs/decisions/`                                                            | 1.5   |
+| 49  | Benchmark harness and results table                                                      | 2     |
+| 50  | CI: pytest + coverage + mypy strict + ruff on 3.11/3.12/3.13, badges                     | 1     |
+| 51  | CLI: `inspect`, `pages`, `btree`, `validate`, `bench`, `shell`                           | 1.5   |
+| 52  | 5-minute demo script, rehearsed out loud twice                                           | 1     |
 
 
 ---
@@ -86,7 +86,7 @@ Every clause must be a thing you actually built:
 
 > **quilldb is a relational database engine written from scratch in pure Python: a paged storage layer
 > writing SQLite's on-disk format, an LRU buffer pool, B+tree tables and indexes, a hand-written SQL parser
-> and iterator-based query executor with a rule-based planner, crash-safe transactions with an undo
+> and iterator-based query executor with a statistics-driven cost-based optimizer, crash-safe transactions with an undo
 > journal, and multi-threaded connections with table-level 2PL and deadlock detection — validated by
 > `PRAGMA integrity_check` and a crash-injection matrix.**
 
@@ -129,8 +129,10 @@ not a format constraint.
 shared-memory index over the log and a checkpointer.
 
 
-**Query processing.** Nested loop joins only, max 3 tables. Rule-based planner — no statistics, so it
-can't choose between two applicable indexes. `ORDER BY` sorts in memory and raises past N rows.
+**Query processing.** Nested loop joins only, max 3 tables. Cost-based planning uses `quill_stat1`
+prefix averages rather than histograms, so skew and correlated columns can produce bad estimates.
+Join search is exhaustive only within the three-table limit. `ORDER BY` sorts in memory and raises
+past N rows.
 
 
 **Concurrency.** Threads in one process. No multi-process locking; a second process opening the same
@@ -163,17 +165,18 @@ font size.
 ```
 1. quilldb shell demo.db
 2. CREATE TABLE users (...); a few INSERTs
-3. SELECT with a WHERE               -> rows come back
-4. EXPLAIN the same query            -> SeqScan, pages_read=2417
-5. CREATE INDEX
-6. EXPLAIN again                     -> IndexScan, pages_read=4     ← THE MOMENT
-7. !sqlite3 demo.db "PRAGMA integrity_check"   -> ok               ← THE OTHER MOMENT
+3. SELECT ... WHERE active=1 AND email=?  -> rows come back
+4. EXPLAIN the same query                 -> SeqScan, est_rows and cost
+5. CREATE INDEX idx_active; CREATE INDEX idx_email; ANALYZE
+6. EXPLAIN again                          -> chooses selective idx_email, not first idx_active
+7. EXPLAIN ANALYZE the query              -> actual pages_read=4     ← THE MOMENT
+8. !sqlite3 demo.db "PRAGMA integrity_check"   -> ok                 ← THE OTHER MOMENT
 ```
 
 
-Steps 6 and 7 are the whole point. **Step 6 shows the engine reasoning about its own execution; step 7
-shows an independent C implementation validating your bytes.** A viewer who watches nothing else has seen
-the two claims that matter.
+Steps 6–8 are the whole point. **Step 6 proves selection is cost-based rather than "first applicable
+index wins"; step 7 compares the estimate with execution; step 8 shows an independent C implementation
+validating your bytes.** A viewer who watches nothing else has seen the claims that matter.
 
 
 Rehearse it. A GIF with a typo and a backspace signals carelessness about the thing you chose to put at the
@@ -190,12 +193,12 @@ Each answers one question a reader will have, and each is 1–2 pages. **Write t
 you already have** — that's what they're for.
 
 
-| Doc | The question | Source |
-|---|---|---|
-| `architecture.md` | how do the pieces fit? | a diagram matching the real module layout, plus the path of one query end to end |
-| `file-format.md` | what's on disk? | chapters 01–03; the 100-byte header, page layout, record encoding, what's refused and why |
-| `durability.md` | why won't a crash corrupt it? | chapter 13 §13.4's ordering and §13.11, **plus the non-guarantees** |
-| `concurrency.md` | what's guaranteed under threads? | chapter 15 §15.6 — the isolation level **and what it permits** |
+| Doc               | The question                     | Source                                                                                    |
+| ----------------- | -------------------------------- | ----------------------------------------------------------------------------------------- |
+| `architecture.md` | how do the pieces fit?           | a diagram matching the real module layout, plus the path of one query end to end          |
+| `file-format.md`  | what's on disk?                  | chapters 01–03; the 100-byte header, page layout, record encoding, what's refused and why |
+| `durability.md`   | why won't a crash corrupt it?    | chapter 13 §13.4's ordering and §13.11, **plus the non-guarantees**                       |
+| `concurrency.md`  | what's guaranteed under threads? | chapter 15 §15.6 — the isolation level **and what it permits**                            |
 
 
 **`durability.md` must name the commit point precisely and list what it does not guarantee**: a lying
@@ -218,16 +221,16 @@ Six to eight, one page each: **Context → Decision → Consequences → Alterna
 where your interview answers come from, so write each one the week you made the decision, not now.
 
 
-| ADR | Records | From |
-|---|---|---|
-| 001 | Buffer pool caches raw pages, not parsed objects | *(already written)* |
-| 002 | SQLite's on-disk format exactly, but one direction only | roadmap §1.1 |
-| 003 | Iterator pipeline, not a bytecode VM | chapter 09 |
-| 004 | Undo journal, not WAL | chapter 13 §13.3, §13.10 |
-| 005 | No sibling merging on delete | chapter 10 §10.6 |
-| 006 | Table-level 2PL with deadlock detection, not SQLite's file-level ladder | chapters 15 §15.6, 16 §16.4 |
-| 007 | Rule-based planner, not cost-based | chapter 12 §12.5 |
-| 008 | Repack pages on delete instead of maintaining freeblocks | chapter 02 §2.4, chapter 10 §10.1 |
+| ADR | Records                                                                  | From                                                                                |
+| --- | ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| 001 | Buffer pool caches raw pages, not parsed objects                         | *(already written)*                                                                 |
+| 002 | SQLite's on-disk format exactly, but one direction only                  | roadmap §1.1                                                                        |
+| 003 | Iterator pipeline, not a bytecode VM                                     | chapter 09                                                                          |
+| 004 | Undo journal, not WAL                                                    | chapter 13 §13.3, §13.10                                                            |
+| 005 | No sibling merging on delete                                             | chapter 10 §10.6                                                                    |
+| 006 | Table-level 2PL with deadlock detection, not SQLite's file-level ladder  | chapters 15 §15.6, 16 §16.4                                                         |
+| 007 | SQLite-style cost model, but exhaustive three-table search instead of N3 | chapter 12 §12.5 (how quilldb scopes the architecture), §12.7 (why not System R DP) |
+| 008 | Repack pages on delete instead of maintaining freeblocks                 | chapter 02 §2.4, chapter 10 §10.1                                                   |
 
 
 **The test for each ADR: can you defend it out loud, without rereading it?** If not, the "alternatives
@@ -253,6 +256,7 @@ BENCHMARKS = [
     "insert_cost_per_index",           # the write-amplification tax     ← publish it
     "buffer_pool_hit_rate_vs_size",    # the working-set knee, chapter 04
     "covering_index_vs_not",           # ~2x, chapter 11 §11.5
+    "join_order_cheap_vs_expensive",   # both orders' page reads         ← publish it
     "limit_1_short_circuits",          # <10 page reads over 1M rows
     "throughput_vs_threads",           # reads scale, writes don't       ← publish it
 ]
@@ -354,8 +358,10 @@ discover which sentences you can't actually say.
        on-disk format, so the sqlite3 command-line tool can read and verify
        the files it produces."
 0:30  shell: CREATE TABLE, INSERT, SELECT
-1:00  EXPLAIN -> SeqScan, 2417 page reads
-1:30  CREATE INDEX; EXPLAIN -> IndexScan, 4 page reads.
+1:00  EXPLAIN -> SeqScan with estimated rows and cost
+1:30  CREATE indexes on active and email; ANALYZE; EXPLAIN -> selective
+       email index, not the first applicable low-selectivity index.
+       EXPLAIN ANALYZE -> 4 actual page reads versus 2417 for the scan.
        "Same query, 600× fewer page reads. You can check the arithmetic:
         100k rows of ~100 bytes is about 2,400 pages."
 2:15  sqlite3 the same file: PRAGMA integrity_check -> ok
@@ -364,8 +370,8 @@ discover which sentences you can't actually say.
        each one the database is entirely pre-commit or entirely post-commit."
 3:30  The 8-thread transfer stress test. "Sum of balances never changes. One
        side of a deadlock aborts, the other commits."
-4:15  Limitations, unprompted. "No WAL, nested loop joins only, rule-based
-       planner. Here's what each would cost."
+4:15  Limitations, unprompted. "No WAL, nested loop joins only, stat1-style
+       averages rather than histograms. Here's where estimates fail."
 4:45  "The write-up of why SQLite made each of these choices is in docs/theory."
 ```
 
@@ -380,15 +386,15 @@ someone showing off a project into someone assessing one, which is what the job 
 ## Week 8 sessions
 
 
-| # | 2 hours on | Done when |
-|---|---|---|
-| 1 | Benchmark harness + all eight benchmarks, numbers checked against arithmetic | a paste-able markdown table exists |
-| 2 | README: pitch, install, example, features, benchmarks | the example runs on a clean checkout in a fresh venv |
-| 3 | README: limitations, testing table, architecture diagram | limitations section is specific, not apologetic |
-| 4 | The four `docs/*.md`, drawn from the theory chapters | `durability.md` lists the non-guarantees |
-| 5 | ADRs 002–008 | each defensible out loud without rereading |
-| 6 | CLI polish + `shell` REPL | you can drive it in front of someone |
-| 7 | GIF, CI matrix, badges, demo rehearsal ×2 | GIF has no typos; CI green on all three versions |
+| #   | 2 hours on                                                                   | Done when                                            |
+| --- | ---------------------------------------------------------------------------- | ---------------------------------------------------- |
+| 1   | Benchmark harness + all eight benchmarks, numbers checked against arithmetic | a paste-able markdown table exists                   |
+| 2   | README: pitch, install, example, features, benchmarks                        | the example runs on a clean checkout in a fresh venv |
+| 3   | README: limitations, testing table, architecture diagram                     | limitations section is specific, not apologetic      |
+| 4   | The four `docs/*.md`, drawn from the theory chapters                         | `durability.md` lists the non-guarantees             |
+| 5   | ADRs 002–008                                                                 | each defensible out loud without rereading           |
+| 6   | CLI polish + `shell` REPL                                                    | you can drive it in front of someone                 |
+| 7   | GIF, CI matrix, badges, demo rehearsal ×2                                    | GIF has no typos; CI green on all three versions     |
 
 
 ---

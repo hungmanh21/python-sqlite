@@ -3,7 +3,7 @@
 
 A companion to `roadmap.md` for someone who has never built a database before. The roadmap tells you
 *what* to build. This tells you *what those words mean*, *why the thing exists*, and *what to type on
-each of the ~56 working sessions*.
+each of the ~58 working sessions*.
 
 
 Assumed background: comfortable Python. No database internals, no C, no systems background.
@@ -12,7 +12,7 @@ Assumed background: comfortable Python. No database internals, no C, no systems 
 > **Going deeper.** This guide gives you the working mental model. `docs/theory/` gives you the
 > theory underneath it — how storage hardware actually behaves, why each design is shaped the way it
 > is, what the alternatives were, and why SQLite chose as it did, all sourced to primary documents.
-> Read [`docs/theory/00-foundations.md`](docs/theory/00-foundations.md) before week 1; it's the
+> Read [`docs/theory/foundations/00-foundations.md`](docs/theory/foundations/00-foundations.md) before week 1; it's the
 > chapter every other decision follows from. Chapters 01–06 cover weeks 1–2 in depth.
 >
 > Two places where the theory chapters **correct** this guide: the RAM-vs-disk ratio in §1.5 (see
@@ -56,17 +56,17 @@ you jump straight to byte 192,512. This is the single most important property of
 Everything you build over eight weeks is a role in this binder metaphor:
 
 
-| You build | In the binder | Week |
-|---|---|---|
-| `Pager` | The assistant who fetches and files sheet N | 1 |
-| `BufferPool` | Your desk — a few sheets kept out so you stop walking to the shelf | 1 |
-| Record codec | The compact shorthand you write a row in | 1 |
-| B+tree | Signpost sheets that tell you which sheet holds which rows | 2 |
-| SQL frontend | Someone who understands spoken requests and writes order slips | 3 |
-| Index | The back-of-book index — a second sorted list pointing into the first | 4 |
-| Journal | Photocopies of pages you're about to scribble on, so you can undo | 5 |
-| Lock manager | A sign-out sheet so two people don't scribble the same sheet | 6 |
-| Joins/aggregation | Cross-referencing two binders; tallying results | 7 |
+| You build         | In the binder                                                         | Week |
+| ----------------- | --------------------------------------------------------------------- | ---- |
+| `Pager`           | The assistant who fetches and files sheet N                           | 1    |
+| `BufferPool`      | Your desk — a few sheets kept out so you stop walking to the shelf    | 1    |
+| Record codec      | The compact shorthand you write a row in                              | 1    |
+| B+tree            | Signpost sheets that tell you which sheet holds which rows            | 2    |
+| SQL frontend      | Someone who understands spoken requests and writes order slips        | 3    |
+| Index             | The back-of-book index — a second sorted list pointing into the first | 4    |
+| Journal           | Photocopies of pages you're about to scribble on, so you can undo     | 5    |
+| Lock manager      | A sign-out sheet so two people don't scribble the same sheet          | 6    |
+| Joins/aggregation | Cross-referencing two binders; tallying results                       | 7    |
 
 
 Keep coming back to this table when a week feels abstract.
@@ -113,7 +113,8 @@ order they're hardest to retrofit.
 ## Part 2: How To Work
 
 
-**Session length: 2 hours.** ~7 sessions per week, ~56 total. Each session below has a goal small
+**Session length: 2 hours.** ~7 sessions per week — except week 4, which needs **9** once the cost
+model is included — so ~58 total. Each session below has a goal small
 enough to finish in one sitting, which matters more than it sounds — finishing is what keeps you
 going for eight weeks.
 
@@ -329,15 +330,15 @@ You don't have to implement that. Knowing it is the point.
 ## 1.6 Your seven sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | `pyproject.toml`, `src/quilldb/`, pytest + ruff + mypy config, GitHub Actions CI, `errors.py` with the exception hierarchy | CI badge is green on a project that does nothing. Psychologically worth more than it sounds. |
-| 2 | `codec/ints.py` (big-endian u16/u32 helpers) and `codec/varint.py` | Hypothesis test: `decode(encode(n)) == n` for all `n` in `0 .. 2**64-1`. Test every length boundary explicitly. |
-| 3 | `storage/header.py` — define all 100 bytes, plus `create_database(path)` and `read_header(path)` | You create a file and read back its page size, page count, and freelist head |
-| 4 | `storage/pager.py` — `read_page`, `write_page`, bounds checks | Write page 5, read page 5, get identical bytes. Reading page 999 of a 3-page file raises `PageOutOfRange`. |
-| 5 | Freelist: `allocate_page`, `free_page` (a linked list — each free page stores the number of the next free page in its first 4 bytes) | Allocate 3, free the middle one, allocate again → you get the freed page back, and the file didn't grow |
-| 6 | `storage/page.py` — `SlottedPage` with `insert_cell(i, bytes)`, `get_cell(i)`, `delete_cell(i)`, `free_space()` | Fill a page to within 10 bytes, verify the 11th insert is refused cleanly |
-| 7 | `storage/bufferpool.py` + `codec/record.py` + `cli.py inspect` | `quilldb inspect demo.db` prints header fields. Capacity-8 pool over a 200-page workload evicts correctly, never loses a dirty page, never evicts a pinned one. |
+| #   | Do this                                                                                                                              | Done when                                                                                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `pyproject.toml`, `src/quilldb/`, pytest + ruff + mypy config, GitHub Actions CI, `errors.py` with the exception hierarchy           | CI badge is green on a project that does nothing. Psychologically worth more than it sounds.                                                                    |
+| 2   | `codec/ints.py` (big-endian u16/u32 helpers) and `codec/varint.py`                                                                   | Hypothesis test: `decode(encode(n)) == n` for all `n` in `0 .. 2**64-1`. Test every length boundary explicitly.                                                 |
+| 3   | `storage/header.py` — define all 100 bytes, plus `create_database(path)` and `read_header(path)`                                     | You create a file and read back its page size, page count, and freelist head                                                                                    |
+| 4   | `storage/pager.py` — `read_page`, `write_page`, bounds checks                                                                        | Write page 5, read page 5, get identical bytes. Reading page 999 of a 3-page file raises `PageOutOfRange`.                                                      |
+| 5   | Freelist: `allocate_page`, `free_page` (a linked list — each free page stores the number of the next free page in its first 4 bytes) | Allocate 3, free the middle one, allocate again → you get the freed page back, and the file didn't grow                                                         |
+| 6   | `storage/page.py` — `SlottedPage` with `insert_cell(i, bytes)`, `get_cell(i)`, `delete_cell(i)`, `free_space()`                      | Fill a page to within 10 bytes, verify the 11th insert is refused cleanly                                                                                       |
+| 7   | `storage/bufferpool.py` + `codec/record.py` + `cli.py inspect`                                                                       | `quilldb inspect demo.db` prints header fields. Capacity-8 pool over a 200-page workload evicts correctly, never loses a dirty page, never evicts a pinned one. |
 
 
 **Success state for the week:** you can write `(1, "ada", 36)` into page 4, close the file, reopen it,
@@ -482,16 +483,16 @@ for cycles, and the reader caps its hops.
 ## 2.6 Your seven (realistically eight) sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | The four cell formats. Table leaf = `[payload len varint][rowid varint][payload]`, table interior = `[left child u32][rowid varint]`, index leaf = `[payload len][payload]`, index interior = `[left child u32][payload len][payload]`. Encode/decode all four. | Round-trip tests pass. **Watch the order in the table leaf cell: length before rowid.** |
-| 2 | Parse a B+tree page header; binary search *within* one page for a key | Given a hand-built page of 20 keys, find each one, and correctly report misses |
-| 3 | `search(key)` — descend root → leaf. **Hand-build a 2-level tree in a test fixture** rather than waiting for insert to work. | Lookups succeed on a manually constructed 3-leaf tree |
-| 4 | `TableCursor` with a path stack: `first()`, `next()`, crossing from one leaf to the next | Full scan of the hand-built tree yields all keys in order |
-| 5 | `insert()` for the easy case only — the target leaf has room | Insert into empty page, at start, middle, end. Keys stay sorted. |
-| 6 | **Leaf split + separator promotion.** Expect this to take the full session and then some. | A page that overflows by one cell splits into two, the parent gains a signpost, and lookups still find every key |
-| 7 | **Recursive split + root split.** Parent full → parent splits → cascade → new root. | Insert 1000 sequential keys; tree height grows; every key still findable |
-| 8 | `validate_btree()`, then the stress test | 100k random-order inserts, validator clean. Scan == `sorted(set(keys))`. Overflow: a 10KB value round-trips. Reopening the file mid-run changes nothing. |
+| #   | Do this                                                                                                                                                                                                                                                         | Done when                                                                                                                                                |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | The four cell formats. Table leaf = `[payload len varint][rowid varint][payload]`, table interior = `[left child u32][rowid varint]`, index leaf = `[payload len][payload]`, index interior = `[left child u32][payload len][payload]`. Encode/decode all four. | Round-trip tests pass. **Watch the order in the table leaf cell: length before rowid.**                                                                  |
+| 2   | Parse a B+tree page header; binary search *within* one page for a key                                                                                                                                                                                           | Given a hand-built page of 20 keys, find each one, and correctly report misses                                                                           |
+| 3   | `search(key)` — descend root → leaf. **Hand-build a 2-level tree in a test fixture** rather than waiting for insert to work.                                                                                                                                    | Lookups succeed on a manually constructed 3-leaf tree                                                                                                    |
+| 4   | `TableCursor` with a path stack: `first()`, `next()`, crossing from one leaf to the next                                                                                                                                                                        | Full scan of the hand-built tree yields all keys in order                                                                                                |
+| 5   | `insert()` for the easy case only — the target leaf has room                                                                                                                                                                                                    | Insert into empty page, at start, middle, end. Keys stay sorted.                                                                                         |
+| 6   | **Leaf split + separator promotion.** Expect this to take the full session and then some.                                                                                                                                                                       | A page that overflows by one cell splits into two, the parent gains a signpost, and lookups still find every key                                         |
+| 7   | **Recursive split + root split.** Parent full → parent splits → cascade → new root.                                                                                                                                                                             | Insert 1000 sequential keys; tree height grows; every key still findable                                                                                 |
+| 8   | `validate_btree()`, then the stress test                                                                                                                                                                                                                        | 100k random-order inserts, validator clean. Scan == `sorted(set(keys))`. Overflow: a 10KB value round-trips. Reopening the file mid-run changes nothing. |
 
 
 **When you get stuck on session 6 or 7** — and you will — the fix is almost always a visualizer:
@@ -632,7 +633,7 @@ genuinely good interview moment.
 
 > ⚠️ Page 1 is doing three jobs at once: the first 100 bytes are the **file header**, byte 100 begins
 > page 1's own **b-tree page header**, and the b-tree rooted there is the **catalog**. That's why page
-> 1 has 100 fewer usable bytes than every other page. `docs/theory/01-pages-and-the-pager.md` §1.6
+> 1 has 100 fewer usable bytes than every other page. `docs/theory/storage/01-pages-and-the-pager.md` §1.6
 > covers why SQLite accepted that awkwardness, and what it costs.
 
 
@@ -654,15 +655,15 @@ Protect this week. If week 2 runs long, cut validator polish — not this.
 ## 3.5 Your seven sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | `sql/tokenizer.py` — keywords, identifiers, string and number literals, operators, `?`, comments | `tokenize("SELECT * FROM t WHERE a>=1")` gives the right token list; unterminated string raises cleanly |
-| 2 | `sql/ast.py` dataclasses, and parse `CREATE TABLE` only | `CREATE TABLE users (id INTEGER, name TEXT)` → correct AST |
-| 3 | Parse `INSERT` and `SELECT` with no `WHERE` | Both produce correct ASTs; `SELECT *` and explicit column lists both work |
-| 4 | Expression parsing via Pratt/precedence climbing — comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL` | `a > 1 AND b = 2 OR c = 3` parses with correct precedence. Read [matklad's post](https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html) first — 40 minutes, saves you two hours. |
-| 5 | `catalog/` — store table metadata as rows in the page-2 B+tree; create and look up tables | `CREATE TABLE`, close the file, reopen, and the table is still known |
-| 6 | Binder (names → column indexes, type checks) + `exec/expressions.py` evaluator | Unknown column raises a typed error *before* execution starts |
-| 7 | `SeqScan`, `Filter`, `Project`, `Insert` operators + `api/connection.py` | **The four-line snippet below runs.** |
+| #   | Do this                                                                                                   | Done when                                                                                                                                                                                              |
+| --- | --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | `sql/tokenizer.py` — keywords, identifiers, string and number literals, operators, `?`, comments          | `tokenize("SELECT * FROM t WHERE a>=1")` gives the right token list; unterminated string raises cleanly                                                                                                |
+| 2   | `sql/ast.py` dataclasses, and parse `CREATE TABLE` only                                                   | `CREATE TABLE users (id INTEGER, name TEXT)` → correct AST                                                                                                                                             |
+| 3   | Parse `INSERT` and `SELECT` with no `WHERE`                                                               | Both produce correct ASTs; `SELECT *` and explicit column lists both work                                                                                                                              |
+| 4   | Expression parsing via Pratt/precedence climbing — comparisons, `AND`/`OR`/`NOT`, arithmetic, `IS NULL`   | `a > 1 AND b = 2 OR c = 3` parses with correct precedence. Read [matklad's post](https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html) first — 40 minutes, saves you two hours. |
+| 5   | `catalog/` — store table metadata as rows in the page-1 `sqlite_schema` B+tree; create and look up tables | `CREATE TABLE`, close the file, reopen, and the table is still known                                                                                                                                   |
+| 6   | Binder (names → column indexes, type checks) + `exec/expressions.py` evaluator                            | Unknown column raises a typed error *before* execution starts                                                                                                                                          |
+| 7   | `SeqScan`, `Filter`, `Project`, `Insert` operators + `api/connection.py`                                  | **The four-line snippet below runs.**                                                                                                                                                                  |
 
 
 ```python
@@ -754,7 +755,140 @@ performance problems are "there's no index on that column" or "there is one but 
 it."
 
 
-## 4.3 EXPLAIN — the kitchen showing you the plan
+But notice what this rule *cannot* do, because it's the whole subject of the next section: it tells you
+which indexes are **allowed**. It does not tell you which one is **best**, and it never tells you
+whether using an index at all beats just reading the table.
+
+
+## 4.3 Two indexes, both legal — now what?
+
+
+Here's the situation the rule can't touch. Table of 10,000 people. Two indexes:
+
+
+```
+idx_active  on active   -- values: 0 or 1.          ~5,000 rows per value
+idx_email   on email    -- values: all different.   ~1 row per value
+```
+
+
+Now: `WHERE active = 1 AND email = 'a@b.c'`.
+
+
+The leading-column rule says **both indexes are usable**. Both are a bare column with an equality on
+it. Identical shape. And yet:
+
+
+- via `idx_email`: find 1 entry, do 1 table lookup. **~4 page reads.**
+- via `idx_active`: find 5,000 entries, do **5,000** table lookups. Far worse than just reading the
+  whole table.
+
+
+Same rule, same shapes, ~1000× apart in real work. **No rule can tell these apart, because the
+difference isn't in the query — it's in the data.** That's the entire argument for what comes next.
+
+
+### The two philosophies, and why they aren't rivals
+
+
+**A rule-based planner** decides from the *shape* of the query. "There's an equality on an indexed
+leading column, so use that index." Cheap to build, and — this is the part people undersell —
+completely predictable. You can read a query and know what it will do.
+
+
+**A cost-based planner** decides from the shape *plus measurements of the data*. It generates every
+legal plan, estimates how many rows each will touch, converts that to an estimated number of page
+reads, and picks the smallest.
+
+
+The trap is thinking you must choose one. You don't, and the reason is worth memorising:
+
+
+> **Rules decide which plans are *legal*. Costs decide which legal plan *wins*.**
+
+
+They're two stages of one pipeline, not two schools of thought. A cost model cannot rescue an illegal
+seek — no number makes `WHERE lower(email)=?` usable against an index on `email`. And no rule can
+separate `idx_active` from `idx_email` above. You need both, and quilldb builds both:
+
+
+```text
+your WHERE clause
+    │
+    ├─ stage 1: legality rules  ──────▶ candidate plans   ← §4.2, the rule-based part
+    │                                   (SeqScan, IndexScan(idx_active), IndexScan(idx_email))
+    ├─ stage 2: estimate rows   ──────▶ "this one touches ~5,000, that one ~1"
+    ├─ stage 3: cost the rows   ──────▶ "≈5,003 page reads vs ≈4"
+    └─ stage 4: pick the cheapest ────▶ IndexScan(idx_email)
+```
+
+
+Stage 1 alone is a rule-based planner. Stages 1–4 are a cost-based one. Note that stage 1 doesn't get
+deleted when you add the others — that's why the phone-book rule in §4.2 is still the most useful thing
+in this week.
+
+
+### Where the numbers come from: `ANALYZE`
+
+
+Stage 2 needs to know that `active` has 2 distinct values and `email` has 10,000. The database doesn't
+know that unless someone counts. That's the `ANALYZE` command: it walks each index, counts, and stores
+a tiny summary in a table called `quill_stat1`.
+
+
+The summary is startlingly small — a string of integers per index:
+
+
+```text
+tbl  idx         stat
+t    idx_active  "10000 5000"      -- 10,000 rows; ~5,000 rows per distinct value
+t    idx_email   "10000 1"         -- 10,000 rows; ~1 row per distinct value
+```
+
+
+For a three-column index on `(a,b,c)` you get four numbers — `"10000 100 10 2"` — meaning 10,000 rows,
+~100 rows share any given `a`, ~10 share any `(a,b)`, ~2 share any `(a,b,c)`. That's it. No histograms,
+no per-value counts. Four integers, and they're enough to tell "1 row per value" from "5,000 rows per
+value", which is the distinction that actually decides the plan.
+
+
+This is copied deliberately: SQLite's own `sqlite_stat1` uses exactly this encoding.
+
+
+### Two consequences you should be able to state
+
+
+**1. Statistics are estimates, and averages hide skew.** If 90% of your rows have `status='open'`, the
+*average* rows-per-status looks moderate and the planner will happily choose that index for
+`status='open'` — and touch 90% of the table. This is a real limitation, it's the one SQLite has too,
+and "averages can't see skew or correlation" is the right one-sentence answer for it.
+
+
+**2. Statistics go stale, and that must never change your answers.** You insert a million rows; the
+stats still describe the old table. The plan may now be slow. **It must still be correct.** That's the
+hard line: bad statistics are allowed to pick a slow legal plan, never a different result. Your week-4
+property test is the guard — run every query with and without each index and assert identical output.
+
+
+And the operational cost of all this, which is the honest counterweight to "cost-based is better":
+statistics are *derived state*. One more thing that can be stale, one more thing to invalidate, one more
+reason a query got slow overnight when nobody deployed anything. A rule-based planner has none of those
+failure modes. It's just reliably mediocre instead.
+
+
+### Why `SeqScan` must always stay on the list
+
+
+The non-obvious one. Even when a perfectly legal index exists, *just reading the whole table* is
+sometimes cheapest — because a non-covering index pays a separate table lookup **per matching row**, and
+those are scattered random reads. Reading 2,417 pages in order can beat 5,000 random lookups.
+
+
+So the planner always includes "scan the whole thing" as a candidate and lets it compete. An
+optimizer that never considers the dumbest plan will lose to it.
+
+
+## 4.4 EXPLAIN — the kitchen showing you the plan
 
 
 `EXPLAIN` prints the operator tree instead of executing it:
@@ -763,15 +897,33 @@ it."
 ```
 >>> print(db.execute("EXPLAIN SELECT * FROM users WHERE email='a@b.c'").explain())
 Project  [id, email, age]
-└─ IndexScan  idx_email  (email = 'a@b.c')   est_rows=1  pages_read=3
+└─ IndexScan  idx_email  (email = 'a@b.c')   est_rows=1  startup=3.00  cost=7.01
 ```
+
+
+Note what's printed: **estimates only**. Plain `EXPLAIN` does not run the query, so it cannot know how
+many pages were really read — `est_rows` and `cost` are the planner's predictions. To get real numbers
+you run `EXPLAIN ANALYZE`, which executes the plan once and adds measured counters:
+
+
+```
+>>> print(db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE email='a@b.c'").explain())
+Project  [id, email, age]
+└─ IndexScan  idx_email  (email = 'a@b.c')   est_rows=1  cost=7.01  actual_rows=1  pages_read=4
+```
+
+
+Keeping those two commands separate is a small discipline with a real payoff: it makes it impossible to
+accidentally present an estimate as a measurement. And putting them side by side is the best demo in the
+project — "the planner predicted 1 row, it read 1 row, here's the page count" is a claim nobody can wave
+away.
 
 
 It costs about two hours because you already have the tree — you're just printing it with
 indentation. Nothing else in the project makes it look this much like a real database in a demo.
 
 
-## 4.4 About deletion
+## 4.5 About deletion
 
 
 Removing a row means removing a cell from a page and repacking it. Simple.
@@ -789,23 +941,38 @@ competence; interviewers find "I know exactly what I didn't do and why" far more
 implied claim of completeness.
 
 
-## 4.5 Your seven sessions
+## 4.6 Your nine sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | Parse `DELETE`; `Delete` operator; B+tree cell removal + repack | Delete by rowid works, remaining rows intact, validator clean |
-| 2 | Return emptied pages to the freelist; parse and implement `UPDATE` | Delete 1000 rows then insert 1000 — file size doesn't grow |
-| 3 | Index key encoding (composite: column values + rowid) and comparison | Sorting encoded keys as bytes matches sorting the tuples logically. Test with mixed types and NULLs. |
-| 4 | `CREATE INDEX` — build the tree by scanning existing rows; `UNIQUE` enforcement | Index built on a populated table; duplicate insert into a unique index raises *before* writing anything |
-| 5 | **Index maintenance on insert/update/delete.** The correctness-critical session. | Property test: full index scan and full table scan + filter return identical row sets, after any sequence of mutations |
-| 6 | `IndexScan` operator (equality and range seeks) + the planner rule from §4.2 | Eligible `WHERE` picks IndexScan; `WHERE` on a non-leading column correctly falls back to SeqScan |
-| 7 | `EXPLAIN` + the benchmark | **Indexed lookup ~3 page reads vs ~2,400 for the scan. This number goes in your README.** |
+**This week needs nine, not seven** — the cost model is two extra sessions and pretending otherwise just
+means running over. It's the heaviest week in the project. If you have to borrow time, borrow it from
+week 8's presentation polish, not from here.
+
+
+| #   | Do this                                                                                       | Done when                                                                                                                  |
+| --- | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Parse `DELETE`; `Delete` operator; B+tree cell removal + repack                               | Delete by rowid works, remaining rows intact, validator clean                                                              |
+| 2   | Return emptied pages to the freelist; parse and implement `UPDATE`                            | Delete 1000 rows then insert 1000 — file size doesn't grow                                                                 |
+| 3   | Index key encoding (composite: column values + rowid) and comparison                          | Sorting encoded keys as bytes matches sorting the tuples logically. Test with mixed types and NULLs.                       |
+| 4   | `CREATE INDEX` — build the tree by scanning existing rows; `UNIQUE` enforcement               | Index built on a populated table; duplicate insert into a unique index raises *before* writing anything                    |
+| 5   | **Index maintenance on insert/update/delete.** The correctness-critical session.              | Property test: full index scan and full table scan + filter return identical row sets, after any sequence of mutations     |
+| 6   | `IndexScan` operator + **stage 1 only**: candidate generation and the legality rule from §4.2 | The 12-case legality table is green — including that the four *ineligible* cases produce **no** IndexScan candidate at all |
+| 7   | `ANALYZE`, `quill_stat1`, and row estimation (**stages 2**)                                   | A known distribution produces the expected prefix numbers; missing statistics fall back to defaults instead of failing     |
+| 8   | The cost model and access-path choice (**stages 3–4**)                                        | The selective index wins; editing *only* the statistics flips the choice; a low-selectivity index loses to SeqScan         |
+| 9   | `EXPLAIN` + `EXPLAIN ANALYZE` + the benchmark                                                 | **Indexed lookup ~4 page reads vs ~2,417 for the scan. This number goes in your README.**                                  |
+
+
+**Do not merge sessions 6 and 8.** It's the tempting cut when you're behind, and it quietly destroys the
+thing you're building: if candidate generation and costing live in one function, the implementation may
+still pick good plans but you can no longer *test* that choice was cost-based rather than rule-based.
+The two tests that prove this project has a real optimizer — statistics flip the plan, and a legal index
+loses to a scan — both need the stages separable. Cut presentation polish instead.
 
 
 One property test worth writing this week, because it catches a whole bug class: run every query in
 your test suite both with and without the index, and assert identical results. An index must change
-*speed*, never *answers*.
+*speed*, never *answers*. This is also your guard against the entire class of planner bugs — a planner
+is an *optimization*, and an optimization that changes answers is just a bug with a nicer name.
 
 
 ---
@@ -973,15 +1140,15 @@ Read [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html) before 
 essentially the spec for this week, and §3 lists the exact ordering.
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | `Transaction` object: tracks dirty pages, all `get_page` routes through it. **No journal yet** — just the shape. | All existing tests pass with mutations flowing through a transaction |
-| 2 | Journal file format: header (original page count) + records (page number, original bytes, 32-bit checksum) | You can write and read back a journal file |
-| 3 | Capture-before-modify, plus the fsync ordering from §5.2 | `strace`/logging confirms the order: journal write → fsync → db write → fsync → unlink |
-| 4 | `commit()` and `rollback()`, `BEGIN`/`COMMIT`/`ROLLBACK`, `with db.transaction():` | Hash the file, do work, rollback, hash again — byte-identical |
-| 5 | Hot-journal detection and replay on open | Kill the process mid-transaction (for real, `os._exit`), reopen, and the DB is back to its pre-transaction state |
-| 6 | `FaultyFile` + your first handful of crash tests | Crash at write 3 and write 17 both recover correctly |
-| 7 | Full parametrized crash matrix + `docs/durability.md` | ~200 crash points green, including one crash-during-recovery case |
+| #   | Do this                                                                                                          | Done when                                                                                                        |
+| --- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 1   | `Transaction` object: tracks dirty pages, all `get_page` routes through it. **No journal yet** — just the shape. | All existing tests pass with mutations flowing through a transaction                                             |
+| 2   | Journal file format: header (original page count) + records (page number, original bytes, 32-bit checksum)       | You can write and read back a journal file                                                                       |
+| 3   | Capture-before-modify, plus the fsync ordering from §5.2                                                         | `strace`/logging confirms the order: journal write → fsync → db write → fsync → unlink                           |
+| 4   | `commit()` and `rollback()`, `BEGIN`/`COMMIT`/`ROLLBACK`, `with db.transaction():`                               | Hash the file, do work, rollback, hash again — byte-identical                                                    |
+| 5   | Hot-journal detection and replay on open                                                                         | Kill the process mid-transaction (for real, `os._exit`), reopen, and the DB is back to its pre-transaction state |
+| 6   | `FaultyFile` + your first handful of crash tests                                                                 | Crash at write 3 and write 17 both recover correctly                                                             |
+| 7   | Full parametrized crash matrix + `docs/durability.md`                                                            | ~200 crash points green, including one crash-during-recovery case                                                |
 
 
 Two details worth copying from SQLite exactly: the journal's page count starts at **zero** and is
@@ -1113,15 +1280,15 @@ vanishes. It's the cleanest possible demonstration that your concurrency control
 ## 6.6 Your seven sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | Split `Database` (shared: file, pool, lock manager) from `Connection` (per-thread: transaction, cursors). A refactor. | All existing tests pass; two connections can be opened to one database |
-| 2 | Make the buffer pool thread-safe: lock the page table, per-page state, safe eviction | Two threads hammering `get_page` on overlapping pages don't corrupt the pool |
-| 3 | `LockManager`: S/X lock table, `threading.Condition` for waiting, compatibility matrix | Unit tests: S+S compatible, S+X blocks, X+X blocks, waiter wakes on release |
-| 4 | Wire 2PL into execution: acquire on first table touch, release all at commit/rollback | Two sequential transactions in different threads serialize correctly |
-| 5 | Wait-for graph + cycle detection + abort the youngest victim | A deliberately constructed deadlock resolves: one gets `DeadlockError`, the other commits |
-| 6 | `busy_timeout`, lock wait timeouts, the transfer stress test | The stress test runs (it may well fail — that's session 7) |
-| 7 | **Debug the stress test.** Then `benchmarks/concurrent.py`. | `sum(balances)` invariant holds over 8 threads × 10k transactions, repeatedly, in CI without flaking |
+| #   | Do this                                                                                                               | Done when                                                                                            |
+| --- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| 1   | Split `Database` (shared: file, pool, lock manager) from `Connection` (per-thread: transaction, cursors). A refactor. | All existing tests pass; two connections can be opened to one database                               |
+| 2   | Make the buffer pool thread-safe: lock the page table, per-page state, safe eviction                                  | Two threads hammering `get_page` on overlapping pages don't corrupt the pool                         |
+| 3   | `LockManager`: S/X lock table, `threading.Condition` for waiting, compatibility matrix                                | Unit tests: S+S compatible, S+X blocks, X+X blocks, waiter wakes on release                          |
+| 4   | Wire 2PL into execution: acquire on first table touch, release all at commit/rollback                                 | Two sequential transactions in different threads serialize correctly                                 |
+| 5   | Wait-for graph + cycle detection + abort the youngest victim                                                          | A deliberately constructed deadlock resolves: one gets `DeadlockError`, the other commits            |
+| 6   | `busy_timeout`, lock wait timeouts, the transfer stress test                                                          | The stress test runs (it may well fail — that's session 7)                                           |
+| 7   | **Debug the stress test.** Then `benchmarks/concurrent.py`.                                                           | `sum(balances)` invariant holds over 8 threads × 10k transactions, repeatedly, in CI without flaking |
 
 
 Session 7 will take longer than two hours. Concurrency bugs are intermittent by nature. Two things
@@ -1177,9 +1344,39 @@ everything" into "jump to the right place" — just applied inside a loop.
 
 **Join order matters, sometimes enormously.** Joining A to B is logically the same as B to A, but the
 *cost* isn't: you want the smaller relation as the outer loop and the indexed one as the inner.
-SQLite's docs work an example where one order beats the other by roughly **2000×**. Your planner
-implements a simple heuristic (smaller table outer) and `EXPLAIN` shows what it chose — which is a
-great demo moment.
+SQLite's docs work an example where one order beats the other by roughly **2000×**.
+
+
+Now, "smaller table outer" is a *heuristic* — and this is a good moment to notice why week 4's cost
+model was worth building, because the heuristic is wrong often enough to matter. It ignores whether the
+inner side has a usable index (a big table with an index on the join key makes a *better* inner than a
+small one without), and it ignores how many rows survive each table's `WHERE` clause before the join
+even starts. A 1M-row table filtered to 3 rows is the smaller relation, and only the estimates know it.
+
+
+So instead of a heuristic, week 7 reuses the four stages from §4.3:
+
+
+```text
+stage 1: which orders are legal?      -- inner joins reorder freely; LEFT JOIN doesn't
+stage 2: how many rows does each      -- |R| × |S| / max(distinct values on either key)
+         join produce?
+stage 3: what does each order cost?   -- outer cost + outer rows × one inner lookup
+stage 4: pick the cheapest            -- and with ≤3 tables there are at most 3! = 6 orders,
+                                         so just try them all
+```
+
+
+That last point is the nice one to be able to say out loud: **because the language caps joins at three
+tables, you can afford to be exhaustive, and exhaustive beats clever.** Six orders is nothing. SQLite
+can't do this — it supports joins of dozens of tables, so it uses a polynomial heuristic search ("N3",
+keeping the N best partial plans at each step) that is fast but not guaranteed optimal. Your search *is*
+guaranteed optimal under your own cost model, purely because your problem is smaller. Knowing which
+constraint bought you that is the interesting half of the answer.
+
+
+`EXPLAIN` then shows what it chose, which is a great demo moment — especially next to the page-read
+count for the order it *rejected*.
 
 
 ## 7.2 Aggregation: a tally sheet
@@ -1225,15 +1422,15 @@ is placed after the concurrency work rather than before.
 ## 7.4 Your seven sessions
 
 
-| # | Do this | Done when |
-|---|---|---|
-| 1 | Parse `JOIN ... ON`, comma joins, table aliases, qualified names (`u.id`) | ASTs correct; ambiguous unqualified column raises a clear error |
-| 2 | Binder handles multiple tables — column resolution across a join | `u.id` and `o.user_id` resolve to the right (table, index) pairs |
-| 3 | `NestedLoopJoin` operator | Two-table join returns correct rows; verified against `sqlite3` |
-| 4 | `IndexNestedLoopJoin` + planner choosing it when the inner side has an index | `EXPLAIN` shows the index join; page-read count drops sharply |
-| 5 | `HashAggregate`: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with and without `GROUP BY` | Matches `sqlite3` on all five, grouped and ungrouped |
-| 6 | `Sort` (in-memory, documented limit), multi-key `ORDER BY` with `ASC`/`DESC`, `LIMIT`/`OFFSET` | `LIMIT 1` over a million rows doesn't scan a million rows — prove it with the page counter |
-| 7 | `HAVING`, `DISTINCT`, and heavy differential testing on `NULL` | The full example query below works |
+| #   | Do this                                                                                        | Done when                                                                                                                                                 |
+| --- | ---------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Parse `JOIN ... ON`, comma joins, table aliases, qualified names (`u.id`)                      | ASTs correct; ambiguous unqualified column raises a clear error                                                                                           |
+| 2   | Binder handles multiple tables — column resolution across a join                               | `u.id` and `o.user_id` resolve to the right (table, index) pairs                                                                                          |
+| 3   | `NestedLoopJoin` operator                                                                      | Two-table join returns correct rows; verified against `sqlite3`                                                                                           |
+| 4   | `IndexNestedLoopJoin` + the planner **costing** it against a plain scan inner side             | `EXPLAIN` shows the index join when it's cheaper, a scan when it isn't; page-read count drops sharply, and you record the number for the losing order too |
+| 5   | `HashAggregate`: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with and without `GROUP BY`              | Matches `sqlite3` on all five, grouped and ungrouped                                                                                                      |
+| 6   | `Sort` (in-memory, documented limit), multi-key `ORDER BY` with `ASC`/`DESC`, `LIMIT`/`OFFSET` | `LIMIT 1` over a million rows doesn't scan a million rows — prove it with the page counter                                                                |
+| 7   | `HAVING`, `DISTINCT`, and heavy differential testing on `NULL`                                 | The full example query below works                                                                                                                        |
 
 
 ```sql
@@ -1321,15 +1518,15 @@ so pages can sit half-empty; space is reused via the freelist but the tree isn't
 ## 8.3 Your seven sessions
 
 
-| # | Do this |
-|---|---|
-| 1 | README sections 1, 3, 4, 5 |
-| 2 | Benchmark harness: point lookup, scan, insert throughput (sorted vs random), index vs no index, buffer-pool hit rate, tree height vs row count, threads vs throughput |
-| 3 | `docs/architecture.md` with a diagram matching the real module layout; `docs/file-format.md` |
-| 4 | 6–8 ADRs. One page each: the decision, the alternatives, why. (Undo journal not WAL; iterators not bytecode; no page merging; SQLite's format exactly but only one direction; table-level locking; deadlock detection over prevention.) |
-| 5 | `quilldb shell` — a REPL. Worth its 90 minutes on its own: "let me just show you" beats any explanation. |
-| 6 | Record the GIF. CI matrix across 3.11/3.12/3.13 with coverage. Test a clean-checkout install in a fresh virtualenv. |
-| 7 | Write the 5-minute demo script. Deliver it out loud, twice, from memory. |
+| #   | Do this                                                                                                                                                                                                                                 |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | README sections 1, 3, 4, 5                                                                                                                                                                                                              |
+| 2   | Benchmark harness: point lookup, scan, insert throughput (sorted vs random), index vs no index, buffer-pool hit rate, tree height vs row count, threads vs throughput                                                                   |
+| 3   | `docs/architecture.md` with a diagram matching the real module layout; `docs/file-format.md`                                                                                                                                            |
+| 4   | 6–8 ADRs. One page each: the decision, the alternatives, why. (Undo journal not WAL; iterators not bytecode; no page merging; SQLite's format exactly but only one direction; table-level locking; deadlock detection over prevention.) |
+| 5   | `quilldb shell` — a REPL. Worth its 90 minutes on its own: "let me just show you" beats any explanation.                                                                                                                                |
+| 6   | Record the GIF. CI matrix across 3.11/3.12/3.13 with coverage. Test a clean-checkout install in a fresh virtualenv.                                                                                                                     |
+| 7   | Write the 5-minute demo script. Deliver it out loud, twice, from memory.                                                                                                                                                                |
 
 
 **Success state:** a stranger clones it, pastes the example, and it works on the first try. And you
@@ -1345,52 +1542,57 @@ can talk through the whole project for five minutes without notes.
 Terms in the roadmap that this guide explains, with where.
 
 
-| Term | Plain meaning | Where |
-|---|---|---|
-| **Page / sheet** | A fixed 4096-byte chunk of the file, addressed by number | §0 |
-| **Pager** | The layer that fetches and writes pages, hiding the file | §1.1 |
-| **Buffer pool / page cache** | A bounded in-memory dict of recently used pages | §1.5 |
-| **Dirty page** | A cached page modified but not yet written to disk | §1.5 |
-| **Pin count** | How many things are currently using a page; can't evict above zero | §1.5 |
-| **LRU** | Least Recently Used — evict whatever you touched longest ago | §1.5 |
-| **Slotted page** | Page layout with an offset array from the top, data from the bottom | §1.2 |
-| **Cell** | One entry on a page — a row, or a signpost | §1.2 |
-| **Varint** | Variable-length integer; small numbers take fewer bytes | §1.3 |
-| **Serial type** | A code in a record header saying what type/size comes next | §1.4 |
-| **Record** | One row encoded as bytes: type header, then values | §1.4 |
-| **Overflow page** | Continuation page for a row too big for one page | §2.5 |
-| **B+tree** | Sorted tree; interior pages navigate, leaves hold data | §2.2 |
-| **Leaf / interior page** | Holds rows / holds only signposts to child pages | §2.2 |
-| **Split** | Full page → two pages + a new signpost in the parent | §2.3 |
-| **Separator / promotion** | The signpost key handed up to the parent after a split | §2.3 |
-| **Root split** | The only way a B+tree gets taller | §2.3 |
-| **Cursor** | A position in the tree that can move forward and back | §2.6 |
-| **Freelist** | Linked list of pages available for reuse | §1.6 |
-| **AST** | Abstract Syntax Tree — the parsed structure of a query | §3.1 |
-| **Tokenizer / lexer** | Splits SQL text into words and symbols | §3.1 |
-| **Binder** | Resolves names to positions and type-checks | §3.1 |
-| **Volcano / iterator model** | Query operators chained by `next()`, one row at a time | §3.2 |
-| **Operator** | One node in the assembly line: `SeqScan`, `Filter`, `Project`… | §3.2 |
-| **Pipeline breaker** | An operator that must consume all input before emitting (sort, aggregate) | §7.2 |
-| **Catalog** | The table that describes all other tables | §3.3 |
-| **Secondary index** | A second B+tree sorted by a different column | §4.1 |
-| **Covering index** | An index containing every column the query needs — skips the table lookup | §4.1 |
-| **Leading column rule** | An index only helps if you constrain its columns left to right, no gaps | §4.2 |
-| **Planner** | Chooses between access paths (scan vs index) | §4.2 |
-| **`fsync`** | "Actually put it on the physical disk, and don't return until it's there" | §5.3 |
-| **Journal** | File holding original page contents so a transaction can be undone | §5.2 |
-| **Commit point** | The instant a transaction becomes durable — for you, deleting the journal | §5.2 |
-| **Hot journal** | A journal found on open, meaning the last run was interrupted | §5.2 |
-| **Atomicity** | All of a transaction happens, or none of it | §5.1 |
-| **Fault injection** | Deliberately failing writes to test recovery | §5.4 |
-| **Shared / exclusive lock** | Many readers / one writer | §6.1 |
-| **2PL** | Acquire locks during the transaction, release all at the end | §6.1 |
-| **Deadlock** | Two transactions each waiting on what the other holds | §6.2 |
-| **Wait-for graph** | Who-waits-on-whom; a cycle means deadlock | §6.2 |
-| **Isolation level** | Precisely what one transaction can see of another's work | §6.6 |
-| **Nested loop join** | For each row of A, look through B | §7.1 |
-| **Hash aggregate** | One pass, keeping a tally dict keyed by the `GROUP BY` value | §7.2 |
-| **ADR** | Architecture Decision Record — one page on a choice and its alternatives | §8.3 |
+| Term                         | Plain meaning                                                                              | Where |
+| ---------------------------- | ------------------------------------------------------------------------------------------ | ----- |
+| **Page / sheet**             | A fixed 4096-byte chunk of the file, addressed by number                                   | §0    |
+| **Pager**                    | The layer that fetches and writes pages, hiding the file                                   | §1.1  |
+| **Buffer pool / page cache** | A bounded in-memory dict of recently used pages                                            | §1.5  |
+| **Dirty page**               | A cached page modified but not yet written to disk                                         | §1.5  |
+| **Pin count**                | How many things are currently using a page; can't evict above zero                         | §1.5  |
+| **LRU**                      | Least Recently Used — evict whatever you touched longest ago                               | §1.5  |
+| **Slotted page**             | Page layout with an offset array from the top, data from the bottom                        | §1.2  |
+| **Cell**                     | One entry on a page — a row, or a signpost                                                 | §1.2  |
+| **Varint**                   | Variable-length integer; small numbers take fewer bytes                                    | §1.3  |
+| **Serial type**              | A code in a record header saying what type/size comes next                                 | §1.4  |
+| **Record**                   | One row encoded as bytes: type header, then values                                         | §1.4  |
+| **Overflow page**            | Continuation page for a row too big for one page                                           | §2.5  |
+| **B+tree**                   | Sorted tree; interior pages navigate, leaves hold data                                     | §2.2  |
+| **Leaf / interior page**     | Holds rows / holds only signposts to child pages                                           | §2.2  |
+| **Split**                    | Full page → two pages + a new signpost in the parent                                       | §2.3  |
+| **Separator / promotion**    | The signpost key handed up to the parent after a split                                     | §2.3  |
+| **Root split**               | The only way a B+tree gets taller                                                          | §2.3  |
+| **Cursor**                   | A position in the tree that can move forward and back                                      | §2.6  |
+| **Freelist**                 | Linked list of pages available for reuse                                                   | §1.6  |
+| **AST**                      | Abstract Syntax Tree — the parsed structure of a query                                     | §3.1  |
+| **Tokenizer / lexer**        | Splits SQL text into words and symbols                                                     | §3.1  |
+| **Binder**                   | Resolves names to positions and type-checks                                                | §3.1  |
+| **Volcano / iterator model** | Query operators chained by `next()`, one row at a time                                     | §3.2  |
+| **Operator**                 | One node in the assembly line: `SeqScan`, `Filter`, `Project`…                             | §3.2  |
+| **Pipeline breaker**         | An operator that must consume all input before emitting (sort, aggregate)                  | §7.2  |
+| **Catalog**                  | The table that describes all other tables                                                  | §3.3  |
+| **Secondary index**          | A second B+tree sorted by a different column                                               | §4.1  |
+| **Covering index**           | An index containing every column the query needs — skips the table lookup                  | §4.1  |
+| **Leading column rule**      | An index only helps if you constrain its columns left to right, no gaps                    | §4.2  |
+| **Planner**                  | Generates every *legal* access path, then costs them and picks the cheapest                | §4.3  |
+| **Rule- vs cost-based**      | Rules decide which plans are legal; costs decide which legal plan wins. Stages, not rivals | §4.3  |
+| **`ANALYZE` / statistics**   | Counts distinct values per index prefix and stores them in `quill_stat1`                   | §4.3  |
+| **Selectivity**              | What fraction of rows a predicate keeps — 1 row per value vs 5,000                         | §4.3  |
+| **Cardinality estimate**     | The planner's guess at how many rows an operator will emit                                 | §4.3  |
+| **Cost model**               | Converts estimated rows into estimated page reads, so plans are comparable                 | §4.3  |
+| **`fsync`**                  | "Actually put it on the physical disk, and don't return until it's there"                  | §5.3  |
+| **Journal**                  | File holding original page contents so a transaction can be undone                         | §5.2  |
+| **Commit point**             | The instant a transaction becomes durable — for you, deleting the journal                  | §5.2  |
+| **Hot journal**              | A journal found on open, meaning the last run was interrupted                              | §5.2  |
+| **Atomicity**                | All of a transaction happens, or none of it                                                | §5.1  |
+| **Fault injection**          | Deliberately failing writes to test recovery                                               | §5.4  |
+| **Shared / exclusive lock**  | Many readers / one writer                                                                  | §6.1  |
+| **2PL**                      | Acquire locks during the transaction, release all at the end                               | §6.1  |
+| **Deadlock**                 | Two transactions each waiting on what the other holds                                      | §6.2  |
+| **Wait-for graph**           | Who-waits-on-whom; a cycle means deadlock                                                  | §6.2  |
+| **Isolation level**          | Precisely what one transaction can see of another's work                                   | §6.6  |
+| **Nested loop join**         | For each row of A, look through B                                                          | §7.1  |
+| **Hash aggregate**           | One pass, keeping a tally dict keyed by the `GROUP BY` value                               | §7.2  |
+| **ADR**                      | Architecture Decision Record — one page on a choice and its alternatives                   | §8.3  |
 
 
 ---
@@ -1399,19 +1601,16 @@ Terms in the roadmap that this guide explains, with where.
 # If You Read Only One Thing Per Week
 
 
-| Week | Read this | Time |
-|---|---|---|
-| 1 | [SQLite Internals: Pages & B-trees](https://fly.io/blog/sqlite-internals-btree/) | 20 min |
-| 2 | [db_tutorial parts 10, 13, 14](https://cstack.github.io/db_tutorial/) | 90 min |
-| 3 | [Simple but Powerful Pratt Parsing](https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html) | 40 min |
-| 4 | [SQLite optoverview §2](https://www.sqlite.org/optoverview.html) | 30 min |
-| 5 | [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html) — **twice** | 2 h |
-| 6 | [A Critique of ANSI SQL Isolation Levels](https://arxiv.org/abs/cs/0701157) | 1 h |
-| 7 | CMU 15-445 "Joins" + "Sorting & Aggregations" slides | 40 min |
-| 8 | [toydb](https://github.com/erikgrinaker/toydb)'s README and architecture doc, as a template | 30 min |
+| Week | Read this                                                                                                                                           | Time   |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| 1    | [SQLite Internals: Pages & B-trees](https://fly.io/blog/sqlite-internals-btree/)                                                                    | 20 min |
+| 2    | [db_tutorial parts 10, 13, 14](https://cstack.github.io/db_tutorial/)                                                                               | 90 min |
+| 3    | [Simple but Powerful Pratt Parsing](https://matklad.github.io/2020/04/13/simple-but-powerful-pratt-parsing.html)                                    | 40 min |
+| 4    | [SQLite optoverview §2](https://www.sqlite.org/optoverview.html) (legality) + [queryplanner-ng](https://www.sqlite.org/queryplanner-ng.html) (cost) | 50 min |
+| 5    | [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html) — **twice**                                                                     | 2 h    |
+| 6    | [A Critique of ANSI SQL Isolation Levels](https://arxiv.org/abs/cs/0701157)                                                                         | 1 h    |
+| 7    | CMU 15-445 "Joins" + "Sorting & Aggregations" slides                                                                                                | 40 min |
+| 8    | [toydb](https://github.com/erikgrinaker/toydb)'s README and architecture doc, as a template                                                         | 30 min |
 
 
 Full annotated list, including what to skip and why, is in `references.md`.
-
-
-

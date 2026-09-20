@@ -79,7 +79,9 @@ class PageBody:
         del self.cells[index]
 
 
-def parse_page(data: bytes | memoryview, header_offset: int = 0) -> PageBody:
+
+
+def parse_page(data: bytes | bytearray | memoryview, header_offset: int = 0) -> PageBody:
     """Decode a raw page.
 
     Args:
@@ -118,9 +120,11 @@ def parse_page(data: bytes | memoryview, header_offset: int = 0) -> PageBody:
 
     for i in range(len(offsets)):
         if i == 0:
-            cells.append(data[offsets[i]: PAGE_SIZE])
+            cells.append(bytes(data[offsets[i]: PAGE_SIZE]))
         else:
-            cells.append(data[offsets[i]: offsets[i-1]])
+            cells.append(bytes(data[offsets[i]: offsets[i-1]]))
+
+
 
 
     right_child = 0
@@ -136,16 +140,18 @@ def parse_page(data: bytes | memoryview, header_offset: int = 0) -> PageBody:
 
 
 
-
 def serialize_page(body: PageBody) -> bytearray:
     """Encode to exactly PAGE_SIZE bytes.
+
 
     Writes cell data packed tight against the end of the page, so a
     freshly-serialized page has zero fragmentation.
 
+
     Bytes before body.header_offset are left ZERO here, not preserved --
     on page 1 those are the file header, so use write_page_body() to splice
     into a live buffer rather than assigning `raw[:] = serialize_page(body)`.
+
 
     Raises:
         PageFullError: body.used_bytes() > PAGE_SIZE.
@@ -153,18 +159,23 @@ def serialize_page(body: PageBody) -> bytearray:
     if body.used_bytes() > PAGE_SIZE:
         raise PageFullError("The current page body exceeded the limit")
 
+
     parsed_page = bytearray(PAGE_SIZE)
     hdr = body.header_offset
+
 
     parsed_page[hdr] = body.page_type
     # bytes 1-2 (first freeblock) and byte 7 (fragment count) stay 0 —
     # we never create freeblocks, so every page we serialize is defragmented.
     parsed_page[hdr + 3:hdr + 5] = body.cell_count.to_bytes(2, "big")
 
+
     if not body.page_type.is_leaf:
         parsed_page[hdr + 8:hdr + 12] = body.right_child.to_bytes(4, "big")
 
+
     cell_ptr_start = hdr + body.page_type.header_size
+
 
     # TODO(human): place each cell's bytes and write the pointer array.
     #
@@ -180,29 +191,33 @@ def serialize_page(body: PageBody) -> bytearray:
     # - Write the final cursor value into parsed_page[5:7] (content start)
     #   — this is PAGE_SIZE if body.cells is empty.
     cur_offset = PAGE_SIZE
-    
+   
     ptrs = []
-    
+   
     for i, cell in enumerate(body.cells):
         # write to ptrs list
         cur_offset -= len(cell)
         ptrs.append(cur_offset)
-        
+       
         # now write the end
         parsed_page[cur_offset: cur_offset + len(cell)] = cell
-    
+   
     for ptr in ptrs:
         parsed_page[cell_ptr_start: cell_ptr_start + 2] = ptr.to_bytes(2, "big")
         cell_ptr_start += 2
-        
+       
     parsed_page[hdr + 5:hdr + 7] = cur_offset.to_bytes(2, "big")
 
+
     return parsed_page
+
+
 
 
 def write_page_body(raw: bytearray, body: PageBody) -> None:
     """Serialize `body` into `raw` in place, preserving whatever sits before
     body.header_offset.
+
 
     That prefix is page 1's 100-byte file header. `raw[:] =
     serialize_page(body)` would zero it -- taking the magic string, page
