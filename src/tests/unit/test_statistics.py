@@ -14,7 +14,6 @@ from quilldb.plan.predicates import Predicate
 from quilldb.plan.statistics import IndexStats, TableStats, estimate_row_counts
 from quilldb.sql.binder import BoundLiteral
 
-
 _ABC = IndexSchema("abc", "t", ("a", "b", "c"), unique=False, root_page=3, sql="CREATE INDEX abc ON t(a,b,c)")
 _STATS = IndexStats(row_count=10_000, rows_per_prefix=(100, 10, 2))
 _TABLE_STATS = TableStats(row_count=10_000)

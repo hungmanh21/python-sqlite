@@ -16,7 +16,6 @@ from quilldb.plan.predicates import Predicate
 from quilldb.sql.ast import DataType
 from quilldb.sql.binder import BoundLiteral
 
-
 _TABLE = TableSchema(
     "t",
     (

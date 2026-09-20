@@ -15,7 +15,7 @@ from quilldb.exec.operators import IndexScan, Insert, Operator
 from quilldb.plan.planner import AccessPath, PlanCost
 from quilldb.plan.predicates import Predicate
 from quilldb.sql.ast import CreateIndex, CreateTable
-from quilldb.sql.binder import BoundInsert, BoundLiteral, bind
+from quilldb.sql.binder import BoundBinaryOp, BoundInsert, BoundLiteral, BoundUnaryOp, bind
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
@@ -463,3 +463,117 @@ def test_index_scan_explain_verbose_without_cost_omits_startup_and_cost(tmp_path
     scan = IndexScan(pager, pool, table, _path(index, _eq("age", 7)))
     assert scan.explain(verbose=True) == "IndexScan idx_age (age = 7) est_rows=0"
     pager.close()
+
+# =====================================================================
+# non-literal (but column-free) seek bounds, and NULL bounds
+# =====================================================================
+
+
+
+
+def test_a_negated_literal_bound_seeks_instead_of_crashing(tmp_path) -> None:
+    """SQL has no negative literal -- `-1` binds as BoundUnaryOp('-') over
+    BoundLiteral(1). An earlier version asserted `isinstance(value,
+    BoundLiteral)` here and crashed on every `WHERE indexed_col >= -1`.
+    plan/predicates.py's sargability test is `_is_column_free`, which
+    deliberately admits any expression computable without a row, so the
+    operator must evaluate the bound rather than refuse the index -- real
+    sqlite3 plans this as SEARCH ... USING INDEX.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", -5), (2, "bob", -1), (3, "amy", 7))
+
+
+    negative_one = BoundUnaryOp("-", BoundLiteral(1))
+    predicate = Predicate("age", ">=", negative_one, negative_one)
+    rows = _drain(IndexScan(pager, pool, table, _path(index, predicate)))
+
+
+    assert [row[0] for row in rows] == [2, 3]
+    assert _outstanding_pins(pool) == 0
+
+
+
+
+def test_an_arithmetic_bound_is_folded_before_seeking(tmp_path) -> None:
+    """Same contract as the unary case, one node deeper: `age = 2 + 5` is a
+    BoundBinaryOp whose operands are both column-free, so it folds to 7.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 7), (2, "bob", 20))
+
+
+    sum_expr = BoundBinaryOp(BoundLiteral(2), "+", BoundLiteral(5))
+    predicate = Predicate("age", "=", sum_expr, sum_expr)
+    rows = _drain(IndexScan(pager, pool, table, _path(index, predicate)))
+
+
+    assert [row[0] for row in rows] == [1]
+
+
+
+
+def test_a_null_bound_yields_no_rows_rather_than_the_whole_table(tmp_path) -> None:
+    """`age > NULL` is NULL, never true, so no row can match. Without an
+    explicit guard the seek returns EVERY row instead: compare_keys orders
+    NULL below every other value -- right for storing NULLs, wrong for a
+    comparison bound -- so the range seek starts below the lowest key and
+    walks the entire index. Wrong answers, silently.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", 20), (3, "amy", None))
+
+
+    for operator in (">", ">=", "<", "<=", "="):
+        rows = _drain(IndexScan(pager, pool, table, _path(index, _cmp("age", operator, None))))
+        assert rows == [], f"`age {operator} NULL` must match nothing, got {rows}"
+    assert _outstanding_pins(pool) == 0
+
+
+
+
+def test_an_is_null_seek_still_matches_nulls(tmp_path) -> None:
+    """The one operator excluded from the guard above. `IS` is how
+    classify_predicate spells `column IS NULL`, and it is precisely the
+    comparison that DOES match NULLs -- folding it into the unsatisfiable
+    case would silently break a legitimate seek.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 36), (2, "bob", None))
+
+
+    predicate = Predicate("age", "IS", BoundLiteral(None), BoundLiteral(None))
+    rows = _drain(IndexScan(pager, pool, table, _path(index, predicate)))
+
+
+    assert [row[0] for row in rows] == [2]
+
+
+
+
+def test_an_unsatisfiable_bound_closes_cleanly_without_leaking_pins(tmp_path) -> None:
+    """The early return leaves the scan open but empty, so next() must keep
+    answering None and close() must still release the table cursor it had
+    already built before the guard fired.
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 36))
+
+
+    operator = IndexScan(pager, pool, table, _path(index, _cmp("age", ">", None)))
+    operator.open()
+    assert operator.next() is None
+    assert operator.next() is None
+    operator.close()
+    operator.close()  # idempotent
+    assert _outstanding_pins(pool) == 0

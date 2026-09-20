@@ -15,8 +15,6 @@ from quilldb.plan.planner import AccessPath, PlanCost
 from quilldb.plan.search import choose_access_path
 
 
-
-
 def _path(kind: str, total: float, startup: float = 0.0) -> AccessPath:
     return AccessPath(kind, None, (), (), cost=PlanCost(startup=startup, total=total))
 

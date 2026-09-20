@@ -152,16 +152,6 @@ class Pager:
         Raises:
             PageOutOfRangeError: page_id < 1 or > page_count.
         """
-        # TODO(human): validate page_id, then seek to its byte offset and read
-        # exactly PAGE_SIZE bytes.
-        #
-        # - page_id must satisfy 1 <= page_id <= self.page_count, else raise
-        #   PageOutOfRangeError (see quilldb.errors).
-        # - Page N starts at byte (N - 1) * PAGE_SIZE — this is the off-by-one
-        #   the module docstring warns about; get it into one expression you
-        #   trust rather than re-deriving it elsewhere.
-        # - self._file.seek(offset) then self._file.read(PAGE_SIZE); wrap the
-        #   result in bytearray(...) since read() returns immutable bytes.
         if page_id < 1 or page_id > self.page_count:
             raise PageOutOfRangeError
         offset = (page_id - 1) * PAGE_SIZE
@@ -176,11 +166,6 @@ class Pager:
         Raises:
             PageOutOfRangeError, ValueError: len(data) != PAGE_SIZE.
         """
-        # TODO(human): validate page_id and len(data), then seek and write.
-        #
-        # - Same page_id bounds check as read_page.
-        # - len(data) must be exactly PAGE_SIZE, else raise ValueError.
-        # - self._file.seek(offset) then self._file.write(data).
         if page_id < 1 or page_id > self.page_count:
             raise  PageOutOfRangeError(f"page {page_id} out of range (1..{self.page_count})")
 

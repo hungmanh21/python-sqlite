@@ -34,7 +34,6 @@ from quilldb.sql.ast import (
 from quilldb.sql.tokenizer import tokenize
 from quilldb.sql.tokens import Token, TokenType
 
-
 _COLUMN_TYPES: dict[TokenType, DataType] = {
     TokenType.INTEGER_TYPE: DataType.INTEGER,
     TokenType.REAL_TYPE: DataType.REAL,

@@ -12,9 +12,7 @@ importing.
 
 import datetime
 
-
 import pytest
-
 
 from quilldb.catalog.schema import ColumnSchema, TableSchema
 from quilldb.errors import (
@@ -42,7 +40,6 @@ from quilldb.sql.binder import (
     bind,
 )
 from quilldb.sql.parser import parse
-
 
 _USERS = TableSchema(
     "users",

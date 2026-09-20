@@ -17,8 +17,6 @@ shape of now.
 from quilldb.plan.planner import AccessPath
 
 
-
-
 def choose_access_path(candidates: list[AccessPath]) -> AccessPath:
     """Pick the minimum-cost.total candidate.
 

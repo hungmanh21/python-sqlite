@@ -12,7 +12,6 @@ detail.
 
 import pytest
 
-
 from quilldb.btree.cells import (
     encode_interior_table_cell,
     encode_leaf_index_cell,
@@ -25,8 +24,6 @@ from quilldb.errors import BTreeInvariantError, OverflowCycleError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, serialize_page
 from quilldb.storage.pager import Pager
-
-
 
 
 @pytest.fixture

@@ -15,7 +15,6 @@ until the next session.
 from dataclasses import dataclass
 from typing import Literal
 
-
 from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.plan.predicates import Predicate
 

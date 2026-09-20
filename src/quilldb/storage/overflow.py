@@ -21,12 +21,10 @@ See docs/theory/btree/06-b-tree-mechanics.md §6.5.
 
 import math
 
-
 from quilldb.constants import USABLE_SIZE
 from quilldb.errors import OverflowCycleError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
-
 
 CONTENT_PER_PAGE = USABLE_SIZE - 4  # 4 bytes spent on the next-page pointer
 

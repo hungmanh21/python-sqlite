@@ -11,12 +11,9 @@ below check exactly that).
 import random
 import subprocess
 
-
 import pytest
 
 import quilldb
-
-
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import decode_leaf_table_cell, encode_leaf_table_cell
 from quilldb.btree.index import IndexBTree
@@ -39,7 +36,6 @@ from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageType, parse_page, write_page_body
 from quilldb.storage.pager import Pager, page_header_offset
-
 
 _USERS_SQL = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 
@@ -620,9 +616,14 @@ def test_create_index_backfill_of_large_keys_survives_a_multi_level_split(tmp_pa
     db.close()
 
 
+    # check=False, unlike the other integrity_check calls in this file, is
+    # deliberate: a malformed file makes sqlite3 exit non-zero with the
+    # reason on STDERR, and check=True would raise CalledProcessError before
+    # the assert below could report it. This is the test that caught the
+    # zero-cell interior page, and it caught it by printing that stderr.
     result = subprocess.run(
         ["sqlite3", str(path), "PRAGMA integrity_check;"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     )
     assert result.stdout.strip() == "ok", result.stdout.strip() or result.stderr.strip()
 

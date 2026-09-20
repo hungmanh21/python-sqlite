@@ -7,7 +7,6 @@ failure or table row in chapter 12.
 from quilldb.plan.predicates import Predicate, classify_predicate, extract_conjuncts
 from quilldb.sql.binder import BoundBinaryOp, BoundColumn, BoundIsNull, BoundLiteral, BoundUnaryOp
 
-
 _A = BoundColumn(0, "a", None)  # data_type is irrelevant to sargability
 _B = BoundColumn(1, "b", None)
 _LIT1 = BoundLiteral(1)

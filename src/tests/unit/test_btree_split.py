@@ -3,7 +3,6 @@
 
 import pytest
 
-
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import (
     decode_interior_table_cell,
@@ -16,8 +15,6 @@ from quilldb.errors import PageFullError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
-
-
 
 
 @pytest.fixture

@@ -1,6 +1,5 @@
 import pytest
 
-
 from quilldb.btree.cells import (
     encode_interior_table_cell,
     encode_leaf_table_cell,
@@ -12,8 +11,6 @@ from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import write_overflow_chain
 from quilldb.storage.page import PageBody, serialize_page
 from quilldb.storage.pager import Pager
-
-
 
 
 @pytest.fixture
