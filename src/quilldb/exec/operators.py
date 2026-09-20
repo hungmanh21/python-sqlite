@@ -52,7 +52,6 @@ from quilldb.sql.binder import (
     BoundDelete,
     BoundExpression,
     BoundInsert,
-    BoundLiteral,
     BoundSelect,
     BoundUpdate,
 )
@@ -176,15 +175,29 @@ class SeqScan(Operator):
 
 
 
-def _literal_value(predicate: Predicate) -> Value:
-    """A seek_term's literal value -- always a BoundLiteral once a Predicate
-    is sargable (classify_predicate's contract, plan/predicates.py), so this
-    narrows what mypy still sees as the general BoundExpression union.
+def _seek_value(predicate: Predicate) -> Value:
+    """Fold a seek_term's value side down to the constant to probe with.
+
+
+    NOT always a BoundLiteral, which is what an earlier version asserted.
+    plan/predicates.py's sargability test is `_is_column_free`, and it
+    deliberately admits any expression computable without reading a row --
+    so `age >= -1` arrives as a BoundUnaryOp (SQL has no negative literal;
+    the minus is an operator) and `age = 2 + 0` as a BoundBinaryOp. Both
+    are legal search arguments, and real sqlite3 plans the first as
+    `SEARCH t USING INDEX ix_age (age>?)`, so the fix is to evaluate them,
+    not to refuse the index.
+
+
+    `evaluate` is pure and, for a column-free expression, never indexes
+    into `row` -- the empty row is unreachable input rather than a stub.
+    Should a BoundColumn ever leak through classify_predicate, it surfaces
+    as ColumnNotFoundError ("the row is shorter than a BoundColumn's
+    index"), which is errors.py's existing name for a binder/executor
+    disagreement -- the right classification for this, and the reason no
+    bare assert is needed to guard it.
     """
-    assert isinstance(predicate.value, BoundLiteral), (
-        f"seek_term {predicate.column!r} has a non-literal value: {type(predicate.value).__name__}"
-    )
-    return predicate.value.value
+    return evaluate(predicate.value, ())
 
 
 
@@ -272,9 +285,9 @@ class IndexScan(Operator):
             seek_range expects.
 
 
-        A literal value comes out of a `Predicate` via `predicate.value` --
-        always a `BoundLiteral` once this predicate reached here, so
-        `predicate.value.value` is the actual Value to pass to IndexBTree.
+        A seek_term's probe value comes out of a `Predicate` through
+        `_seek_value`, which evaluates it: `predicate.value` is any
+        column-free expression, not necessarily a `BoundLiteral`.
 
 
         This operator does its own per-row table lookups in next() through
@@ -291,6 +304,33 @@ class IndexScan(Operator):
         self._cursor = TableCursor(self.pager, self.pool, self.table.root_page)
 
 
+        # A seek bound that folds to NULL makes the conjunct unsatisfiable,
+        # and it has to be caught here rather than handed to the b-tree.
+        # compare_keys orders NULL below every other value -- correct for
+        # STORING NULLs in an index, and exactly the wrong semantics for a
+        # comparison BOUND, because `age > NULL` would then seek "everything
+        # above the lowest possible key" and return the whole table.
+        # Measured before this guard existed, same rows indexed vs. not:
+        #
+        #   WHERE age >  NULL    SeqScan []    IndexScan [0,1,2,3,4]   WRONG
+        #   WHERE age =  NULL    SeqScan []    IndexScan [5]           WRONG
+        #   WHERE age IS NULL    SeqScan [5]   IndexScan [5]           right
+        #
+        # Real sqlite3 returns nothing for the first two: `=`, `<`, `>`
+        # against NULL evaluate to NULL, never true. `IS` is the one
+        # operator that DOES match NULLs, which is why classify_predicate
+        # gives it a name of its own and why it must be excluded here --
+        # including it would break `WHERE age IS NULL`, a legitimate seek.
+        #
+        # This is the worst class of bug the planner can have: an index is
+        # only allowed to change a query's SPEED, never its RESULTS, and
+        # getting it wrong returns wrong rows silently rather than raising.
+        for term in self.path.seek_terms:
+            if _seek_value(term) is None and term.operator != "IS":
+                self._rowids = iter(())
+                return
+
+
         # check if seek terms is all equal comparison
         all_eq = True
 
@@ -302,17 +342,17 @@ class IndexScan(Operator):
 
         if all_eq:
             # get all the predicates
-            values = [_literal_value(predicate) for predicate in self.path.seek_terms]
+            values = [_seek_value(predicate) for predicate in self.path.seek_terms]
             self._rowids = btree.seek_eq(values)
         else:
-            equality_prefix = [_literal_value(predicate) for predicate in self.path.seek_terms if predicate.operator in ["=", "IS"]]
+            equality_prefix = [_seek_value(predicate) for predicate in self.path.seek_terms if predicate.operator in ["=", "IS"]]
             low_bound: list[Value] = []
             high_bound: list[Value] = []
             low_inclusive = high_inclusive = True
 
 
             for predicate in self.path.seek_terms:
-                value = _literal_value(predicate)
+                value = _seek_value(predicate)
                 if predicate.operator in ["<", "<="]:
                     # keep the TIGHTEST (smallest) upper bound seen -- two
                     # same-direction inequalities on one column (e.g. a
@@ -391,7 +431,7 @@ class IndexScan(Operator):
 
         if self.path.seek_terms:
             predicate_text = " AND ".join(
-                f"{p.column} {p.operator} {_literal_sql(_literal_value(p))}" for p in self.path.seek_terms
+                f"{p.column} {p.operator} {_literal_sql(_seek_value(p))}" for p in self.path.seek_terms
             )
             label += f" ({predicate_text})"
 
