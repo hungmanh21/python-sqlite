@@ -154,6 +154,7 @@ class SeqScan(Operator):
             # record() reassembles an overflow chain if the payload spilled,
             # so a 10KB value scans the same as a 10-byte one from here.
             row = decode_record(self._cursor.record())
+            self.pool.rows_examined += 1
             if not self._cursor.next():
                 self._positioned = False
         except Exception:
@@ -365,6 +366,7 @@ class IndexScan(Operator):
                     # writers yet), but skipping rather than raising keeps
                     # this scan's own resource discipline self-contained.
                     continue
+                self.pool.rows_examined += 1
                 return decode_record(self._cursor.record())
             self._rowids = None
             return None

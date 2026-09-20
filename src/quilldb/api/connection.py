@@ -208,6 +208,44 @@ class Connection:
         self._closed = False
 
 
+    # ---- measurement surface (chapter 19 SS19.2) -------------------------
+    #
+    # Page reads, not seconds. A page read here is exactly a buffer-pool
+    # MISS, so the number is decided by the access path rather than by how
+    # warm the cache happened to be -- which is what makes it reproducible
+    # and checkable against the arithmetic by anyone reading the README.
+
+
+    @property
+    def pages_read(self) -> int:
+        """Buffer-pool misses since the last reset_counters()."""
+        return self.pool.misses
+
+
+    @property
+    def pages_cached(self) -> int:
+        """Buffer-pool hits since the last reset_counters(). These cost no
+        I/O and are deliberately NOT part of pages_read.
+        """
+        return self.pool.hits
+
+
+    @property
+    def rows_examined(self) -> int:
+        """Rows pulled out of a scan operator since the last
+        reset_counters() -- rows LOOKED AT, which for a SeqScan is the
+        whole table however few rows come back.
+        """
+        return self.pool.rows_examined
+
+
+    def reset_counters(self) -> None:
+        """Zero the measurement counters, immediately before the statement
+        being measured.
+        """
+        self.pool.reset_counters()
+
+
     def execute(self, sql: str, parameters: Sequence[Value] = ()) -> Cursor:
         """Parse, bind, and execute one statement.
 

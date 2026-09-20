@@ -53,6 +53,34 @@ class BufferPool:
         self._cache: OrderedDict[int, _Entry] = OrderedDict()
 
 
+        # Chapter 19 SS19.2's benchmark metric. A "page read" is exactly a
+        # pool MISS -- a hit costs no I/O and must not be counted, or the
+        # number stops being the thing the access path determines and
+        # starts reporting how warm the cache happened to be. Hits are
+        # counted too, but only so a benchmark can state its hit rate;
+        # the headline number is `misses`.
+        self.hits = 0
+        self.misses = 0
+
+
+        # Rows pulled out of a scan operator. Not a buffer-pool concept --
+        # it lives here because the pool is the one object every layer
+        # already holds, so counting it costs no new plumbing through
+        # build_operator. Paired with `misses` it gives chapter 19's two
+        # headline numbers: page reads AND rows examined, which together
+        # say whether an index was used and whether it helped.
+        self.rows_examined = 0
+
+
+    def reset_counters(self) -> None:
+        """Zero the hit/miss counters. A benchmark calls this immediately
+        before the statement it is measuring.
+        """
+        self.hits = 0
+        self.misses = 0
+        self.rows_examined = 0
+
+
     def get_page(self, page_id: int) -> bytearray:
         """Fetch a page, pinning it.
 
@@ -74,6 +102,7 @@ class BufferPool:
             entry = self._cache[page_id]
             entry.pin_count += 1
             self._cache.move_to_end(page_id)
+            self.hits += 1
             return entry.data
 
 
@@ -85,6 +114,7 @@ class BufferPool:
 
         data = self._pager.read_page(page_id)
         self._cache[page_id] = _Entry(data=data, pin_count=1, dirty=False)
+        self.misses += 1
         return data
 
 
