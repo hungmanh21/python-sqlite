@@ -99,11 +99,19 @@ def test_overflow_spill_always_fills_overflow_pages_exactly(total_len: int) -> N
     spilled = total_len - local
     if spilled <= 0:
         return
-    if local == MIN_LOCAL_PAYLOAD and local != total_len:
-        # the M fallback: only guaranteed when the ideal K would exceed X
-        expected_k = MIN_LOCAL_PAYLOAD + ((total_len - MIN_LOCAL_PAYLOAD) % (USABLE_SIZE - 4))
-        assert expected_k > x
+
+
+    # Which branch ran is decided by K itself, NOT by "local == M". K equals
+    # M exactly when (P - M) divides evenly by (USABLE_SIZE - 4) -- e.g.
+    # P=8673 gives K=489=M -- and that is the remainder trick landing
+    # perfectly, not the fallback. Reading "local == M" as proof of the
+    # fallback misfires on precisely those P.
+    k = MIN_LOCAL_PAYLOAD + ((total_len - MIN_LOCAL_PAYLOAD) % (USABLE_SIZE - 4))
+    if k > x:
+        # the M fallback: K didn't fit, so a partial last overflow page is expected
+        assert local == MIN_LOCAL_PAYLOAD
     else:
+        assert local == k
         assert spilled % (USABLE_SIZE - 4) == 0
 
 
