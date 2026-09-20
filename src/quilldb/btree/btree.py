@@ -38,8 +38,6 @@ from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
 
 
-
-
 def _fits_one_leaf_page(cells: list[bytes]) -> bool:
     """Would `cells` (in this order) serialize into one LEAF_TABLE page?
 

@@ -340,10 +340,12 @@ def test_insert_splits_a_leaf_and_promotes_into_an_existing_parent(pager, pool) 
 
 
 
-def test_insert_raises_cleanly_when_the_parent_has_no_room_for_the_promoted_separator(pager, pool) -> None:
-    """The one-level-split ceiling this module's docstring documents: a full
-    leaf splits fine on its own, but promoting the split into an already-full
-    parent has nowhere to go, and must fail without touching anything.
+def test_insert_cascades_when_the_parent_has_no_room_for_the_promoted_separator(pager, pool) -> None:
+    """A full leaf under a FULL parent used to be the ceiling: insert()
+    raised, and an index could never grow past two levels. _promote_separator
+    now splits the parent instead, and when that parent is the root the tree
+    gains a level -- with the root keeping its page number, because
+    sqlite_schema records it.
     """
     full_leaf, next_n = _full_index_leaf(0)
     leaf_page = _write_page(pager, pool, full_leaf)
@@ -352,22 +354,34 @@ def test_insert_raises_cleanly_when_the_parent_has_no_room_for_the_promoted_sepa
     idx = IndexBTree(pager, pool, root, n_key_columns=1, unique=False)
 
 
-    page_count_before = pager.page_count
+    idx.insert([f"k{next_n:06d}"], next_n)  # must not raise
 
 
-    with pytest.raises(PageFullError):
-        idx.insert([f"k{next_n:06d}"], next_n)
+    assert idx.root == root  # the root page number never moves
 
 
-    assert pager.page_count == page_count_before  # nothing allocated on the failure path
-
-
-    raw = pool.get_page(leaf_page)
+    raw = pool.get_page(root)
     try:
-        leaf_body = parse_page(raw)
+        root_body = parse_page(raw)
     finally:
-        pool.unpin(leaf_page)
-    assert len(leaf_body.cells) == full_leaf.cell_count  # leaf left completely untouched
+        pool.unpin(root)
+
+
+    # The root split: it is now a 1-cell interior page whose two children
+    # are BOTH freshly allocated pages holding its former content.
+    assert root_body.page_type is PageType.INTERIOR_INDEX
+    assert len(root_body.cells) == 1
+    new_left, *_ = decode_interior_index_cell(root_body.cells[0])
+    assert new_left not in (root, leaf_page)
+    assert root_body.right_child not in (root, new_left)
+
+
+    # ...and the level below the root is now interior, not leaf: depth grew.
+    raw = pool.get_page(new_left)
+    try:
+        assert parse_page(raw).page_type is PageType.INTERIOR_INDEX
+    finally:
+        pool.unpin(new_left)
 
 
 
@@ -429,9 +443,17 @@ def test_delete_last_entry_collapses_root_to_an_empty_leaf(index) -> None:
 
 
 
-def test_delete_empty_non_root_leaf_frees_the_page(pager, pool) -> None:
-    """Emptying leaf_a frees it, and its divider ("a", 1) is not destroyed
-    along with the parent cell -- it descends into the sibling leaf_b.
+def test_delete_emptying_a_leaf_merges_and_shrinks_the_tree(pager, pool) -> None:
+    """Emptying leaf_a must not destroy its divider ("a", 1) along with the
+    parent cell -- the divider descends into sibling leaf_b instead. The
+    root is then an interior page with no cells left, which is a level the
+    tree no longer needs, so its only child is pulled up INTO the root page
+    (the root's page number is recorded in sqlite_schema and cannot move).
+
+
+    Net effect: three entries minus one leaves two, which fit a single
+    page, so the index is a one-page leaf root again -- and both former
+    leaves are back on the freelist.
     """
     idx, leaf_a, leaf_b, root = _build_two_leaf_index(pager, pool)
 
@@ -439,7 +461,6 @@ def test_delete_empty_non_root_leaf_frees_the_page(pager, pool) -> None:
     assert idx.delete(["A"], 0) is True
     assert list(idx.seek_eq(["A"])) == []
     assert list(idx.scan()) == [(["a"], 1), (["b"], 2)]
-    assert pager.allocate_page() == leaf_a  # freed page reused
 
 
     raw = pool.get_page(root)
@@ -447,8 +468,16 @@ def test_delete_empty_non_root_leaf_frees_the_page(pager, pool) -> None:
         root_body = parse_page(raw)
     finally:
         pool.unpin(root)
-    assert root_body.cells == []
-    assert root_body.right_child == leaf_b
+
+
+    assert idx.root == root                       # the root page number never moves
+    assert root_body.page_type is PageType.LEAF_INDEX
+    assert len(root_body.cells) == 2              # both surviving entries live here now
+    assert root_body.right_child == 0
+
+
+    # leaf_a was merged away and leaf_b was pulled up, so both are reusable.
+    assert {pager.allocate_page(), pager.allocate_page()} == {leaf_a, leaf_b}
 
 
 

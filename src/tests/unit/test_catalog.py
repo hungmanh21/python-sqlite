@@ -14,6 +14,8 @@ import subprocess
 
 import pytest
 
+import quilldb
+
 
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import decode_leaf_table_cell, encode_leaf_table_cell
@@ -581,49 +583,48 @@ def test_create_index_backfills_every_existing_row(tmp_path) -> None:
 
 
 
-def test_create_index_backfill_page_full_does_not_corrupt_the_freelist(tmp_path) -> None:
-    """A backfill big enough to overflow IndexBTree.insert()'s one-level-
-    split cap frees its root page on a best-effort basis (create_index()'s
-    own documented limitation -- any sibling pages the backfill had already
-    split off before failing are leaked, not freed, and PRAGMA
-    integrity_check would rightly flag those as "never used"; that's a
-    separate, accepted tradeoff, not what this test is about).
+def test_create_index_backfill_of_large_keys_survives_a_multi_level_split(tmp_path) -> None:
+    """This workload used to be the one-level-split ceiling: a backfill of
+    120 rows with 3000-byte keys overflowed IndexBTree.insert()'s cap, and
+    create_index() freed its root page on a best-effort basis and re-raised
+    PageFullError. With _promote_separator() the backfill completes instead,
+    building a multi-level index.
 
 
-    What this test isolates: the freed ROOT page specifically must not be
-    left as a stale, dirty buffer-pool cache entry. If it were, a later
-    flush_all() (what Connection.close() does) would overwrite the
-    freelist trunk header free_page() just wrote with that stale page,
-    corrupting the freelist -- silently, since nothing re-reads through our
-    own Catalog/Pager to notice.
+    It is kept because it is the exact shape that caught the zero-cell
+    interior page bug: 3000-byte keys leave only a handful of cells per
+    interior page, so its splits land on split_interior_cells' peel path,
+    where an empty half was previously possible. sqlite3 reads a zero-cell
+    interior page as "database disk image is malformed" -- a hard parse
+    error, not a soft integrity finding -- so only a real sqlite3 read
+    catches it.
     """
-    pager = Pager.create(tmp_path / "t.db")
-    pool = BufferPool(pager, capacity=64)
-    catalog = _catalog(pager, pool)
-    table = _create_table(catalog, "CREATE TABLE t (v TEXT)")
+    path = tmp_path / "t.db"
+    db = quilldb.connect(str(path))
+    db.execute("CREATE TABLE t (v TEXT)")
 
 
     random.seed(3)
-    for rowid in range(1, 121):
-        long_value = "".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=3000))
-        _insert_row(pager, pool, table, rowid, (long_value,))
+    values = ["".join(random.choices("abcdefghijklmnopqrstuvwxyz", k=3000)) for _ in range(120)]
+    for value in values:
+        db.execute("INSERT INTO t VALUES (?)", (value,))
 
 
-    root_page = pager.page_count + 1  # create_index()'s first allocate_page() call
-    with pytest.raises(PageFullError):
-        _create_index(catalog, "CREATE INDEX idx_v ON t (v)")
+    db.execute("CREATE INDEX idx_v ON t (v)")  # must not raise
 
 
-    assert root_page not in pool._cache
+    # Every row is still reachable through the index it just built.
+    probe = values[57]
+    assert len(db.execute("SELECT v FROM t WHERE v = ?", (probe,)).fetchall()) == 1
+    assert len(db.execute("SELECT v FROM t WHERE v >= ?", ("",)).fetchall()) == 120
+    db.close()
 
 
-    trunk_before_flush = bytes(pager.read_page(root_page))
-    pool.flush_all()
-    trunk_after_flush = bytes(pager.read_page(root_page))
-    assert trunk_before_flush == trunk_after_flush  # flush_all must not have touched it
-    pager.close()
-
-
+    result = subprocess.run(
+        ["sqlite3", str(path), "PRAGMA integrity_check;"],
+        capture_output=True, text=True,
+    )
+    assert result.stdout.strip() == "ok", result.stdout.strip() or result.stderr.strip()
 
 
 def test_create_index_on_missing_table_raises(tmp_path) -> None:

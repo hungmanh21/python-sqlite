@@ -46,7 +46,7 @@ from quilldb.btree.cells import (
     encode_leaf_index_cell,
     local_payload_size,
 )
-from quilldb.btree.split import split_cells
+from quilldb.btree.split import split_cells, split_interior_cells
 from quilldb.codec.record import Value, decode_record, encode_record
 from quilldb.constants import PAGE_SIZE, PageType
 from quilldb.errors import BTreeInvariantError, PageFullError
@@ -499,94 +499,200 @@ class IndexBTree:
 
 
     def _collapse_empty_leaf(self, path: list[tuple[int, int]]) -> None:
-        """Free a page that just lost its last cell, preserving the divider
-        that pointed at it.
+        """Entry point kept for readability at the call sites: the page at
+        path[-1] just lost its last cell."""
+        self._rebalance(path, len(path) - 1)
 
 
-        This is where an index b-tree parts company with btree.py's cascade
-        most sharply. There, an empty child is unlinked by deleting the
-        parent cell that pointed at it, and nothing is lost because a table
-        interior cell is pure routing. Here that cell is a live entry
-        (SS11.6), so deleting it would silently drop a row from the index.
+    def _rebalance(self, path: list[tuple[int, int]], level: int) -> None:
+        """Restore the page at `path[level]`, which currently has zero cells.
 
 
-        So the divider DESCENDS instead -- the classic b-tree merge. The
-        empty child is dropped and its divider is pushed into the sibling it
-        used to separate, becoming an ordinary leaf entry there: prepended
-        to the right sibling, or appended to the left one when the empty
-        page was the rightmost child. Pages go away; entries never do.
+        THE invariant: no page in the tree may have zero cells. Not a leaf,
+        not an interior page. Real sqlite3 rejects either as "database disk
+        image is malformed" -- a hard parse error, not a soft
+        integrity_check finding -- so there is no "wasteful but harmless"
+        option here, and leaving an empty page linked is not a scope cut
+        this format allows. The only exception is the root of an empty
+        index, which is legitimately a zero-cell leaf.
 
 
-        Scope cut, documented rather than silent: if the sibling has no room
-        for the descending divider, the empty page is simply LEFT LINKED,
-        empty. That wastes a page until something reuses it, and is
-        deliberately preferred to raising -- a half-applied DELETE has no
-        rollback to fall back on before week 5, so a delete that has already
-        removed a cell must not then fail.
+        Two moves restore it, and the choice between them is about the
+        PARENT, not this page:
+
+
+        * MERGE -- the divider descends into the sibling, and this page is
+          freed. Costs the parent one cell.
+        * ROTATE -- the divider descends into THIS page (which stops being
+          empty), and the parent's key is refilled by borrowing the
+          sibling's adjacent edge entry. Costs the parent nothing, and
+          needs no free space in the sibling.
+
+
+        So a merge is preferred while the parent can afford it, and a
+        rotation is forced when the parent is down to its last cell, since
+        a merge there would just move the zero-cell problem up a level.
+        Only the ROOT may legitimately run out of cells; it is then one
+        level the tree no longer needs, and its single child is pulled up
+        into it -- into ITS page, because sqlite_schema records the root's
+        page number and a moving root would invalidate the catalog.
+
+
+        An index divider is a live entry (SS11.6), which is what makes all
+        of this necessary: the table b-tree can drop the parent cell that
+        pointed at an emptied child and lose nothing, because its interior
+        cells are pure routing.
         """
-        page_id, _ = path[-1]
-        if page_id == self.root:
+        page_id, _ = path[level]
+
+
+        raw = self.pool.get_page(page_id)
+        try:
+            body = parse_page(raw)
+            is_leaf = body.page_type is PageType.LEAF_INDEX
+            only_child = body.right_child
+        finally:
+            self.pool.unpin(page_id)
+
+
+        if level == 0:
+            if not is_leaf and only_child:
+                self._pull_up_into_root(only_child)
             return
 
 
-        parent_page_id, child_slot = path[-2]
-
-
+        parent_page_id, child_slot = path[level - 1]
         parent_raw = self.pool.get_page(parent_page_id)
         parent_dirty = False
-        unlink_parent_too = False
         freed = False
+        shrink_parent = False
+
+
         try:
             parent = parse_page(parent_raw)
             children = self._children(parent)
 
 
             if not parent.cells:
-                # A single-child interior page: no divider to rescue, so the
-                # page itself is redundant once its only child is gone.
-                parent.right_child = 0
-                freed = True
-                if parent_page_id == self.root:
-                    parent_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX))
-                else:
-                    parent_raw[:] = serialize_page(parent)
-                    unlink_parent_too = True
-                parent_dirty = True
+                # Can only happen to a root already handled above.
+                return
+
+
+            if child_slot < len(parent.cells):
+                donor_slot, sibling_slot, prepend = child_slot, child_slot + 1, True
             else:
-                if child_slot < len(parent.cells):
-                    donor_slot, sibling_id, prepend = child_slot, children[child_slot + 1], True
+                donor_slot = len(parent.cells) - 1
+                sibling_slot, prepend = donor_slot, False
+            sibling_id = children[sibling_slot]
+
+
+            divider_child, div_len, div_local, div_overflow = decode_interior_index_cell(
+                parent.cells[donor_slot]
+            )
+            divider = (div_len, div_local, div_overflow)
+
+
+            merge_would_empty_parent = len(parent.cells) == 1
+            prefer_rotation = merge_would_empty_parent and parent_page_id != self.root
+
+
+            sibling_raw = self.pool.get_page(sibling_id)
+            sibling_dirty = False
+            merged = False
+            rotated = False
+            try:
+                sibling = parse_page(sibling_raw)
+
+
+                if is_leaf:
+                    descending = encode_leaf_index_cell(*divider)
+                    absorbed_right_child = sibling.right_child
                 else:
-                    donor_slot = len(parent.cells) - 1
-                    sibling_id, prepend = children[donor_slot], False
+                    # The emptied interior page still owns one subtree; the
+                    # descending divider is what re-attaches it beside the
+                    # sibling's own children.
+                    if prepend:
+                        descending = encode_interior_index_cell(only_child, *divider)
+                        absorbed_right_child = sibling.right_child
+                    else:
+                        descending = encode_interior_index_cell(sibling.right_child, *divider)
+                        absorbed_right_child = only_child
 
 
-                _, total_len, local, overflow_page = decode_interior_index_cell(parent.cells[donor_slot])
-                descending = encode_leaf_index_cell(total_len, local, overflow_page)
+                # A rotation may only borrow from a sibling that can spare
+                # an entry -- two or more. Borrowing the last one would
+                # merely move the emptiness sideways, and the drained
+                # sibling's own rebalance can rotate straight back, which
+                # ping-pongs forever. With this bound a rotation always
+                # terminates on the spot, and a sibling of one cell falls
+                # through to the merge, which always fits precisely
+                # because that sibling is nearly empty.
+                can_rotate = len(sibling.cells) >= 2
+                if sibling.fits(len(descending)) and not (prefer_rotation and can_rotate):
+                    sibling.insert_cell(0 if prepend else len(sibling.cells), descending)
+                    sibling.right_child = absorbed_right_child
+                    sibling_raw[:] = serialize_page(sibling)
+                    sibling_dirty = True
+                    merged = True
+                elif can_rotate:
+                    borrow_slot = 0 if prepend else len(sibling.cells) - 1
+                    borrow_child, b_len, b_local, b_overflow = decode_interior_index_cell(
+                        sibling.cells[borrow_slot]
+                    ) if not is_leaf else (0, *decode_leaf_index_cell(sibling.cells[borrow_slot]))
 
 
-                sibling_raw = self.pool.get_page(sibling_id)
-                sibling_dirty = False
-                merged = False
-                try:
-                    sibling = parse_page(sibling_raw)
-                    if sibling.page_type is PageType.LEAF_INDEX and sibling.fits(len(descending)):
-                        sibling.insert_cell(0 if prepend else len(sibling.cells), descending)
-                        sibling_raw[:] = serialize_page(sibling)
-                        sibling_dirty = True
-                        merged = True
-                finally:
-                    self.pool.unpin(sibling_id, dirty=sibling_dirty)
+                    if is_leaf:
+                        refilled = PageBody(
+                            PageType.LEAF_INDEX, cells=[encode_leaf_index_cell(*divider)]
+                        )
+                    elif prepend:
+                        # X keeps its own subtree on the left of the divider
+                        # and adopts the sibling's first child on the right.
+                        refilled = PageBody(
+                            PageType.INTERIOR_INDEX,
+                            cells=[encode_interior_index_cell(only_child, *divider)],
+                            right_child=borrow_child,
+                        )
+                    else:
+                        refilled = PageBody(
+                            PageType.INTERIOR_INDEX,
+                            cells=[encode_interior_index_cell(sibling.right_child, *divider)],
+                            right_child=only_child,
+                        )
 
 
-                if merged:
-                    parent.delete_cell(donor_slot)
-                    if not prepend:
-                        # The empty page WAS right_child; the sibling that
-                        # absorbed the divider takes over that role.
-                        parent.right_child = sibling_id
-                    parent_raw[:] = serialize_page(parent)
-                    parent_dirty = True
-                    freed = True
+                    sibling.delete_cell(borrow_slot)
+                    if not is_leaf and not prepend:
+                        sibling.right_child = borrow_child
+                    sibling_raw[:] = serialize_page(sibling)
+                    sibling_dirty = True
+
+
+                    with self.pool.pinned(page_id, dirty=True) as empty_raw:
+                        empty_raw[:] = serialize_page(refilled)
+
+
+                    # The borrowed entry becomes the new divider; the
+                    # parent cell's child pointer is untouched.
+                    parent.cells[donor_slot] = encode_interior_index_cell(
+                        divider_child, b_len, b_local, b_overflow
+                    )
+                    rotated = True
+            finally:
+                self.pool.unpin(sibling_id, dirty=sibling_dirty)
+
+
+            if merged:
+                parent.delete_cell(donor_slot)
+                if not prepend:
+                    parent.right_child = sibling_id
+                freed = True
+                shrink_parent = not parent.cells
+
+
+            if merged or rotated:
+                parent_raw[:] = serialize_page(parent)
+                parent_dirty = True
         finally:
             self.pool.unpin(parent_page_id, dirty=parent_dirty)
 
@@ -594,8 +700,29 @@ class IndexBTree:
         if freed:
             self.pool.discard(page_id)
             self.pager.free_page(page_id)
-        if unlink_parent_too:
-            self._collapse_empty_leaf(path[:-1])
+        if shrink_parent:
+            self._rebalance(path, level - 1)
+
+
+
+    def _pull_up_into_root(self, child_page_id: int) -> None:
+        """Replace the root's content with its only child's and free the
+        child. The root's PAGE NUMBER survives, because sqlite_schema
+        records it.
+        """
+        raw = self.pool.get_page(child_page_id)
+        try:
+            promoted = parse_page(raw)
+        finally:
+            self.pool.unpin(child_page_id)
+
+
+        with self.pool.pinned(self.root, dirty=True) as root_raw:
+            root_raw[:] = serialize_page(promoted)
+
+
+        self.pool.discard(child_page_id)
+        self.pager.free_page(child_page_id)
 
 
     # ---- descent, keyed by compare_keys instead of int comparison --------
@@ -857,11 +984,9 @@ class IndexBTree:
             )
 
 
-            if parent is not None and not parent[2].fits(len(placeholder_separator_cell)):
-                raise PageFullError(
-                    "cannot promote this index leaf's split into its parent: the parent is "
-                    "full and multi-level index splits aren't implemented yet"
-                )
+            # A full parent is no longer a dead end: the leaf's own write
+            # happens either way, and _promote_separator() below re-fetches
+            # the parent and splits it once this leaf's pins are released.
 
 
             if spills:
@@ -909,20 +1034,226 @@ class IndexBTree:
 
 
             _, parent_raw, parent_body, child_slot = parent
-            if is_rightmost:
-                parent_body.insert_cell(child_slot, new_left_cell)
-                parent_body.right_child = right_page_id
-            else:
-                _, old_len, old_local, old_overflow = decode_interior_index_cell(parent_body.cells[child_slot])
-                parent_body.cells[child_slot] = encode_interior_index_cell(
-                    right_page_id, old_len, old_local, old_overflow
-                )
-                parent_body.insert_cell(child_slot, new_left_cell)
+            parent_has_room = parent_body.fits(len(placeholder_separator_cell))
+            if parent_has_room:
+                if is_rightmost:
+                    parent_body.insert_cell(child_slot, new_left_cell)
+                    parent_body.right_child = right_page_id
+                else:
+                    _, old_len, old_local, old_overflow = decode_interior_index_cell(
+                        parent_body.cells[child_slot]
+                    )
+                    parent_body.cells[child_slot] = encode_interior_index_cell(
+                        right_page_id, old_len, old_local, old_overflow
+                    )
+                    parent_body.insert_cell(child_slot, new_left_cell)
 
 
-            parent_raw[:] = serialize_page(parent_body)
-            parent_dirty = True
+                parent_raw[:] = serialize_page(parent_body)
+                parent_dirty = True
+            # else: leave the parent untouched here -- _promote_separator()
+            # re-fetches and splits it after this leaf's pins are released.
         finally:
             self.pool.unpin(page_id, dirty=leaf_dirty)
             if parent is not None:
                 self.pool.unpin(parent[0], dirty=parent_dirty)
+
+
+        if parent is not None and not parent_has_room:
+            self._promote_separator(
+                path,
+                len(path) - 2,
+                page_id,
+                (promoted_len, promoted_local, promoted_overflow),
+                right_page_id,
+            )
+
+
+    def _promote_separator(
+        self,
+        path: list[tuple[int, int]],
+        level: int,
+        left_child: int,
+        separator: tuple[int, bytes, int],
+        right_child: int,
+    ) -> None:
+        """Insert `(left_child, separator, right_child)` into the interior
+        index page at `path[level]` -- splitting that page, cascading
+        further up `path`, and growing the root, as many times as it takes.
+
+
+        This is btree.py's `_promote_separator` for index pages, and it is
+        what lifts the old "one level of split, no cascade" ceiling: before
+        it existed, an index tree could go from 1 level to 2 (a leaf root
+        splitting into an interior root) and then never grow again, because
+        a full parent had nowhere to promote to. That capped an index at
+        `children_per_interior x entries_per_leaf` entries regardless of
+        how many rows the table held.
+
+
+        `separator` is carried as the promoted entry's raw
+        `(total_payload_len, local_payload, overflow_page)` rather than a
+        decoded key, because an index divider IS an entry (SS11.6): it has
+        to be re-encoded byte-for-byte into its new home, and its overflow
+        chain has to travel with it. Passing payloads as
+        `split_interior_cells`' KeyT means the consumed separator comes
+        back out in exactly the form the parent needs, with the chain still
+        owned by precisely one cell.
+
+
+        `path[0]` is always `(self.root, ...)`, so `level == 0` with no room
+        means the ROOT must split: `self.root` is rewritten IN PLACE as a
+        fresh 1-cell INTERIOR_INDEX page and BOTH halves of its former
+        content move to freshly allocated pages. The root keeps its page
+        number because sqlite_schema records it -- a moving root would
+        invalidate the catalog.
+
+
+        Args:
+            path: the root-to-leaf path `_find_leaf()`/`_split_leaf()` used.
+            level: index into `path`; everything below it is already
+                resolved by the caller or an earlier cascade step.
+            left_child: the page belonging immediately before `separator`.
+            separator: the promoted entry's (total_len, local, overflow).
+            right_child: the freshly allocated page holding the rest.
+        """
+        while True:
+            page_id, child_slot = path[level]
+            raw = self.pool.get_page(page_id)
+            dirty = False
+            try:
+                body = parse_page(raw)
+                new_left_cell = encode_interior_index_cell(left_child, *separator)
+
+
+                if body.fits(len(new_left_cell)):
+                    # Room here -- same insert-or-swap dance _split_leaf()
+                    # does for its own parent, one level up.
+                    if child_slot == len(body.cells):
+                        body.insert_cell(child_slot, new_left_cell)
+                        body.right_child = right_child
+                    else:
+                        _, old_len, old_local, old_overflow = decode_interior_index_cell(
+                            body.cells[child_slot]
+                        )
+                        body.cells[child_slot] = encode_interior_index_cell(
+                            right_child, old_len, old_local, old_overflow
+                        )
+                        body.insert_cell(child_slot, new_left_cell)
+                    raw[:] = serialize_page(body)
+                    dirty = True
+                    return
+
+
+                # No room: page_id splits too. Build the combined lists
+                # with the pending cell already placed, so this becomes one
+                # ordinary interior split rather than "split, then work out
+                # which half the new cell belongs in".
+                payloads: list[tuple[int, bytes, int]] = []
+                children: list[int] = []
+                for cell in body.cells:
+                    child, total_len, local, overflow_page = decode_interior_index_cell(cell)
+                    payloads.append((total_len, local, overflow_page))
+                    children.append(child)
+
+
+                if child_slot == len(body.cells):
+                    combined_cells = [*body.cells, new_left_cell]
+                    combined_keys = [*payloads, separator]
+                    combined_children = [*children, left_child]
+                    combined_right_child = right_child
+                else:
+                    old_payload = payloads[child_slot]
+                    rewritten_cell = encode_interior_index_cell(right_child, *old_payload)
+                    combined_cells = [
+                        *body.cells[:child_slot],
+                        new_left_cell,
+                        rewritten_cell,
+                        *body.cells[child_slot + 1 :],
+                    ]
+                    combined_keys = [
+                        *payloads[:child_slot],
+                        separator,
+                        old_payload,
+                        *payloads[child_slot + 1 :],
+                    ]
+                    combined_children = [
+                        *children[:child_slot],
+                        left_child,
+                        right_child,
+                        *children[child_slot + 1 :],
+                    ]
+                    combined_right_child = body.right_child
+
+
+                # See btree.py's _promote_separator for why this asks
+                # "does this promotion land at the tail of page_id's own
+                # cells", not "is page_id positionally rightmost".
+                is_own_rightmost = child_slot == len(body.cells)
+
+
+                (
+                    new_left_cells,
+                    new_left_right_child,
+                    new_right_cells,
+                    new_right_right_child,
+                    new_separator,
+                ) = split_interior_cells(
+                    combined_cells,
+                    combined_keys,
+                    combined_children,
+                    combined_right_child,
+                    is_own_rightmost,
+                )
+
+
+                new_right_page_id = self.pager.allocate_page()
+                with self.pool.pinned(new_right_page_id, dirty=True) as new_right_raw:
+                    new_right_raw[:] = serialize_page(
+                        PageBody(
+                            PageType.INTERIOR_INDEX,
+                            cells=new_right_cells,
+                            right_child=new_right_right_child,
+                        )
+                    )
+
+
+                if level == 0:
+                    # Root split: self.root keeps its page number and
+                    # becomes the new top; BOTH halves move to fresh pages.
+                    new_left_page_id = self.pager.allocate_page()
+                    with self.pool.pinned(new_left_page_id, dirty=True) as new_left_raw:
+                        new_left_raw[:] = serialize_page(
+                            PageBody(
+                                PageType.INTERIOR_INDEX,
+                                cells=new_left_cells,
+                                right_child=new_left_right_child,
+                            )
+                        )
+
+
+                    new_root = PageBody(
+                        PageType.INTERIOR_INDEX,
+                        cells=[encode_interior_index_cell(new_left_page_id, *new_separator)],
+                        right_child=new_right_page_id,
+                    )
+                    raw[:] = serialize_page(new_root)
+                    dirty = True
+                    return
+
+
+                # Non-root split: page_id keeps the left half in place.
+                raw[:] = serialize_page(
+                    PageBody(
+                        PageType.INTERIOR_INDEX,
+                        cells=new_left_cells,
+                        right_child=new_left_right_child,
+                    )
+                )
+                dirty = True
+            finally:
+                self.pool.unpin(page_id, dirty=dirty)
+
+
+            level -= 1
+            left_child, separator, right_child = page_id, new_separator, new_right_page_id

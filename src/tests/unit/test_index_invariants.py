@@ -37,18 +37,18 @@ def _build(path: pathlib.Path, rows: int, *, unique: bool = False) -> None:
 
 
 
-def _index_root(path: pathlib.Path) -> int:
+def _index_root(path: pathlib.Path, table: str = "t") -> int:
     db = quilldb.connect(str(path))
-    root = db.catalog.indexes_for("t")[0].root_page
+    root = db.catalog.indexes_for(table)[0].root_page
     db.close()
     return root
 
 
 
 
-def _validate(path: pathlib.Path) -> int:
+def _validate(path: pathlib.Path, table: str = "t") -> int:
     """Run the structural validator over the on-disk index; return entries."""
-    root = _index_root(path)
+    root = _index_root(path, table)
     pager = Pager.open(path)
     pool = BufferPool(pager, capacity=64)
     try:
@@ -391,4 +391,150 @@ def test_index_agrees_with_the_table_after_random_mutations(tmp_path, seed: int)
 
     assert via_index == via_scan == sorted(live)
     assert _validate(path) == len(live)
+    assert _integrity_check(path) == "ok"
+
+
+
+
+# =====================================================================
+# Multi-level index trees (the _promote_separator cascade)
+# =====================================================================
+
+
+
+
+def _build_wide_keys(path: pathlib.Path, rows: int, klen: int) -> list[str]:
+    """Long keys shrink the fanout, so a 3+ level tree arrives in hundreds
+    of rows instead of tens of thousands -- the same structure the 100k
+    email case builds, reachable in a fast test.
+    """
+    import random
+
+
+    rnd = random.Random(17)
+    values = ["".join(rnd.choices("abcdefghijklmnopqrstuvwxyz", k=klen)) for _ in range(rows)]
+    db = quilldb.connect(str(path))
+    db.execute("CREATE TABLE t (id INTEGER, v TEXT)")
+    db.execute("CREATE INDEX ix ON t (v)")
+    for i, value in enumerate(values, start=1):
+        db.execute("INSERT INTO t VALUES (?, ?)", (i, value))
+    db.close()
+    return values
+
+
+
+
+def _depth(path: pathlib.Path, table: str = "t") -> int:
+    from quilldb.btree.cells import decode_interior_index_cell
+    from quilldb.constants import PageType
+    from quilldb.storage.page import parse_page
+
+
+    root = _index_root(path, table)
+    pager = Pager.open(path)
+    pool = BufferPool(pager, capacity=64)
+    try:
+        depth, page_id = 0, root
+        while True:
+            current = page_id
+            raw = pool.get_page(current)
+            try:
+                body = parse_page(raw)
+                depth += 1
+                if body.page_type is PageType.LEAF_INDEX:
+                    return depth
+                page_id = decode_interior_index_cell(body.cells[0])[0]
+            finally:
+                pool.unpin(current)
+    finally:
+        pager.close()
+
+
+
+
+def test_a_long_key_index_actually_grows_past_two_levels(tmp_path) -> None:
+    """Guard on the guard: without a cascade this tree could not exceed
+    depth 2, and every test below would be testing nothing.
+    """
+    path = tmp_path / "wide.db"
+    _build_wide_keys(path, rows=600, klen=900)
+    assert _depth(path) >= 3
+
+
+
+
+def test_multi_level_index_is_valid_and_conserves_entries(tmp_path) -> None:
+    path = tmp_path / "wide.db"
+    values = _build_wide_keys(path, rows=600, klen=900)
+    assert _validate(path) == len(values)
+    assert _integrity_check(path) == "ok"
+
+
+
+
+def test_multi_level_index_finds_every_key(tmp_path) -> None:
+    path = tmp_path / "wide.db"
+    values = _build_wide_keys(path, rows=600, klen=900)
+    db = quilldb.connect(str(path))
+    missing = [v for v in values if len(db.execute("SELECT id FROM t WHERE v = ?", (v,)).fetchall()) != 1]
+    db.close()
+    assert missing == []
+
+
+
+
+@pytest.mark.parametrize("klen", [300, 900, 3000])
+def test_index_survives_key_sizes_that_thin_out_interior_fanout(tmp_path, klen: int) -> None:
+    """3000-byte keys spill to overflow and leave only a few cells per
+    interior page, which is what drives splits onto the peel path where an
+    empty half was once possible. A zero-cell interior page is a hard parse
+    error to sqlite3, so integrity_check is the check that matters here.
+    """
+    path = tmp_path / f"k{klen}.db"
+    values = _build_wide_keys(path, rows=400, klen=klen)
+    assert _validate(path) == len(values)
+    assert _integrity_check(path) == "ok"
+
+
+
+
+def test_deleting_from_a_multi_level_index_keeps_it_valid(tmp_path) -> None:
+    import random
+
+
+    path = tmp_path / "wide.db"
+    values = _build_wide_keys(path, rows=600, klen=900)
+    doomed = random.Random(5).sample(range(1, len(values) + 1), k=200)
+
+
+    db = quilldb.connect(str(path))
+    for rowid in doomed:
+        db.execute("DELETE FROM t WHERE id = ?", (rowid,))
+    db.close()
+
+
+    assert _validate(path) == len(values) - len(doomed)
+    assert _integrity_check(path) == "ok"
+
+
+
+
+@pytest.mark.slow
+def test_index_scales_to_a_hundred_thousand_rows(tmp_path) -> None:
+    """The old ceiling was ~12,000 rows: a full root had nowhere to promote
+    to, so the tree could never reach a third level.
+    """
+    path = tmp_path / "big.db"
+    db = quilldb.connect(str(path))
+    db.execute("CREATE TABLE users (id INTEGER, email TEXT)")
+    db.execute("CREATE INDEX ix_email ON users (email)")
+    for i in range(1, 100_001):
+        db.execute("INSERT INTO users VALUES (?, ?)", (i, f"u{i}@example.com"))
+    found = db.execute("SELECT id FROM users WHERE email = ?", ("u50000@example.com",)).fetchall()
+    db.close()
+
+
+    assert found == [(50000,)]
+    assert _depth(path, "users") >= 3
+    assert _validate(path, "users") == 100_000
     assert _integrity_check(path) == "ok"

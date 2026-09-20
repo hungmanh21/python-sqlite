@@ -30,8 +30,6 @@ from quilldb.btree.cells import decode_interior_table_cell, decode_leaf_table_ce
 from quilldb.storage.page import PageBody
 
 
-
-
 def binary_search_leaf(page: PageBody, key: int) -> int | None:
     """Find `key` among a LEAF_TABLE page's cells.
 

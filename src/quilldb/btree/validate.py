@@ -263,6 +263,11 @@ def validate_index_btree(
 
 
         if body.page_type is PageType.LEAF_INDEX:
+            if not body.cells and page_id != root:
+                raise BTreeInvariantError(
+                    f"page {page_id} is a non-root leaf with zero cells -- not a legal page; "
+                    f"sqlite3 reads the whole file as malformed on sight of one"
+                )
             for cell in body.cells:
                 key = key_of(PageType.LEAF_INDEX, cell)
                 if prev is not None and compare_keys(key, prev) <= 0:
@@ -270,6 +275,18 @@ def validate_index_btree(
                 check_bounds(page_id, key, low, high)
                 prev = key
             return 1, len(body.cells)
+
+
+        # An interior page with no cells has a right_child and nothing to
+        # route with. It is not a legal SQLite page: real sqlite3 rejects
+        # the entire file as "database disk image is malformed" rather than
+        # reporting it as an integrity_check finding, so nothing softer
+        # than this catches it.
+        if not body.cells:
+            raise BTreeInvariantError(
+                f"page {page_id} is an interior page with zero cells -- not a legal page; "
+                f"a split must never leave a half empty"
+            )
 
 
         # INTERIOR_INDEX: cells[i]'s child covers (bound, separator) -- open

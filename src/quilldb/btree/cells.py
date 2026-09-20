@@ -35,7 +35,6 @@ from quilldb.codec.varint import (
 from quilldb.constants import USABLE_SIZE, PageType
 from quilldb.errors import MalformedCellError
 
-
 # M -- the minimum payload that must always stay local, even when P is huge.
 # Independent of page type (unlike X), so it's a module constant, not a function.
 MIN_LOCAL_PAYLOAD = ((USABLE_SIZE - 12) * 32 // 255) - 23

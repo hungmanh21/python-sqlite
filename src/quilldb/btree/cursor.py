@@ -29,7 +29,6 @@ across a mutation to its tree. There's no insert yet for this to matter against;
 
 from typing import Self
 
-
 from quilldb.btree.cells import decode_leaf_table_cell
 from quilldb.btree.search import children_of_interior, interior_slot_for_key, leaf_slot_lower_bound
 from quilldb.constants import PageType
@@ -37,8 +36,6 @@ from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import read_overflow_chain
 from quilldb.storage.page import PageBody, parse_page
 from quilldb.storage.pager import Pager
-
-
 
 
 class TableCursor:
