@@ -613,11 +613,38 @@ class IndexBTree:
 3. **Maintenance is delete-then-insert on the old and new values.** For `UPDATE`, the old index entry
    is built from the row's *pre-update* values — so read the row before you overwrite it. Forgetting
    this leaves orphaned entries that make the index disagree with the table.
-4. **Index deletion must handle the interior-page case** (§11.6), or must avoid creating it. The
-   cheap correct option: never delete a divider — if the entry to remove lives on an interior page,
-   leave the divider in place as a routing-only fence and remove only the leaf copy. Document it,
-   because a divider that no longer corresponds to a live entry is legal but *is* something your
-   validator must not flag.
+4. **Index deletion must handle the interior-page case** (§11.6). There is no cheap way out of it,
+   and two tempting ones do not work:
+
+   * *"Leave the divider as a routing-only fence and remove only the leaf copy."* There **is** no leaf
+     copy. That is the B+tree convention from the table b-tree next door; in a true b-tree an entry
+     stored on an interior page is stored there and nowhere else, so this deletes nothing. The index
+     keeps N entries while the table drops to N−1, and real sqlite3 answers
+     `wrong # of entries in index`. A divider not backed by a live entry is **not** legal, and your
+     validator must flag it rather than tolerate it.
+   * *"Free the emptied page and drop the parent cell."* That is what the table b-tree does, and it
+     is exactly what you cannot copy: there the parent cell is pure routing and costs nothing to
+     discard, here it is a row.
+
+   So the divider has to go **somewhere**, and there are only two somewheres — which is the whole of
+   index deletion:
+
+   * **MERGE** — the divider descends into the sibling and the emptied page is freed. Costs the
+     parent one cell.
+   * **ROTATE** — the divider descends into the emptied page itself, and the parent's slot is refilled
+     by borrowing the sibling's adjacent edge entry. Costs the parent nothing and needs no free space.
+
+   Prefer MERGE while the parent can spare a cell; ROTATE is *forced* when the parent is down to its
+   last one, because merging there just hands the empty-page problem up a level. Only rotate from a
+   sibling holding **two or more** cells: borrowing its last one moves the emptiness sideways and the
+   drained sibling can rotate straight back, forever.
+
+   The invariant driving all of it: **no page may ever hold zero cells** — not a leaf, not an interior
+   page. sqlite3 rejects either as `database disk image is malformed`, a hard parse error rather than
+   an `integrity_check` finding, so "wasteful but harmless" is not an option the format offers. The
+   one exemption is an empty index's root, which is legitimately a zero-cell leaf. A root left without
+   cells is a level the tree no longer needs: pull its only child up **into the root's own page**,
+   since `sqlite_schema` records that page number.
 
 
 **The test that matters more than all the others:** a property test asserting that a full index scan
