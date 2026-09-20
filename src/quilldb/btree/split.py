@@ -175,23 +175,37 @@ def split_interior_cells[KeyT](
             < m) or right_cells (indices > m). right_right_child is
             always the page's original right_child -- the split never
             touches the rightmost subtree, only which page owns the
-            pointer to it. When is_rightmost is True, m == len(cells) - 1
-            (right_cells comes out empty). When is_rightmost is False, m
+            pointer to it. When is_rightmost is True, m == len(cells) - 2
+            (right_cells keeps exactly one cell). When is_rightmost is False, m
             is chosen so cells[:m] and cells[m + 1:] end up as close in
             serialized footprint as possible -- see
             _consume_closest_to_half_by_bytes. Ties favor a larger m.
+            m is always in [1, len(cells) - 2], so both halves keep at
+            least one cell: a zero-cell interior page is not a legal
+            SQLite page and real sqlite3 reads the file as malformed.
     Raises:
-        ValueError: fewer than 2 cells -- there's nothing to usefully
-            split (mirrors split_cells).
+        ValueError: fewer than 3 cells -- consuming one would leave a
+            half empty (split_cells needs only 2, because a leaf split
+            consumes nothing).
     """
-    if len(cells) < 2:
-        raise ValueError("not enough cells to split")
+    if len(cells) < 3:
+        raise ValueError("not enough cells to split an interior page")
 
 
+    # m is clamped to [1, len(cells) - 2] so NEITHER half comes out empty.
+    # An interior page with zero cells is not a legal SQLite page -- it has
+    # a right_child and nothing to route with -- and real sqlite3 rejects
+    # the whole file as "database disk image is malformed" on sight of one.
+    # Consuming one cell out of N leaves N-1 to share, so N must be >= 3
+    # for both halves to get one; that is what the guard above enforces.
     if is_rightmost:
-        m = len(cells) - 1
+        # Peel from the tail, as the leaf split does, but stop one short of
+        # emptying the right half: it keeps exactly one cell. Left still
+        # retains len(cells) - 2, so the ~100% occupancy this optimisation
+        # exists for on append-heavy inserts is preserved.
+        m = len(cells) - 2
     else:
-        m = _consume_closest_to_half_by_bytes(cells)
+        m = min(max(_consume_closest_to_half_by_bytes(cells), 1), len(cells) - 2)
 
 
     separator = keys[m]

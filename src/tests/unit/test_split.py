@@ -97,6 +97,13 @@ def test_rightmost_split_of_the_minimum_two_cells() -> None:
 _KEY_LISTS = st.lists(st.integers(min_value=0, max_value=10_000), min_size=2, max_size=50, unique=True)
 
 
+# An INTERIOR split consumes a cell, so it needs one more than a leaf split
+# to leave both halves non-empty -- see split_interior_cells' own guard.
+_INTERIOR_KEY_LISTS = st.lists(
+    st.integers(min_value=0, max_value=10_000), min_size=3, max_size=50, unique=True
+)
+
+
 
 
 @given(_KEY_LISTS, st.booleans())
@@ -196,49 +203,63 @@ def test_interior_split_near_the_middle_for_an_odd_cell_count() -> None:
 
 
 
-def test_interior_split_minimum_splittable_size_is_two_cells() -> None:
-    cells, keys, children = _interior_cells_and_keys([1, 2])
+def test_interior_split_minimum_splittable_size_is_three_cells() -> None:
+    """Three, not two. One cell is consumed and the two that remain go one
+    to each half -- because an interior page with zero cells is not a legal
+    SQLite page (sqlite3 reads the whole file as malformed on sight of one),
+    so no split may produce an empty half.
+    """
+    cells, keys, children = _interior_cells_and_keys([1, 2, 3])
     left, _, right, right_right_child, _ = split_interior_cells(
         cells, keys, children, _RIGHT_CHILD, is_rightmost=False
     )
-    # Only 2 cells means exactly one is consumed -- whichever half keeps
-    # the other ends up with 1 cell, the other with 0.
-    assert len(left) + len(right) == 1
+    assert len(left) == 1
+    assert len(right) == 1
     assert right_right_child == _RIGHT_CHILD
 
 
 
 
-def test_interior_split_fewer_than_two_cells_raises() -> None:
-    with pytest.raises(ValueError):
-        split_interior_cells([b"only"], [1], [100], _RIGHT_CHILD, is_rightmost=False)
-    with pytest.raises(ValueError):
-        split_interior_cells([], [], [], _RIGHT_CHILD, is_rightmost=False)
+def test_interior_split_fewer_than_three_cells_raises() -> None:
+    """Two cells is one too few: consuming one leaves a single cell for two
+    halves, and whichever half misses out would be an illegal zero-cell
+    interior page. Refuse rather than emit one.
+    """
+    for keys in ([1, 2], [1], []):
+        cells, keys_list, children = _interior_cells_and_keys(keys)
+        with pytest.raises(ValueError):
+            split_interior_cells(cells, keys_list, children, _RIGHT_CHILD, is_rightmost=False)
+        with pytest.raises(ValueError):
+            split_interior_cells(cells, keys_list, children, _RIGHT_CHILD, is_rightmost=True)
 
 
 
 
-def test_interior_rightmost_split_promotes_only_the_last_cell() -> None:
+def test_interior_rightmost_split_peels_the_tail_but_leaves_right_one_cell() -> None:
+    """The append-split optimisation still peels from the tail and still
+    leaves left near-full, but it stops one cell short of emptying the
+    right half, which would be an illegal page.
+    """
     cells, keys, children = _interior_cells_and_keys(list(range(1, 11)))  # 10 cells
     left, left_right_child, right, right_right_child, separator = split_interior_cells(
         cells, keys, children, _RIGHT_CHILD, is_rightmost=True
     )
-    assert left == cells[:9]
-    assert right == []
-    assert separator == keys[9]
-    assert left_right_child == children[9]
+    assert left == cells[:8]
+    assert right == [cells[9]]
+    assert separator == keys[8]
+    assert left_right_child == children[8]
     assert right_right_child == _RIGHT_CHILD
 
 
 
 
-def test_interior_rightmost_split_of_the_minimum_two_cells() -> None:
-    cells, keys, children = _interior_cells_and_keys([1, 2])
+def test_interior_rightmost_split_of_the_minimum_three_cells() -> None:
+    cells, keys, children = _interior_cells_and_keys([1, 2, 3])
     left, left_right_child, right, right_right_child, separator = split_interior_cells(
         cells, keys, children, _RIGHT_CHILD, is_rightmost=True
     )
     assert left == cells[:1]
-    assert right == []
+    assert right == [cells[2]]
     assert separator == keys[1]
     assert left_right_child == children[1]
     assert right_right_child == _RIGHT_CHILD
@@ -246,7 +267,7 @@ def test_interior_rightmost_split_of_the_minimum_two_cells() -> None:
 
 
 
-@given(_KEY_LISTS, st.booleans())
+@given(_INTERIOR_KEY_LISTS, st.booleans())
 def test_interior_exactly_one_cell_is_consumed(keys: list[int], is_rightmost: bool) -> None:
     """left + [the consumed cell] + right must reconstruct `cells` exactly --
     nothing else added, dropped, or reordered.
@@ -264,7 +285,7 @@ def test_interior_exactly_one_cell_is_consumed(keys: list[int], is_rightmost: bo
 
 
 
-@given(_KEY_LISTS, st.booleans())
+@given(_INTERIOR_KEY_LISTS, st.booleans())
 def test_interior_right_right_child_is_always_the_original(keys: list[int], is_rightmost: bool) -> None:
     cells, keys, children = _interior_cells_and_keys(sorted(keys))
     *_, right_right_child, _ = split_interior_cells(cells, keys, children, _RIGHT_CHILD, is_rightmost)
@@ -273,16 +294,30 @@ def test_interior_right_right_child_is_always_the_original(keys: list[int], is_r
 
 
 
-@given(_KEY_LISTS)
-def test_interior_rightmost_mode_always_leaves_right_cells_empty(keys: list[int]) -> None:
+@given(_INTERIOR_KEY_LISTS)
+def test_interior_rightmost_mode_leaves_right_exactly_one_cell(keys: list[int]) -> None:
     cells, keys, children = _interior_cells_and_keys(sorted(keys))
     _, _, right, _, _ = split_interior_cells(cells, keys, children, _RIGHT_CHILD, is_rightmost=True)
-    assert right == []
+    assert right == [cells[-1]]
 
 
 
 
-@given(_KEY_LISTS, st.booleans())
+@given(_INTERIOR_KEY_LISTS, st.booleans())
+def test_interior_split_never_produces_an_empty_half(keys: list[int], is_rightmost: bool) -> None:
+    """The invariant behind the three-cell minimum: a zero-cell interior
+    page is not a legal SQLite page, so neither half may ever come out
+    empty, in either mode, at any size.
+    """
+    cells, keys, children = _interior_cells_and_keys(sorted(keys))
+    left, _, right, _, _ = split_interior_cells(cells, keys, children, _RIGHT_CHILD, is_rightmost)
+    assert left
+    assert right
+
+
+
+
+@given(_INTERIOR_KEY_LISTS, st.booleans())
 def test_interior_split_does_not_mutate_its_inputs(keys: list[int], is_rightmost: bool) -> None:
     cells, keys, children = _interior_cells_and_keys(sorted(keys))
     cells_before, keys_before, children_before = list(cells), list(keys), list(children)
