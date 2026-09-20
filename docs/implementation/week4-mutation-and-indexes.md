@@ -12,8 +12,9 @@
 
 > **Read first:** [chapter 10](../theory/btree/10-deletion-and-space-reuse.md) before the delete
 > session, [chapter 11](../theory/btree/11-index-b-trees.md) before the index sessions, and
-> [chapter 12](../theory/plan/12-the-query-planner.md) before the planner. Each is ~40 minutes and
-> each answers a design question this spec assumes you've already settled.
+> [chapter 12](../theory/plan/12-the-query-planner.md) before the planner. Chapters 10–11 are ~40
+> minutes each; the expanded cost-based planner chapter is ~60 minutes. Each answers a design question
+> this spec assumes you've already settled.
 
 
 Week 3 gave you a database you could read from. This week makes it a database you can *keep data in*
@@ -44,7 +45,9 @@ DELETE FROM users WHERE age < 18;
 UPDATE users SET age = age + 1 WHERE id = 4;
 CREATE INDEX idx_email ON users (email);
 CREATE UNIQUE INDEX idx_ssn ON users (ssn);
+ANALYZE;
 EXPLAIN SELECT * FROM users WHERE email = ?;
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = ?;
 ```
 
 
@@ -54,7 +57,9 @@ Supported:
 - `DELETE FROM t [WHERE ...]` — including no `WHERE`, meaning all rows
 - `UPDATE t SET col = expr [, col = expr]* [WHERE ...]`
 - `CREATE [UNIQUE] INDEX name ON table (col [, col]*)`
-- `EXPLAIN <select>` returning the operator tree as text
+- `ANALYZE [table-or-index]` collecting table and index-prefix statistics into `quill_stat1`
+- `EXPLAIN <select>` returning estimated rows and costs without executing
+- `EXPLAIN ANALYZE <select>` executing once and adding actual rows and page reads
 - indexes are maintained automatically by `INSERT`, `UPDATE`, and `DELETE`
 
 
@@ -92,13 +97,16 @@ src/quilldb/
 │   ├── btree.py         + delete()
 │   └── index.py         NEW — encode_index_key, IndexBTree
 ├── catalog/
-│   └── catalog.py       + create_index(), indexes_for()
+│   ├── catalog.py       + create_index(), indexes_for()
+│   └── stats.py         NEW — ANALYZE, TableStats, IndexStats, quill_stat1
 ├── plan/                NEW
-│   ├── planner.py       AccessPath, choose_access_path
+│   ├── planner.py       enumerate_access_paths(), choose_access_path()
+│   ├── cardinality.py   estimate rows from prefix statistics
+│   ├── cost.py          page-oriented cost model
 │   └── explain.py       format_plan()
 ├── sql/
-│   ├── ast.py           + Delete, Update, CreateIndex, Explain
-│   └── parser.py        + the three statements
+│   ├── ast.py           + Delete, Update, CreateIndex, Analyze, Explain
+│   └── parser.py        + the new statements
 ├── exec/
 │   └── operators.py     + IndexScan, DeleteOp, UpdateOp
 └── errors.py            + UniqueViolationError
@@ -486,9 +494,11 @@ Indexes live in `sqlite_schema` alongside tables, using the same five columns:
 
 
     def indexes_for(self, table: str) -> list[IndexSchema]:
-        """Every index on `table`, in creation order. Deterministic order
-        matters: the planner breaks ties by it, and EXPLAIN output is asserted
-        in tests.
+        """Every index on `table`, in creation order.
+
+
+        Candidate enumeration is deterministic. Cost is the primary choice;
+        index name is only the final tie-breaker for exactly equal costs.
         """
 ```
 
@@ -505,20 +515,126 @@ Two details worth getting right because they're cheap and they're what a reader 
 ---
 
 
-## 25. `plan/planner.py` — NEW
+## 25. `catalog/stats.py` and the cost-based planner — NEW
 
 
-### The stub
+### `ANALYZE`: small statistics with a large effect
+
+
+Create `quill_stat1(tbl, idx, stat)` lazily on the first `ANALYZE`. Its encoding deliberately mirrors
+SQLite's `sqlite_stat1`:
+
+
+```text
+tbl  idx  stat
+t    abc  "10000 100 10 2"
+```
+
+
+For the three-column index `(a,b,c)`, this means 10,000 index rows, about 100 rows per distinct `a`,
+10 per distinct `(a,b)`, and 2 per distinct `(a,b,c)`. An entry with `idx IS NULL` stores only the
+table row count. Statistics are estimates and may become stale after writes; stale statistics may
+produce a slower plan but must never change query results.
+
+
+Compute every prefix count in one ordered index scan. Keep the previous key, count how many distinct
+prefixes of length `1..K` occur, then store `ceil(total_rows / distinct_prefixes[n])` for each prefix.
+That is O(N×K), uses O(K) counters, and does not need one hash set per column prefix.
 
 
 ```python
+@dataclass(frozen=True)
+class TableStats:
+    row_count: int
+    page_count: int
+    height: int          # root→leaf pages read for one rowid lookup, leaf INCLUSIVE
+
+
+
+
+@dataclass(frozen=True)
+class IndexStats:
+    row_count: int
+    rows_per_prefix: tuple[int, ...]
+    leaf_pages: int
+    height: int          # same convention: root→leaf inclusive
+
+
+
+
+def analyze(database: Database, target: str | None = None) -> None:
+    """Scan committed tables/indexes and replace their quill_stat1 rows.
+
+
+    Runs inside one ordinary transaction: DELETE the target's existing rows,
+    INSERT the new ones, commit. The undo journal already makes that atomic, so
+    there is NO shadow table and no root-page swap — a reader sees either the
+    old complete statistics or the new complete statistics. That's what the
+    week-5 `analyze_refresh` crash scenario asserts.
+
+
+    After committing, bump the existing schema cookie so cached plans in every
+    connection are invalidated. Reusing the schema cookie over-invalidates
+    slightly — connections also re-read the schema they didn't need to — but it
+    avoids inventing a second cross-connection versioning protocol for a table
+    that changes only when someone types ANALYZE.
+    """
+```
+
+
+`height` is on **both** stats objects, and it is the single most load-bearing number in the cost model
+below: `IndexStats.height` is paid once per seek, but `TableStats.height` is paid *per fetched row* on a
+non-covering index, so it is what makes a low-selectivity index lose. Define it once — pages read from
+root to leaf **inclusive**, so a two-level tree has `height == 2` — and use that convention in the
+`estimated_leaf_pages` arithmetic too, where it prevents double-counting the first leaf.
+
+
+If statistics are absent, malformed, or stale, planning still works with documented defaults:
+
+
+```python
+DEFAULT_TABLE_ROWS = 1_000
+DEFAULT_EQUALITY_SELECTIVITY = 0.10
+DEFAULT_RANGE_SELECTIVITY = 0.25
+DEFAULT_RESIDUAL_SELECTIVITY = 0.50
+MIN_ESTIMATED_ROWS = 1
+```
+
+
+These constants are deliberately centralized and test-visible. Never reject a query merely because
+`ANALYZE` has not run.
+
+
+`startup` matters for exactly two things and is worth keeping honest about both: it's what makes a
+pipeline breaker like `Sort` expensive under `LIMIT` (§18.4 — a top-K heap has a low startup, a full sort
+does not), and it's the tie-breaker in `choose_access_path` when two plans have equal `total`. For a
+`SeqScan` and an `IndexScan` — neither of which blocks — `startup` is just the cost of getting positioned:
+0 for a scan, the seek cost for an index.
+
+
+### Candidate generation is separate from choosing
+
+
+```python
+@dataclass(frozen=True)
+class PlanCost:
+    startup: float      # cost paid before this operator can emit its FIRST row
+    total: float        # cost to run it to completion
+
+
+
+
 @dataclass(frozen=True)
 class AccessPath:
     kind: Literal["seq_scan", "index_scan"]
     index: IndexSchema | None
     seek_terms: list[Predicate]     # the index-prefix terms this path will seek on
     residual: list[Predicate]       # everything else — becomes a Filter above
-    est_rows: int
+    rows_fetched: int               # rows read from the tree, BEFORE residual filtering
+    est_rows: int                   # rows emitted, AFTER residual filtering
+    cost: PlanCost
+    covering: bool
+    output_order: tuple[str, ...]    # index columns in physical ascending order
 
 
 
@@ -540,9 +656,10 @@ def is_sargable(pred: Predicate, column: str) -> bool:
 
 
 
-def choose_access_path(table: TableSchema, indexes: list[IndexSchema],
-                       predicates: list[Predicate]) -> AccessPath:
-    """Pick how to read `table`.
+def enumerate_access_paths(table: TableSchema, indexes: list[IndexSchema],
+                           predicates: list[Predicate], required_columns: set[str],
+                           stats: StatisticsCatalog) -> list[AccessPath]:
+    """Return SeqScan plus every legal normal IndexScan candidate.
 
 
     For each index, walk its columns LEFT TO RIGHT (chapter 12 §12.3):
@@ -550,15 +667,123 @@ def choose_access_path(table: TableSchema, indexes: list[IndexSchema],
       - at the first column with only inequalities, consume up to two of them
         and STOP;
       - at the first column with no usable term, STOP (no gaps).
-    Everything unconsumed goes to `residual`.
-
-
-    Score by number of columns consumed; longest wins. Break ties by index
-    NAME so EXPLAIN output is deterministic and tests don't flake. If nothing
-    consumes at least one column, return a seq_scan with all predicates as
-    residual.
+    Everything unconsumed goes to `residual`. Index legality is a rule; it does
+    not mean the index wins. Always emit SeqScan because a low-selectivity index
+    can cost more than reading the table once.
     """
+
+
+
+
+def choose_access_path(candidates: list[AccessPath]) -> AccessPath:
+    """Choose minimum total cost; then startup cost; then stable plan identity."""
 ```
+
+
+This separation is load-bearing. **Rules generate legal candidates; estimates and costs choose among
+them.** A planner that returns the first legal index is still rule-based even if it prints a made-up
+`cost` field.
+
+
+### Cardinality estimation
+
+
+Use prefix statistics when they match the seek terms:
+
+
+```text
+index (a,b,c), stat "10000 100 10 2"
+a=?                 → rows_fetched ≈ 100
+a=? AND b=?         → rows_fetched ≈ 10
+a=? AND b=? AND c=? → rows_fetched ≈ 2
+```
+
+
+For `IN`, multiply by the number of distinct constants and cap at the input size. For a range, apply
+the documented range fraction to the rows remaining after equality-prefix terms. Residual predicates
+may lower `est_rows` seen by parent operators, but they do **not** lower `rows_fetched`: the scan still
+reads those candidates before filtering them.
+
+
+SQLite's `stat1` averages cannot describe skew or correlation. Preserve that limitation rather than
+pretending the estimate is exact; chapter 12 includes the failure case.
+
+
+### A small, explicit cost model
+
+
+Keep every constant in `plan/cost.py`, with cost measured in approximate page-read equivalents:
+
+
+```python
+CPU_PER_ROW = 0.01
+SEQ_PAGE_COST = 1.0          # a page reached by walking forward
+RANDOM_PAGE_COST = 4.0       # a page reached by a fresh root-to-leaf descent
+
+
+seq_total = SEQ_PAGE_COST * table_pages + CPU_PER_ROW * table_rows
+
+
+rows_per_leaf = max(1, index_rows / index_leaf_pages)
+rows_fetched = max(MIN_ESTIMATED_ROWS, rows_fetched)          # never 0 — see below
+estimated_leaf_pages = ceil(rows_fetched / rows_per_leaf)
+
+
+# height is root→leaf INCLUSIVE, so the descent already paid for one leaf;
+# only the leaves after the first are additional, and they're sequential.
+seek_cost = (
+    RANDOM_PAGE_COST * index_height
+    + SEQ_PAGE_COST * max(0, estimated_leaf_pages - 1)
+)
+table_lookup_cost = RANDOM_PAGE_COST * table_height           # PER FETCHED ROW
+
+
+index_total = (
+    seek_cost
+    + (0 if covering else rows_fetched * table_lookup_cost)
+    + CPU_PER_ROW * rows_fetched
+)
+```
+
+
+Three things in there are deliberate and each is a place the model would otherwise lie:
+
+
+- **`RANDOM_PAGE_COST > SEQ_PAGE_COST`, or the constant is decorative.** If a random seek and a
+  sequential step both cost 1.0, the model cannot express the one distinction it exists to express, and
+  calling it "page-oriented" overstates it. 4.0 is the conventional starting ratio (it's PostgreSQL's
+  default `random_page_cost`); the exact value is yours to calibrate, but it must be greater than 1.
+- **`height` is leaf-inclusive, so don't charge for the first leaf twice.** Adding
+  `index_height + estimated_leaf_pages` counts the leaf you already descended to. It's a rounding-level
+  error on a big range scan and a ~30% error on the single-row lookup that is your headline benchmark.
+- **Clamp `rows_fetched` to at least 1.** `MIN_ESTIMATED_ROWS` is not only about `est_rows`: if
+  `rows_fetched` reaches 0, `estimated_leaf_pages` is 0 and an index that matches nothing looks *free*,
+  which makes it beat every real plan. A zero-row estimate is a prediction, not a promise, and the plan
+  still has to descend the tree to discover it.
+
+
+Worked, for the README benchmark — 100k rows, `table_pages=2417`, `table_height=3`, a unique index on
+`email` with `index_height=3` and ~200 rows per leaf:
+
+
+```text
+seq_total   = 1.0 × 2417 + 0.01 × 100000        = 3417.00
+index_total = 4.0 × 3 + 1.0 × max(0, 1-1)                      # seek  = 12.00
+            + 1 × (4.0 × 3)                                    # fetch = 12.00
+            + 0.01 × 1                                         # cpu   =  0.01
+            =                                                    24.01
+```
+
+
+So `EXPLAIN` prints `cost=24.01` against a scan's `3417.00` — a 142× predicted advantage, next to a
+*measured* ~4 pages versus ~2,417. The estimate and the measurement are different quantities and are
+allowed to disagree; that's exactly why `EXPLAIN` and `EXPLAIN ANALYZE` print them separately.
+
+
+This intentionally captures the important facts, not every device detail: a seek pays tree height;
+matching entries occupy leaf pages; a non-covering index pays a second table lookup per candidate;
+and a covering index avoids that lookup. Calibrate constants with page counters, but never tune them
+to make one fixture pass.
 
 
 ### The invariant that makes this safe
@@ -576,39 +801,83 @@ already selective enough to hide it — which your small fixtures probably are.
 
 
 ```python
-@pytest.mark.parametrize("sql,expected_kind,expected_seek", [
-    ("WHERE a = 1",                   "index_scan", ["a"]),
-    ("WHERE a = 1 AND b = 2",         "index_scan", ["a", "b"]),
-    ("WHERE a = 1 AND b = 2 AND c = 3", "index_scan", ["a", "b", "c"]),
-    ("WHERE a IN (1,2,3) AND b = 2",  "index_scan", ["a", "b"]),
-    ("WHERE a IS NULL AND b = 2",     "index_scan", ["a", "b"]),
-    ("WHERE a = 1 AND b > 2 AND b < 5", "index_scan", ["a", "b"]),
-    ("WHERE a = 1 AND b > 2 AND c = 3", "index_scan", ["a", "b"]),   # c dropped: right of an inequality
-    ("WHERE a = 1 AND c = 3",         "index_scan", ["a"]),          # c dropped: gap at b
-    ("WHERE c = 3",                   "seq_scan",   []),             # no usable prefix
-    ("WHERE b = 2",                   "seq_scan",   []),             # no skip-scan in quilldb
-    ("WHERE lower(a) = 'x'",          "seq_scan",   []),             # not sargable
-    ("WHERE a = 1 OR b = 2",          "seq_scan",   []),             # OR
+# expected_seek is the seek prefix an IndexScan candidate must have.
+# expected_seek == [] means NO IndexScan candidate may be generated at all.
+@pytest.mark.parametrize("sql,expected_seek", [
+    ("WHERE a = 1",                     ["a"]),
+    ("WHERE a = 1 AND b = 2",           ["a", "b"]),
+    ("WHERE a = 1 AND b = 2 AND c = 3", ["a", "b", "c"]),
+    ("WHERE a IN (1,2,3) AND b = 2",    ["a", "b"]),
+    ("WHERE a IS NULL AND b = 2",       ["a", "b"]),
+    ("WHERE a = 1 AND b > 2 AND b < 5", ["a", "b"]),
+    ("WHERE a = 1 AND b > 2 AND c = 3", ["a", "b"]),   # c dropped: right of an inequality
+    ("WHERE a = 1 AND c = 3",           ["a"]),        # c dropped: gap at b
+    ("WHERE c = 3",                     []),          # no usable prefix
+    ("WHERE b = 2",                     []),          # no skip-scan in quilldb
+    ("WHERE lower(a) = 'x'",            []),          # not sargable
+    ("WHERE a = 1 OR b = 2",            []),          # OR
 ])
-def test_leading_column_rule(index_abc, sql, expected_kind, expected_seek):
-    path = plan_for(index_abc, sql)
-    assert path.kind == expected_kind
-    assert [t.column for t in path.seek_terms] == expected_seek
+def test_leading_column_rule_controls_candidates(index_abc, sql, expected_seek):
+    candidates = candidates_for(index_abc, sql)
+    index_paths = [p for p in candidates if p.kind == "index_scan"]
+
+
+    # SeqScan is ALWAYS a candidate, in every one of these 12 cases.
+    assert any(p.kind == "seq_scan" for p in candidates)
+
+
+    if not expected_seek:
+        # The four ineligible cases. This is the assertion that matters: it is
+        # not enough that SeqScan exists, no index seek may be OFFERED.
+        assert index_paths == [], f"illegal seek generated for {sql}"
+    else:
+        assert [[t.column for t in p.seek_terms] for p in index_paths] == [expected_seek]
 
 
 
 
 def test_every_predicate_is_either_seeked_or_residual(index_abc):
     preds = parse_where("WHERE a = 1 AND c = 3 AND d = 9")
-    path = choose_access_path(TABLE, [index_abc], preds)
-    assert set(path.seek_terms) | set(path.residual) == set(preds)
-    assert not (set(path.seek_terms) & set(path.residual))
+    for path in enumerate_access_paths(TABLE, [index_abc], preds, REQUIRED, STATS):
+        assert set(path.seek_terms) | set(path.residual) == set(preds)
+        assert not (set(path.seek_terms) & set(path.residual))
+
+
+
+
+def test_statistics_choose_the_selective_index(db):
+    # x has 2 distinct values (~5000 rows/value); y has 1000 (~10/value).
+    db.execute("ANALYZE")
+    plan = db.execute("EXPLAIN SELECT * FROM t WHERE x=1 AND y=5").text
+    assert "y_idx" in plan
+
+
+
+
+def test_changing_only_statistics_flips_the_plan(db):
+    original = explain(db, "SELECT * FROM t WHERE x=1 AND y=5")
+    replace_stat(db, "x_idx", "10000 1")
+    replace_stat(db, "y_idx", "10000 9000")
+    invalidate_plans(db)
+    changed = explain(db, "SELECT * FROM t WHERE x=1 AND y=5")
+    assert index_used(original) != index_used(changed)
+
+
+
+
+def test_low_selectivity_index_can_lose_to_seq_scan(db):
+    db.execute("ANALYZE")
+    assert plan_kind(db, "SELECT * FROM t WHERE boolean_col=1") == "seq_scan"
 ```
 
 
-That parametrized table is lifted directly from real `EXPLAIN QUERY PLAN` output against SQLite 3.37
-(chapter 12 §12.3), so it isn't a guess about what the rules should be — it's what they *are*, minus
-the skip-scan rows, which quilldb deliberately doesn't implement.
+The parametrized table is lifted directly from real `EXPLAIN QUERY PLAN` output against SQLite 3.37
+(chapter 12 §12.3). Note the `if not expected_seek` branch: an earlier version of this test asserted only
+that a *matching* candidate existed, which the four ineligible rows pass **trivially** — SeqScan is always
+emitted, so `("WHERE c = 3", "seq_scan", [])` stays green even if the planner also offers an illegal
+`IndexScan(abc, c=3)`. Legality tests have to assert what is *absent*; that's the point chapter 12 §12.6
+makes in trap 2. The three cost tests then prove the choice is genuinely cost-based. Skip-scan remains
+deferred; ordinary access-path choice does not depend on it.
 
 
 ---
@@ -623,13 +892,14 @@ def format_plan(op: Operator) -> str:
 
 
     Project  [id, email, age]
-    └─ IndexScan  idx_email  (email = ?)   est_rows=1  pages_read=3
+    └─ IndexScan  idx_email  (email = ?)   est_rows=1  startup=12.00  cost=24.01
     """
 ```
 
 
-**`pages_read` must come from the buffer pool's real counter, not an estimate.** A measured number is
-evidence; an estimate is a claim, and this string is destined for the README.
+Plain `EXPLAIN` must not execute the query: it prints `est_rows`, startup cost, and total cost.
+`EXPLAIN ANALYZE` executes the selected tree once and adds `actual_rows` and the buffer pool's measured
+`pages_read`. Never label an estimate as an actual counter.
 
 
 ```python
@@ -750,7 +1020,8 @@ def main() -> None:
 Report **page reads**, not seconds. Chapter 19 makes the full argument, but the short version: page
 reads are what the algorithm determines, they're deterministic, they don't depend on your laptop's
 thermal state, and nobody can wonder whether you benchmarked a warm cache. The roadmap's target shape
-is ~3 reads against ~2,400 — a number an interviewer can check the arithmetic on.
+is ~4 reads against ~2,417 — a number an interviewer can check the arithmetic on (chapter 19 §19.5 shows
+the full result statement, including the conditions that make it falsifiable).
 
 
 Also record the *write* side honestly: how much slower is `INSERT` with three indexes than with none?
@@ -766,18 +1037,21 @@ lookup speedup alone.
 
 | # | 2 hours on | Done when |
 |---|---|---|
-| 1 | `DELETE` / `UPDATE` / `CREATE INDEX` / `EXPLAIN` in `ast.py` + `parser.py` | all four parse; unsupported forms raise typed errors |
+| 1 | `DELETE` / `UPDATE` / `CREATE INDEX` / `ANALYZE` / both `EXPLAIN` forms in parser | all forms parse; unsupported forms raise typed errors |
 | 2 | `BTree.delete`, empty-page freeing, root collapse | delete-2000-in-random-order is green, validator clean each step |
 | 3 | `index.py`: `encode_index_key`, `compare_keys`, `insert`, `seek_eq` | duplicates test passes; `sqlite3 integrity_check` is `ok` |
 | 4 | `IndexBTree.delete`, `find_conflict`, `catalog.create_index` with backfill | `CREATE INDEX` on a populated table produces a complete index |
 | 5 | Index maintenance in `InsertOp` / `DeleteOp` / `UpdateOp` | the index-vs-table property test is green |
-| 6 | `planner.py`, `is_sargable`, `IndexScan` operator | the 12-row parametrized planner table is green |
-| 7 | `EXPLAIN` formatting, the benchmark, the results-unchanged property test | the README number exists and is reproducible |
+| 6 | Candidate generation, `is_sargable`, `IndexScan` | the 12-row legality table and residual invariant are green |
+| 7 | `ANALYZE`, `quill_stat1`, cardinality estimates | known distributions produce expected prefix estimates |
+| 8 | Cost model and access-path selection | selective-index, stats-flip, seq-scan-wins, covering-index tests are green |
+| 9 | `EXPLAIN` / `EXPLAIN ANALYZE`, benchmark, results-unchanged property | estimates and actual counters are distinct; README number is reproducible |
 
 
-Session 5 is the one that runs long. If it does, take the time out of session 7's benchmark — the
-consistency property is load-bearing for week 5, and the benchmark can be produced in twenty minutes
-once everything works.
+Sessions 5 and 8 are the ones most likely to run long. Do not collapse candidate generation and
+costing into one function to save time; that would make the implementation look cost-based while
+remaining impossible to test as a cost-based pipeline. Move the presentation polish, not the
+correctness and plan-choice tests.
 
 
 ---
@@ -798,14 +1072,18 @@ once everything works.
 - [ ] A `UNIQUE` index accepts multiple NULLs
 - [ ] Indexes stay consistent through insert / update / delete — property test, ≥200 random ops
 - [ ] Adding an index never changes query results — property test over generated queries
-- [ ] The 12-case planner table matches, including all four `seq_scan` fallbacks
+- [ ] The 12-case table verifies which index candidates are legal, including all four ineligible cases
 - [ ] `seek_terms ∪ residual` equals the input predicates, asserted
-- [ ] `EXPLAIN` prints the tree with **measured** `pages_read`
+- [ ] `ANALYZE` persists K+1 prefix statistics and missing statistics use documented defaults
+- [ ] Statistics choose `y_idx` (~10 rows) over `x_idx` (~5,000 rows) for the two-index fixture
+- [ ] Changing only statistics flips the chosen index; query results remain identical
+- [ ] A low-selectivity applicable index can lose to SeqScan; a covering index gets the cheaper cost
+- [ ] `EXPLAIN` prints estimates without execution; `EXPLAIN ANALYZE` prints measured rows/page reads
 - [ ] `sqlite3 f.db "PRAGMA integrity_check"` is `ok` after an index-heavy *and* a delete-heavy workload
-- [ ] Benchmark in the README: ~3 page reads indexed vs ~2,400 scanned, plus the insert-side cost
+- [ ] Benchmark in the README: ~4 page reads indexed vs ~2,417 scanned, plus the insert-side cost
 - [ ] `NOTES.md` has an entry for every bug that took over 20 minutes
 
 
-**The four bullets to protect if the week runs short:** the two property tests, `integrity_check` on a
-delete-heavy database, and the benchmark. Those are the ones that appear in the README or make week 5
-possible. Everything else is recoverable later.
+**The five bullets to protect if the week runs short:** the two property tests, the statistics-flip
+test, `integrity_check` on a delete-heavy database, and the benchmark. Those are the claims that make
+the cost-based planner and storage engine independently verifiable.

@@ -20,13 +20,16 @@ when you get stuck.
 > you at one.
 
 
-**Reading budget: ~12 hours total across 8 weeks — about 10% of build time.** Each week has 60–90
+**Reading budget: ~13 hours total across 8 weeks — about 10% of build time.** Most weeks have 60–90
 minutes of targeted reading, done the day you *start* that week's work, not before. Reading further
 ahead than one week is procrastination dressed as diligence; you won't retain B+tree split
 mechanics in week 1 and you'll re-read them in week 2 anyway.
 
 
-Week 5 is the exception — spend two hours there. It's the highest-leverage reading in the project.
+Two weeks are exceptions, and both are worth the overrun. **Week 5 (~2 h)** is the highest-leverage
+reading in the project. **Week 4 (~2 h 15 min)** is the second, because the planner is the one component
+where you're copying an *architecture* rather than a data structure, and the architecture only exists in
+prose — there's no `fileformat2.html` for a cost model.
 
 
 Every entry below is marked:
@@ -49,14 +52,14 @@ And each says *which sections*. Almost nothing here should be read cover to cove
 Six things you'll return to repeatedly. If you acquire nothing else, acquire these.
 
 
-| Resource | What it's for | Cost |
-|---|---|---|
-| ⭐ [SQLite Database File Format](https://www.sqlite.org/fileformat2.html) | The canonical spec for varints, serial types, record format, page layout. **This is not background reading — it's the specification quilldb implements.** Every constant in `constants.py` comes from here, and `PRAGMA integrity_check` is the enforcement. | Free |
-| ⭐ [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html) | Your entire week 5, written by the people who got it right. Non-negotiable. | Free |
-| ⭐ **Database Internals** — Alex Petrov (O'Reilly, 2019) | Part I only (ch 1–8). The best book-length treatment of storage engines, page layout, and B-tree implementation. Skip Part II entirely — it's distributed systems, irrelevant here. | ~$40 |
-| ⭐ [Crafting Interpreters](https://craftinginterpreters.com/) — Robert Nystrom | Free online. Chapters 4–6 are the best writing on handwritten tokenizers and recursive-descent parsers that exists. Your week 3. | Free |
-| ⭐ [CMU 15-445 Intro to Database Systems](https://15445.courses.cs.cmu.edu/) | Lecture slides + notes. Fall 2026 is taught by Jignesh Patel; **Andy Pavlo's archived semesters have full public YouTube lecture playlists** — those are the famous ones. Archived course sites are linked from the homepage. Watch ~8 of 26 lectures, listed per week below. | Free |
-| ⭐ [SQLite: How It Is Tested](https://www.sqlite.org/testing.html) | Your testing philosophy. Also the source of the best stat in your README: as of 3.42.0, SQLite ships **590× more test code than library code**. | Free |
+| Resource                                                                      | What it's for                                                                                                                                                                                                                                                                 | Cost |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| ⭐ [SQLite Database File Format](https://www.sqlite.org/fileformat2.html)      | The canonical spec for varints, serial types, record format, page layout. **This is not background reading — it's the specification quilldb implements.** Every constant in `constants.py` comes from here, and `PRAGMA integrity_check` is the enforcement.                  | Free |
+| ⭐ [Atomic Commit In SQLite](https://www.sqlite.org/atomiccommit.html)         | Your entire week 5, written by the people who got it right. Non-negotiable.                                                                                                                                                                                                   | Free |
+| ⭐ **Database Internals** — Alex Petrov (O'Reilly, 2019)                       | Part I only (ch 1–8). The best book-length treatment of storage engines, page layout, and B-tree implementation. Skip Part II entirely — it's distributed systems, irrelevant here.                                                                                           | ~$40 |
+| ⭐ [Crafting Interpreters](https://craftinginterpreters.com/) — Robert Nystrom | Free online. Chapters 4–6 are the best writing on handwritten tokenizers and recursive-descent parsers that exists. Your week 3.                                                                                                                                              | Free |
+| ⭐ [CMU 15-445 Intro to Database Systems](https://15445.courses.cs.cmu.edu/)   | Lecture slides + notes. Fall 2026 is taught by Jignesh Patel; **Andy Pavlo's archived semesters have full public YouTube lecture playlists** — those are the famous ones. Archived course sites are linked from the homepage. Watch ~8 of 26 lectures, listed per week below. | Free |
+| ⭐ [SQLite: How It Is Tested](https://www.sqlite.org/testing.html)             | Your testing philosophy. Also the source of the best stat in your README: as of 3.42.0, SQLite ships **590× more test code than library code**.                                                                                                                               | Free |
 
 
 ---
@@ -180,17 +183,52 @@ hand someone.
 ---
 
 
-### Week 4 — Indexes and Planner
+### Week 4 — Indexes and the Planner
+
+
+**~2 h 15 min, the longest reading week after week 5 — budget for it.** Week 4 is where the two planner
+philosophies meet, so read them as a *pair* rather than picking a side: `optoverview` §2 gives you the
+**rules** (which plans are legal), `queryplanner-ng` gives you the **costs** (which legal plan wins).
+quilldb implements both, in that order, and the trade-off note at the end of this section is the answer
+to "why not just use rules?"
 
 
 - ⭐ [SQLite Query Optimizer Overview](https://www.sqlite.org/optoverview.html) — sections **2**
   (WHERE clause analysis), **8** (choosing between multiple indexes), **9** (covering indexes),
-  **10** (ORDER BY optimizations). **~50 min.** §2 is effectively a spec for the rule-based planner
-  you're building — it states precisely when an index is usable: leading columns need `=`/`IN`/`IS`,
-  the right-most used column may take inequalities, **no gaps allowed**. There's a clean worked
-  table of which WHERE clauses can use `ex1(a,b,c,d,…)` and why. Steal that table's logic directly.
+  **10** (ORDER BY optimizations). **~50 min.** §2 is effectively a spec for the **legality stage** —
+  stage 1 of four — and it states precisely when an index is usable: leading columns need `=`/`IN`/`IS`,
+  the right-most used column may take inequalities, **no gaps allowed**. There's a clean worked table of
+  which WHERE clauses can use `ex1(a,b,c,d,…)` and why. Steal that table's logic directly; it's the
+  source of the 12-case test in week 4. Then read **§8** immediately after, because it's where the docs
+  admit that legality alone doesn't decide — that's the seam the cost model fills.
   Skip: subquery flattening (§11), co-routines (§12), skip-scan (§6), outer-join strength reduction
   (§16) — all out of scope.
+- ⭐ [The Next-Generation Query Planner](https://www.sqlite.org/queryplanner-ng.html) — **~20 min, and
+  this is the citation that matters.** The page that actually says SQLite's planner is cost-based: plan
+  search is *"finding a minimum-cost path through the graph"*, *"the 'cost' here is logarithmic"*, and
+  since 3.8.0 the search keeps the N best paths at each step (N-nearest-neighbours, "N3").
+  **`arch.html` never says "cost-based"** — it calls the planner *"an AI that strives to select the best
+  algorithm"*, which is evocative and useless as a citation. If you cite one page for the architecture
+  you copied, cite this one. See chapter 12 §12.5.
+- ⭐ **Selinger et al., "Access Path Selection in a Relational Database Management System"** (1979) —
+  the founding cost-based optimizer paper, and **core reading now, not depth**. Read §§1–5, ~40 min.
+  Three things in it are directly yours, and it's worth being able to name them:
+  - separating **candidate access paths** from **choosing** among them — your
+    `enumerate_access_paths` / `choose_access_path` split is this paper's structure;
+  - **selectivity factors**. Selinger's default for `column = value` with no index is **1/10** and for
+    `BETWEEN` is **1/4** — which are quilldb's `DEFAULT_EQUALITY_SELECTIVITY` and
+    `DEFAULT_RANGE_SELECTIVITY`, and SQLite's own defaults, unchanged in 45 years. (His default for a
+    one-sided `>` is 1/3, where SQLite uses 1/4 — a small honest divergence worth knowing.)
+  - the **join estimate**. Selinger's selectivity for `column1 = column2` is
+    `1/MAX(ICARD1, ICARD2)` — which is *literally* week 7's
+    `|R| × |S| / max(NDV(R.a), NDV(S.b))`. You are not inventing that formula; you're citing it.
+
+
+  What you deliberately *don't* take is the dynamic-programming join enumeration — see chapter 12 §12.7.
+- ⭐ [SQLite File Format](https://www.sqlite.org/fileformat2.html) **§2.6.4** — the `sqlite_stat1`
+  encoding that `quill_stat1` mirrors: K+1 integers per index, the first is the row count, the N-th is
+  the average number of rows sharing the first N-1 columns, and the last is 1 for a unique index. ~10
+  min, and read it *before* writing `ANALYZE` rather than after.
 - ⭐ [Use The Index, Luke](https://use-the-index-luke.com/) — Markus Winand. Free web version. The
   practical mental model for leading columns, range constraints, and covering indexes. Read the
   "Anatomy of an Index" and "The Where Clause" chapters. ~45 min.
@@ -199,10 +237,39 @@ hand someone.
   print.
 - ○ [SQLite File Format](https://www.sqlite.org/fileformat2.html) §1.6 — index B-tree cell format,
   for how index keys are laid out.
-- ◇ **Selinger et al., "Access Path Selection in a Relational Database Management System"** (1979) —
-  the founding cost-based optimizer paper. You're building rule-based, so this is for the
-  conversation where someone asks "how would you extend this?" Answer: table statistics, selectivity
-  estimation, dynamic-programming join ordering — all from this paper.
+
+
+#### The trade-off, so you can argue it either way
+
+
+You're building cost-based. You should still be able to defend the rule-based choice, because it's a
+real engineering position and an interviewer may push on it.
+
+
+|                 | Rule-based                                                 | Cost-based                                        |
+| --------------- | ---------------------------------------------------------- | ------------------------------------------------- |
+| Decides using   | the *shape* of the query                                   | the shape **and** the data                        |
+| Needs           | nothing                                                    | `ANALYZE`, plus statistics fresh enough to trust  |
+| Typical failure | picks a legal-but-terrible index, *consistently*           | good on average, occasionally very bad on skew    |
+| Debugging       | you can predict the plan by reading the query              | you must inspect `EXPLAIN` **and** the statistics |
+| Build cost here | ~3 h                                                       | ~7 h, and it never stops being tunable            |
+| Cannot do       | separate two same-shaped indexes 500× apart in selectivity | promise you the same plan tomorrow                |
+
+
+**They are stages, not rivals** — this is the framing week 4 is built around, and the single most
+useful thing to have straight. Rules answer *which plans are legal*; costs answer *which legal plan
+wins*. No cost can make an illegal seek correct, and no rule can separate two indexes with identical
+shapes and wildly different selectivity (chapter 12 §12.1, failure 3). Anyone who presents these as
+competing philosophies has skipped a step.
+
+
+The genuinely defensible rule-based position, worth saying out loud: **predictability is a feature.** A
+plan that is always mediocre is easier to operate than one that is usually excellent and occasionally
+catastrophic — which is exactly why production databases ship plan hints and plan freezing (chapter 12
+§12.7). And statistics are *derived state*: one more thing that goes stale, one more thing to
+invalidate, one more reason a query got slow overnight with no deploy. quilldb pays those costs
+deliberately — that's what the `ANALYZE`-invalidates-the-plan-cache wiring in week 7 is *for* — and the
+honest summary is that cost-based trades worst-case predictability for average-case speed.
 
 
 ---
@@ -368,16 +435,16 @@ unusually good.
 Read code when a doc leaves you unsure. Ranked by usefulness *to this specific project*.
 
 
-| Project | Lang | Steal | Rating |
-|---|---|---|---|
-| [chidb](https://chi.cs.uchicago.edu/chidb/) | C | Assignment specs 1–4 as incremental task lists. SQLite-derived format with deliberate simplifications — the same tradeoff you're making. Has a shell with `EXPLAIN`. | ⭐⭐ closest structural match |
-| [cstack/db_tutorial](https://cstack.github.io/db_tutorial/) | C | Parts 7–14: B-tree splits, step by step, with working code at each step. | ⭐⭐ best for week 2 |
-| [toydb](https://github.com/erikgrinaker/toydb) | Rust | Architecture doc, iterator executor, `EXPLAIN` format, README posture, goldenscript testing approach. | ⭐⭐ best documented |
-| [build-your-own.org/database](https://build-your-own.org/database/) | Go | Part I free: B+tree node/insert/delete, free list. Ch 6's testing discussion. | ⭐ |
-| [SQLite](https://github.com/sqlite/sqlite) `src/btree.c` | C | Ground truth on page format and cell handling. `pager.c` for journal mechanics — but it's ~10k lines of edge cases you've cut. | ⭐ reference only |
-| [BoltDB](https://github.com/boltdb/bolt) | Go | ~4k LOC, single-file B+tree with mmap and copy-on-write. Unusually readable end-to-end in an afternoon. | ⭐ |
-| CMU **BusTub** (linked from 15-445) | C++ | Buffer pool manager (wk 1) and lock manager (wk 6) reference designs. | ○ |
-| **SimpleDB** — accompanies Sciore, *Database Design and Implementation* | Java | A complete teaching RDBMS: file/log/buffer manager, records, metadata, parser, planner, JDBC. Scope match is very close to yours. *(Couldn't verify a canonical download URL — it ships with the book; search for it.)* | ○ |
+| Project                                                                 | Lang | Steal                                                                                                                                                                                                                   | Rating                      |
+| ----------------------------------------------------------------------- | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| [chidb](https://chi.cs.uchicago.edu/chidb/)                             | C    | Assignment specs 1–4 as incremental task lists. SQLite-derived format with deliberate simplifications — the same tradeoff you're making. Has a shell with `EXPLAIN`.                                                    | ⭐⭐ closest structural match |
+| [cstack/db_tutorial](https://cstack.github.io/db_tutorial/)             | C    | Parts 7–14: B-tree splits, step by step, with working code at each step.                                                                                                                                                | ⭐⭐ best for week 2          |
+| [toydb](https://github.com/erikgrinaker/toydb)                          | Rust | Architecture doc, iterator executor, `EXPLAIN` format, README posture, goldenscript testing approach.                                                                                                                   | ⭐⭐ best documented          |
+| [build-your-own.org/database](https://build-your-own.org/database/)     | Go   | Part I free: B+tree node/insert/delete, free list. Ch 6's testing discussion.                                                                                                                                           | ⭐                           |
+| [SQLite](https://github.com/sqlite/sqlite) `src/btree.c`                | C    | Ground truth on page format and cell handling. `pager.c` for journal mechanics — but it's ~10k lines of edge cases you've cut.                                                                                          | ⭐ reference only            |
+| [BoltDB](https://github.com/boltdb/bolt)                                | Go   | ~4k LOC, single-file B+tree with mmap and copy-on-write. Unusually readable end-to-end in an afternoon.                                                                                                                 | ⭐                           |
+| CMU **BusTub** (linked from 15-445)                                     | C++  | Buffer pool manager (wk 1) and lock manager (wk 6) reference designs.                                                                                                                                                   | ○                           |
+| **SimpleDB** — accompanies Sciore, *Database Design and Implementation* | Java | A complete teaching RDBMS: file/log/buffer manager, records, metadata, parser, planner, JDBC. Scope match is very close to yours. *(Couldn't verify a canonical download URL — it ships with the book; search for it.)* | ○                           |
 
 
 **How to read someone else's database:** find the page/node struct first, then the insert path, then
@@ -394,17 +461,18 @@ Saying why you're *not* reading something is as useful as a reading list. Each o
 resource that would cost you hours for no return on this project:
 
 
-| Skip | Why |
-|---|---|
-| Petrov, Database Internals **Part II** | Distributed systems. Half the book, zero relevance. |
-| [SQLite WAL docs](https://www.sqlite.org/wal.html) | You cut WAL. Read only if you resurrect it. |
-| SQLite `pager.c`, `wal.c` | Thousands of lines handling cases you explicitly descoped. |
-| ARIES in full | You're undo-only. Abstract + intro is enough to compare. |
-| All 26 CMU 15-445 lectures | ~35 hours. Watch the 8 named above. |
-| **Designing Data-Intensive Applications** | Excellent book, wrong book. Only ch 3 is relevant and it's a survey — Petrov covers the same ground with the implementation detail you actually need. |
-| The SQL standard | Enormous, expensive, and SQLite's syntax diagrams are a better spec for your purposes. |
-| Graefe, Modern B-Tree Techniques (in full) | 200 pages. Skim for vocabulary only. |
-| SQLite's `sqlite_stat*` / ANALYZE machinery | You're rule-based, not cost-based. |
+| Skip                                                                 | Why                                                                                                                                                                                                                                        |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Petrov, Database Internals **Part II**                               | Distributed systems. Half the book, zero relevance.                                                                                                                                                                                        |
+| [SQLite WAL docs](https://www.sqlite.org/wal.html)                   | You cut WAL. Read only if you resurrect it.                                                                                                                                                                                                |
+| SQLite `pager.c`, `wal.c`                                            | Thousands of lines handling cases you explicitly descoped.                                                                                                                                                                                 |
+| ARIES in full                                                        | You're undo-only. Abstract + intro is enough to compare.                                                                                                                                                                                   |
+| All 26 CMU 15-445 lectures                                           | ~35 hours. Watch the 8 named above.                                                                                                                                                                                                        |
+| **Designing Data-Intensive Applications**                            | Excellent book, wrong book. Only ch 3 is relevant and it's a survey — Petrov covers the same ground with the implementation detail you actually need.                                                                                      |
+| The SQL standard                                                     | Enormous, expensive, and SQLite's syntax diagrams are a better spec for your purposes.                                                                                                                                                     |
+| Graefe, Modern B-Tree Techniques (in full)                           | 200 pages. Skim for vocabulary only.                                                                                                                                                                                                       |
+| SQLite's `sqlite_stat4` sampling and `where.c`'s `LogEst` arithmetic | You build `stat1` and plain float costs. Read fileformat2 §2.6.4 for the `stat1` encoding you *do* implement; skip `stat4` histograms and the fixed-point logarithm tricks — they're an optimization for a planning budget you don't have. |
+| SQLite's `where.c` / `whereexpr.c` / `wherecode.c`                   | ~13,000 lines. You're copying the four-stage *architecture*, not the implementation. `optoverview` §2/§8 and `queryplanner-ng` describe it in ~30 pages.                                                                                   |
 
 
 ---
@@ -413,18 +481,18 @@ resource that would cost you hours for no return on this project:
 ## 5. When You're Stuck
 
 
-| Symptom | Go here |
-|---|---|
-| "What byte goes where?" | fileformat2.html §1.2, §1.5, §2.1 |
-| "My varint decodes wrong" | fly.io post, then fileformat2 §1.5. Check endianness and the continue-bit convention. |
-| "Split works but the tree is corrupt two levels up" | cstack parts 13–14; then trust your validator over your intuition |
-| "How do I parse expression precedence?" | matklad Pratt parsing |
-| "Which index should the planner pick?" | optoverview §2 and §8 |
-| "What order do I fsync in?" | atomiccommit.html §3.7–3.11. This is the answer, verbatim. |
-| "Is my journal safe against a torn write?" | atomiccommit.html §6.2 — zero-init page count + per-page checksum |
-| "What isolation level did I actually build?" | Berenson et al. Work out which anomalies you permit. |
-| "How do I test something with no reference?" | testing.html anomaly-testing section; SQL Logic Test for the differential idea |
-| "Is my design reasonable?" | Compare against chidb's assignment structure and toydb's architecture doc |
+| Symptom                                             | Go here                                                                                                                                                                                      |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "What byte goes where?"                             | fileformat2.html §1.2, §1.5, §2.1                                                                                                                                                            |
+| "My varint decodes wrong"                           | fly.io post, then fileformat2 §1.5. Check endianness and the continue-bit convention.                                                                                                        |
+| "Split works but the tree is corrupt two levels up" | cstack parts 13–14; then trust your validator over your intuition                                                                                                                            |
+| "How do I parse expression precedence?"             | matklad Pratt parsing                                                                                                                                                                        |
+| "Which index should the planner pick?"              | optoverview §2 for which are *legal*, §8 for choosing between them, then queryplanner-ng for the cost model. If the answer feels arbitrary, you're missing statistics — check `ANALYZE` ran. |
+| "What order do I fsync in?"                         | atomiccommit.html §3.7–3.11. This is the answer, verbatim.                                                                                                                                   |
+| "Is my journal safe against a torn write?"          | atomiccommit.html §6.2 — zero-init page count + per-page checksum                                                                                                                            |
+| "What isolation level did I actually build?"        | Berenson et al. Work out which anomalies you permit.                                                                                                                                         |
+| "How do I test something with no reference?"        | testing.html anomaly-testing section; SQL Logic Test for the differential idea                                                                                                               |
+| "Is my design reasonable?"                          | Compare against chidb's assignment structure and toydb's architecture doc                                                                                                                    |
 
 
 ---
@@ -446,4 +514,8 @@ Three caveats:
   stable URL. Search the titles.
 - Books (Petrov, Sciore) and older papers (Graefe, Selinger, Gray, ARIES, Pillai) are cited from
   knowledge by title/author/year rather than by link — those are stable enough to search.
-  
+- **Selinger's specific selectivity constants** in the week-4 entry (1/10 for `=`, 1/4 for `BETWEEN`,
+  1/3 for a one-sided inequality, `1/MAX(ICARD1, ICARD2)` for `col1 = col2`) are quoted from knowledge,
+  not from a fetched copy of the 1979 paper. The *correspondence* to SQLite's and quilldb's defaults is
+  the interesting claim and it's worth 10 minutes to verify against the paper's §5 before you say it in
+  an interview — it's a great line if right and an easy thing to be corrected on if not.

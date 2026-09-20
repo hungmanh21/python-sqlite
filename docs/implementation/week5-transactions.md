@@ -582,6 +582,7 @@ SCENARIOS = [
     ("insert_causing_split", ...),      # must allocate a page — exercises truncate-on-rollback
     ("delete_freeing_page",  ...),      # exercises the freelist transactionally
     ("update_with_indexes",  ...),      # table page + N index pages: the week-4 consistency risk
+    ("analyze_refresh",      ...),      # quill_stat1 is replaced atomically, never half-published
     ("multi_page_txn",       ...),      # bigger than the buffer pool: forces a mid-txn spill
 ]
 
@@ -602,6 +603,7 @@ def test_atomic_at_every_write_boundary(tmp_path, scenario, target, crash_at):
     assert state in (STATE_BEFORE, STATE_AFTER), "found a MIXTURE — atomicity violated"
     assert validate_all_btrees(db).is_valid
     assert index_matches_table(db)                   # the week-4 property, after a crash
+    assert statistics_are_complete_or_absent(db)     # stale is safe; structurally partial is not
     db.close()
     assert sqlite3_integrity_check(tmp_path / "t.db") == "ok"
     assert not (tmp_path / "t.db-journal").exists()
@@ -630,10 +632,10 @@ def test_crash_during_recovery(tmp_path, first, second):
 ```
 
 
-**The four assertions inside the loop are the deliverable, not the loop.** Anyone can crash a program;
-what makes this evidence is that after every crash you check *four independent properties* — the state is
-unmixed, the trees are structurally valid, the indexes agree with their tables, and an
-independently-written C implementation agrees the file is sound.
+**The five assertions inside the loop are the deliverable, not the loop.** Anyone can crash a program;
+what makes this evidence is that after every crash you check independent properties — the state is
+unmixed, the trees are structurally valid, the indexes agree with their tables, planner statistics are
+complete-or-absent, and an independently-written C implementation agrees the file is sound.
 
 
 **Keep it fast enough to actually run.** The full product is thousands of cases. Practical shape: the
@@ -651,15 +653,15 @@ embarrassingly easy to write a matrix that passes because the transaction never 
 ## Week 5 sessions
 
 
-| # | 2 hours on | Done when |
-|---|---|---|
-| 1 | `journal.py`: header, records, `journal_checksum`, `begin` / `record_original` | the magic-and-nRec-withheld test is green |
-| 2 | `commit_barrier`, `replay`, and all four "replays nothing" cases | a hand-built corrupt journal is correctly ignored |
-| 3 | `Transaction`, `get_page_for_write`, the write-barrier assertion, no-steal in the pool | the byte-identical rollback hash test is green |
-| 4 | `BEGIN` / `COMMIT` / `ROLLBACK`, autocommit, `db.transaction()` | exception inside the context manager rolls back |
-| 5 | `recovery.py` + hot-journal detection wired into `connect()` | kill a process mid-txn, reopen, data is pre-transaction |
-| 6 | `FaultyFile`, and the write matrix for one scenario | one scenario × every write boundary is green |
-| 7 | Full matrix, sync matrix, crash-during-recovery, `docs/durability.md` | all five scenarios green; the doc names the non-guarantees |
+| #   | 2 hours on                                                                             | Done when                                                 |
+| --- | -------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1   | `journal.py`: header, records, `journal_checksum`, `begin` / `record_original`         | the magic-and-nRec-withheld test is green                 |
+| 2   | `commit_barrier`, `replay`, and all four "replays nothing" cases                       | a hand-built corrupt journal is correctly ignored         |
+| 3   | `Transaction`, `get_page_for_write`, the write-barrier assertion, no-steal in the pool | the byte-identical rollback hash test is green            |
+| 4   | `BEGIN` / `COMMIT` / `ROLLBACK`, autocommit, `db.transaction()`                        | exception inside the context manager rolls back           |
+| 5   | `recovery.py` + hot-journal detection wired into `connect()`                           | kill a process mid-txn, reopen, data is pre-transaction   |
+| 6   | `FaultyFile`, and the write matrix for one scenario                                    | one scenario × every write boundary is green              |
+| 7   | Full matrix, sync matrix, crash-during-recovery, `docs/durability.md`                  | all six scenarios green; the doc names the non-guarantees |
 
 
 **Session 3 is the one to slow down on.** If `get_page_for_write` isn't the only route to a mutable page,
@@ -683,10 +685,11 @@ every later session builds on a foundation that can silently skip journalling. G
 - [ ] Recovery restores pages, **then** truncates, **then** fsyncs, **then** deletes the journal
 - [ ] Recovery happens automatically inside `connect()`; no user-callable repair step exists
 - [ ] Recovery is idempotent — running it twice is safe, and calling it after a mid-recovery crash works
-- [ ] Crash matrix green over every **write** boundary, all five scenarios, faulting both files
+- [ ] Crash matrix green over every **write** boundary, all six scenarios, faulting both files
 - [ ] Crash matrix green over every **fsync** boundary
 - [ ] **Crash during recovery** green — the nastiest case, and the one that catches fsync-before-unlink
-- [ ] After every crash point: unmixed state, valid trees, indexes agree with tables, `integrity_check` `ok`
+- [ ] After every crash point: unmixed state, valid trees, indexes agree with tables, statistics are
+      complete-or-absent, and `integrity_check` is `ok`
 - [ ] A transaction larger than the buffer pool works (mid-transaction spill after the barrier)
 - [ ] Pages allocated within the transaction are **not** journalled — and rollback still truncates them away
 - [ ] `PRAGMA synchronous = OFF | NORMAL | FULL` changes the fsync count; assert the counts
@@ -695,6 +698,7 @@ every later session builds on a foundation that can silently skip journalling. G
 - [ ] `NOTES.md` entries for every bug over 20 minutes — this week produces the best interview stories
 
 
-**If the week runs short, cut in this order:** `synchronous` levels, then the sync matrix, then scenarios
-4 and 5. **Never cut** the byte-identical rollback test, the write matrix, or crash-during-recovery.
+**If the week runs short, cut in this order:** `synchronous` levels, then the sync matrix, then the
+largest optional workload scenarios. **Never cut** the byte-identical rollback test, the write matrix,
+or crash-during-recovery.
 Those three are the week's entire value.

@@ -7,13 +7,14 @@ The fourth doc, and the one that answers *"but why?"*
 The other three docs each do a different job:
 
 
-| Doc | Job | What it doesn't do |
-|---|---|---|
-| `roadmap.md` | What to build, in what order, with hour budgets | Explain the ideas |
-| `guide.md` | Teach the concepts with analogies, split into 2-hour sessions | Go deep enough to defend in an interview |
-| `docs/implementation/` | Signatures and tests to code against | Say why the signatures look like that |
-| `references.md` | Where to read more | Contain the knowledge — it's a map, not the territory |
-| **`docs/theory/` (this)** | **The actual knowledge: the physics, the theory, the design space, and why SQLite picked what it picked** | Tell you what to type |
+| Doc                                                | Job                                                                                                       | What it doesn't do                                    |
+| -------------------------------------------------- | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `roadmap.md`                                       | What to build, in what order, with hour budgets                                                           | Explain the ideas                                     |
+| `guide.md`                                         | Teach the concepts with analogies, split into 2-hour sessions                                             | Go deep enough to defend in an interview              |
+| `docs/implementation/`                             | Signatures and tests to code against                                                                      | Say why the signatures look like that                 |
+| `references.md`                                    | Where to read more                                                                                        | Contain the knowledge — it's a map, not the territory |
+| **`docs/theory/` (this)**                          | **The actual knowledge: the physics, the theory, the design space, and why SQLite picked what it picked** | Tell you what to type                                 |
+| [`../design-decisions.md`](../design-decisions.md) | **One page: same as SQLite, different from SQLite, and why, for every decision**                          | Argue the case — it links back here for that          |
 
 
 If `references.md` says *"read atomiccommit.html §3.7–3.11 to learn the fsync order,"* this directory says *"here is the fsync order, here is the failure that each step prevents, here is what SQLite assumes about your hard drive that makes it work, and here is what happens when that assumption is false."*
@@ -57,18 +58,18 @@ package's name. When you open `src/quilldb/txn/journal.py` and wonder *why the f
 that order*, the answer is in `docs/theory/txn/`.
 
 
-| Folder | Explains the code in | Chapters |
-|---|---|---|
-| [`foundations/`](foundations/) | nothing — read it before you write any code | 00 |
-| [`storage/`](storage/) | `storage/` — `pager`, `page`, `bufferpool`, `overflow`, `freelist` | 01, 02, 04 |
-| [`codec/`](codec/) | `codec/` — `varint`, `record` | 03 |
-| [`btree/`](btree/) | `btree/` — `btree`, `cells`, `cursor`, `split`, `index` | 05, 06, 10, 11 |
-| [`sql/`](sql/) | `sql/` — `tokenizer`, `ast`, `parser` | 07 |
-| [`catalog/`](catalog/) | `catalog/` — `schema`, `catalog` — plus `sql/binder.py` | 08 |
-| [`plan/`](plan/) | `plan/` — `planner`, `explain` | 12 |
-| [`exec/`](exec/) | `exec/` — `operators`, `expressions`, `join`, `aggregate`, `sort` | 09, 17, 18 |
-| [`txn/`](txn/) | `txn/` — `transaction`, `journal`, `recovery`, `locks` | 13, 14, 15, 16 |
-| [`benchmarks/`](benchmarks/) | `benchmarks/` | 19 |
+| Folder                         | Explains the code in                                               | Chapters       |
+| ------------------------------ | ------------------------------------------------------------------ | -------------- |
+| [`foundations/`](foundations/) | nothing — read it before you write any code                        | 00             |
+| [`storage/`](storage/)         | `storage/` — `pager`, `page`, `bufferpool`, `overflow`, `freelist` | 01, 02, 04     |
+| [`codec/`](codec/)             | `codec/` — `varint`, `record`                                      | 03             |
+| [`btree/`](btree/)             | `btree/` — `btree`, `cells`, `cursor`, `split`, `index`            | 05, 06, 10, 11 |
+| [`sql/`](sql/)                 | `sql/` — `tokenizer`, `ast`, `parser`                              | 07             |
+| [`catalog/`](catalog/)         | `catalog/` — `schema`, `catalog` — plus `sql/binder.py`            | 08             |
+| [`plan/`](plan/)               | `plan/` — `planner`, `explain`                                     | 12             |
+| [`exec/`](exec/)               | `exec/` — `operators`, `expressions`, `join`, `aggregate`, `sort`  | 09, 17, 18     |
+| [`txn/`](txn/)                 | `txn/` — `transaction`, `journal`, `recovery`, `locks`             | 13, 14, 15, 16 |
+| [`benchmarks/`](benchmarks/)   | `benchmarks/`                                                      | 19             |
 
 
 **Chapter numbers are global and follow reading order, so folders have gaps.** `btree/` jumps from
@@ -91,9 +92,9 @@ both halves incomprehensible.
 ### Part 0 — The Ground Floor
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 00 | [Foundations: the machine you're actually writing to](foundations/00-foundations.md) | Why storage is slow, why you can't write one byte, why `write()` doesn't mean "written," what atomicity means at the hardware level, and the three eternal problems every database solves |
+| #   | Chapter                                                                              | What you'll be able to explain afterwards                                                                                                                                                 |
+| --- | ------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 00  | [Foundations: the machine you're actually writing to](foundations/00-foundations.md) | Why storage is slow, why you can't write one byte, why `write()` doesn't mean "written," what atomicity means at the hardware level, and the three eternal problems every database solves |
 
 
 **Read chapter 00 before week 1, and don't skip it.** Every design decision in the following seven chapters is a response to something in it. If you read only this chapter you'll still understand *why databases are shaped like databases*, which is most of the value.
@@ -102,76 +103,76 @@ both halves incomprehensible.
 ### Part 1 — Week 1: Storage
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 01 | [Pages and the pager](storage/01-pages-and-the-pager.md) | Why fixed-size numbered pages beat every alternative, why the pager indirection is the most valuable line you draw all project, and how the freelist works |
-| 02 | [The slotted page](storage/02-the-slotted-page.md) | How variable-length rows fit in a fixed-size box, why two regions grow toward each other, and what fragmentation actually costs |
-| 03 | [Encoding: varints and records](codec/03-encoding-varints-and-records.md) | Why numbers aren't stored as 8 bytes, how a manifest-then-body layout lets you read column 5 without decoding columns 1–4, and the endianness trap |
-| 04 | [The buffer pool](storage/04-the-buffer-pool.md) | Caching theory from first principles, why LRU is wrong for table scans, what pin counts protect against, and the dirty-page rule that data loss hides behind |
+| #   | Chapter                                                                   | What you'll be able to explain afterwards                                                                                                                    |
+| --- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 01  | [Pages and the pager](storage/01-pages-and-the-pager.md)                  | Why fixed-size numbered pages beat every alternative, why the pager indirection is the most valuable line you draw all project, and how the freelist works   |
+| 02  | [The slotted page](storage/02-the-slotted-page.md)                        | How variable-length rows fit in a fixed-size box, why two regions grow toward each other, and what fragmentation actually costs                              |
+| 03  | [Encoding: varints and records](codec/03-encoding-varints-and-records.md) | Why numbers aren't stored as 8 bytes, how a manifest-then-body layout lets you read column 5 without decoding columns 1–4, and the endianness trap           |
+| 04  | [The buffer pool](storage/04-the-buffer-pool.md)                          | Caching theory from first principles, why LRU is wrong for table scans, what pin counts protect against, and the dirty-page rule that data loss hides behind |
 
 
 ### Part 2 — Week 2: The B+Tree
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 05 | [Why B-trees](btree/05-why-b-trees.md) | The fanout arithmetic that makes 125 million rows reachable in 4 reads, why not a binary tree, why not a hash table, why the "+" matters, and where LSM-trees beat you |
-| 06 | [B-tree mechanics](btree/06-b-tree-mechanics.md) | Cells, cursors, the split cascade, why trees grow upward from the root, overflow chains, and the invariants your validator asserts |
+| #   | Chapter                                          | What you'll be able to explain afterwards                                                                                                                              |
+| --- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 05  | [Why B-trees](btree/05-why-b-trees.md)           | The fanout arithmetic that makes 125 million rows reachable in 4 reads, why not a binary tree, why not a hash table, why the "+" matters, and where LSM-trees beat you |
+| 06  | [B-tree mechanics](btree/06-b-tree-mechanics.md) | Cells, cursors, the split cascade, why trees grow upward from the root, overflow chains, and the invariants your validator asserts                                     |
 
 
 ### Part 3 — Week 3: SQL to Rows
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 07 | [From SQL text to a tree](sql/07-from-sql-text-to-a-tree.md) | Why tokenization and parsing are separate, how an AST preserves meaning, how Pratt binding powers encode precedence, and why quilldb handwrites a parser while SQLite uses Lemon |
-| 08 | [The catalog and binding](catalog/08-the-catalog-and-binding.md) | How page 1 bootstraps a self-describing database, why SQLite stores CREATE text, what the schema cookie invalidates, and why names and parameters disappear before execution |
-| 09 | [Iterator execution](exec/09-iterator-execution.md) | How open/next/close streams rows through composable operators, how SQL's three-valued NULL logic works, how resources follow cursor lifetime, and why SQLite's bytecode VM is a valid alternative |
+| #   | Chapter                                                          | What you'll be able to explain afterwards                                                                                                                                                         |
+| --- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 07  | [From SQL text to a tree](sql/07-from-sql-text-to-a-tree.md)     | Why tokenization and parsing are separate, how an AST preserves meaning, how Pratt binding powers encode precedence, and why quilldb handwrites a parser while SQLite uses Lemon                  |
+| 08  | [The catalog and binding](catalog/08-the-catalog-and-binding.md) | How page 1 bootstraps a self-describing database, why SQLite stores CREATE text, what the schema cookie invalidates, and why names and parameters disappear before execution                      |
+| 09  | [Iterator execution](exec/09-iterator-execution.md)              | How open/next/close streams rows through composable operators, how SQL's three-valued NULL logic works, how resources follow cursor lifetime, and why SQLite's bytecode VM is a valid alternative |
 
 
 ### Part 4 — Week 4: Mutation, Indexes, and Planning
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 10 | [Deletion and space reuse](btree/10-deletion-and-space-reuse.md) | Why deleting a row makes the file bigger before it makes it smaller, what a freeblock is and when it's reclaimable, why SQLite merges siblings and quilldb doesn't, and why databases don't shrink |
-| 11 | [Index B-trees](btree/11-index-b-trees.md) | Why an index is the same B-tree with the payload thrown away, why the rowid is glued onto every key, what makes a covering index twice as fast, and what `WITHOUT ROWID` really changes |
-| 12 | [The query planner](plan/12-the-query-planner.md) | What "sargable" means and why `WHERE lower(x)='a'` can't use an index, the leading-column-no-gaps rule and why gaps are fatal, and what `sqlite_stat1` buys a cost-based planner that a rule-based one can't have |
+| #   | Chapter                                                          | What you'll be able to explain afterwards                                                                                                                                                                                   |
+| --- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 10  | [Deletion and space reuse](btree/10-deletion-and-space-reuse.md) | Why deleting a row makes the file bigger before it makes it smaller, what a freeblock is and when it's reclaimable, why SQLite merges siblings and quilldb doesn't, and why databases don't shrink                          |
+| 11  | [Index B-trees](btree/11-index-b-trees.md)                       | Why an index is the same B-tree with the payload thrown away, why the rowid is glued onto every key, what makes a covering index twice as fast, and what `WITHOUT ROWID` really changes                                     |
+| 12  | [The query planner](plan/12-the-query-planner.md)                | How legal access paths are generated, how `ANALYZE` prefix statistics estimate cardinality, how page-oriented costs select scans and indexes, and why quilldb exhaustively searches three-table joins while SQLite needs N3 |
 
 
 ### Part 5 — Week 5: Durability
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 13 | [Atomic commit and the journal](txn/13-atomic-commit-and-the-journal.md) | Why the commit point is *deleting a file*, the exact fsync order and the specific crash each barrier stops, why the journal holds old pages rather than new ones, and what WAL trades away to be faster |
-| 14 | [Crash recovery](txn/14-crash-recovery.md) | What makes a journal "hot," why replay must be idempotent, why crashing *during* recovery is the case that finds real bugs, and how to turn a durability claim into evidence |
+| #   | Chapter                                                                  | What you'll be able to explain afterwards                                                                                                                                                               |
+| --- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 13  | [Atomic commit and the journal](txn/13-atomic-commit-and-the-journal.md) | Why the commit point is *deleting a file*, the exact fsync order and the specific crash each barrier stops, why the journal holds old pages rather than new ones, and what WAL trades away to be faster |
+| 14  | [Crash recovery](txn/14-crash-recovery.md)                               | What makes a journal "hot," why replay must be idempotent, why crashing *during* recovery is the case that finds real bugs, and how to turn a durability claim into evidence                            |
 
 
 ### Part 6 — Week 6: Concurrency
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 15 | [Isolation and the anomalies](txn/15-isolation-and-anomalies.md) | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly |
-| 16 | [Locking, 2PL, and deadlock](txn/16-locking-and-deadlock.md) | Why the *second* phase of two-phase locking is the load-bearing half, locks vs. latches, deadlock detection vs. avoidance vs. prevention, and why SQLite's 5-state ladder needs `PENDING` |
+| #   | Chapter                                                          | What you'll be able to explain afterwards                                                                                                                                                 |
+| --- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 15  | [Isolation and the anomalies](txn/15-isolation-and-anomalies.md) | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly               |
+| 16  | [Locking, 2PL, and deadlock](txn/16-locking-and-deadlock.md)     | Why the *second* phase of two-phase locking is the load-bearing half, locks vs. latches, deadlock detection vs. avoidance vs. prevention, and why SQLite's 5-state ladder needs `PENDING` |
 
 
 ### Part 7 — Week 7: Query Processing
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 17 | [Joins](exec/17-joins.md) | Why a join is a nested loop before it's anything else, what an index turns the inner loop into, when hash and merge joins win, and why SQLite ships only one join algorithm on purpose |
-| 18 | [Sorting and aggregation](exec/18-sorting-and-aggregation.md) | How to sort more data than you have RAM, why an index can delete the sort step entirely, sort-based vs. hash-based grouping, and why `LIMIT` changes the algorithm rather than just the output |
+| #   | Chapter                                                       | What you'll be able to explain afterwards                                                                                                                                                      |
+| --- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 17  | [Joins](exec/17-joins.md)                                     | Why a join is a nested loop before it's anything else, what an index turns the inner loop into, when hash and merge joins win, and why SQLite ships only one join algorithm on purpose         |
+| 18  | [Sorting and aggregation](exec/18-sorting-and-aggregation.md) | How to sort more data than you have RAM, why an index can delete the sort step entirely, sort-based vs. hash-based grouping, and why `LIMIT` changes the algorithm rather than just the output |
 
 
 ### Part 8 — Week 8: Presentation
 
 
-| # | Chapter | What you'll be able to explain afterwards |
-|---|---|---|
-| 19 | [Measuring it](benchmarks/19-measuring-it.md) | Why you report page reads and not milliseconds, how warm caches produce numbers that are real but meaningless, and how to state a result an interviewer can't poke a hole in |
+| #   | Chapter                                       | What you'll be able to explain afterwards                                                                                                                                    |
+| --- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 19  | [Measuring it](benchmarks/19-measuring-it.md) | Why you report page reads and not milliseconds, how warm caches produce numbers that are real but meaningless, and how to state a result an interviewer can't poke a hole in |
 
 
 ---
@@ -185,27 +186,27 @@ August is procrastination that feels like diligence — you'll have forgotten it
 you'll re-read it anyway.
 
 
-| When | Read | Time |
-|---|---|---|
-| Before you write any code | 00 | 60–75 min |
-| Start of week 1 | 01, 02 | 50 min |
-| Week 1, before the codec sessions | 03 | 30 min |
-| Week 1, before the buffer pool session | 04 | 35 min |
-| Start of week 2 | 05 | 40 min |
-| Week 2, before the split sessions | 06 | 50 min |
-| Start of week 3 | 07 | 40 min |
-| Week 3, before catalog + binding | 08 | 40 min |
-| Week 3, before the executor | 09 | 45 min |
-| Week 4, before B-tree delete | 10 | 35 min |
-| Week 4, before index B-trees | 11 | 45 min |
-| Week 4, before the planner | 12 | 45 min |
-| **Start of week 5, before any code** | **13** | **55 min** |
-| Week 5, before the crash matrix | 14 | 40 min |
-| **Start of week 6, before any code** | **15** | **40 min** |
-| Week 6, before the lock manager | 16 | 50 min |
-| Week 7, before the join operator | 17 | 40 min |
-| Week 7, before sort + aggregate | 18 | 40 min |
-| Week 8, before writing benchmarks | 19 | 25 min |
+| When                                   | Read   | Time       |
+| -------------------------------------- | ------ | ---------- |
+| Before you write any code              | 00     | 60–75 min  |
+| Start of week 1                        | 01, 02 | 50 min     |
+| Week 1, before the codec sessions      | 03     | 30 min     |
+| Week 1, before the buffer pool session | 04     | 35 min     |
+| Start of week 2                        | 05     | 40 min     |
+| Week 2, before the split sessions      | 06     | 50 min     |
+| Start of week 3                        | 07     | 40 min     |
+| Week 3, before catalog + binding       | 08     | 40 min     |
+| Week 3, before the executor            | 09     | 45 min     |
+| Week 4, before B-tree delete           | 10     | 35 min     |
+| Week 4, before index B-trees           | 11     | 45 min     |
+| Week 4, before the planner             | 12     | 60 min     |
+| **Start of week 5, before any code**   | **13** | **55 min** |
+| Week 5, before the crash matrix        | 14     | 40 min     |
+| **Start of week 6, before any code**   | **15** | **40 min** |
+| Week 6, before the lock manager        | 16     | 50 min     |
+| Week 7, before the join operator       | 17     | 40 min     |
+| Week 7, before sort + aggregate        | 18     | 40 min     |
+| Week 8, before writing benchmarks      | 19     | 25 min     |
 
 
 Total ≈ 13 hours across eight weeks, which comes *out of* the reading budget in `references.md`

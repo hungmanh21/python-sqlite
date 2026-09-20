@@ -58,7 +58,8 @@ Not supported, rejected with a typed error:
 - `RIGHT` / `FULL OUTER JOIN`, `NATURAL JOIN`, `USING (...)`
 - correlated subqueries, `EXISTS`, `IN (subquery)`, CTEs, window functions
 - `GROUPING SETS` / `ROLLUP`, `FILTER`, `DISTINCT` inside an aggregate (`COUNT(DISTINCT x)`)
-- more than **three** tables in one join (document the limit; the ordering heuristic is O(n!) honest)
+- more than **three** tables in one join (document the limit; exhaustive left-deep search is O(n!),
+  intentionally bounded to at most six orders)
 
 
 **Two rules that will produce all of your bugs:**
@@ -317,57 +318,165 @@ class Sort(Operator):
 ```
 
 
-**Sort avoidance is the planner's job**, and it's the most satisfying part of the week:
+**Ordering is a physical property and therefore part of cost**, not a post-processing rule. Which means
+sort avoidance cannot be decided about an access path in isolation — it's decided about a *whole
+candidate plan*, because in a left-deep nested loop the output order comes from the **outermost** table's
+access path:
 
 
 ```python
-    def plan_order_by(self, access_path: AccessPath, order_by: list[OrderKey]) -> Operator:
-        """If the chosen index's column prefix matches the ORDER BY keys (all
-        ascending, or all descending — a B+tree walks backwards for free), emit
-        NO Sort operator at all (§18.3).
+    def sort_cost(candidate: PlanCandidate, order_by: list[OrderKey]) -> float:
+        """0.0 if `candidate.output_order` already satisfies `order_by`, else the
+        cost of the Sort this candidate would need on top.
+
+
+        Satisfied when output_order starts with the ORDER BY keys, all ascending
+        or all descending — a B+tree walks backwards for free (§18.3).
 
 
         Mixed ASC/DESC cannot be satisfied by one traversal. Sort.
         ORDER BY rowid on a rowid table needs nothing — the table IS in that order.
         """
+
+
+
+
+    def total_cost_with_ordering(candidate: PlanCandidate,
+                                 order_by: list[OrderKey]) -> float:
+        """THE comparison key. Never rank candidates on `candidate.cost.total`
+        alone when there's an ORDER BY."""
+        return candidate.cost.total + sort_cost(candidate, order_by)
 ```
 
 
-And join ordering, kept deliberately simple:
+> ⚠️ **This is the one trap in the week, and it is silent.** The natural thing to write is
+> `min(candidates, key=lambda p: p.cost.total)` and then add a `Sort` on top of the winner. That picks
+> the cheapest *join*, then pays for a sort that a slightly-pricier ordered candidate would have avoided
+> — so the plan is legal, the results are right, and the optimizer is quietly worse than the one you
+> think you built. No test fails. This is the classic **"interesting orders"** problem, and it's exactly
+> why System R's dynamic programming keeps the cheapest plan per subset *plus* the cheapest plan per
+> useful ordering (chapter 12 §12.7). Compare complete alternatives — `cheap scan + sort` versus
+> `ordered index scan` — and never prefer sort avoidance as a rule.
+
+
+Join ordering uses the same candidate → estimate → cost → search pipeline introduced in week 4:
 
 
 ```python
-    def order_joins(self, tables: list[TableRef], predicates) -> list[TableRef]:
-        """Heuristic, in priority order:
-          1. A table with an equality predicate on an indexed column goes OUTER
-             (it produces few rows, and cardinality multiplies — §17.7).
-          2. Otherwise the smaller table (by page count) goes outer.
-          3. A table whose join column is indexed prefers to be INNER, so its
-             loop is a seek.
-          4. LEFT JOIN order is FIXED by the SQL — it is not commutative (§17.8).
-        Ties broken by declaration order, so EXPLAIN is deterministic.
-        """
+@dataclass(frozen=True)
+class PlanCandidate:
+    relations: frozenset[TableId]
+    root: OperatorSpec
+    est_rows: int
+    cost: PlanCost                   # the join tree only — NOT including any Sort above it
+    output_order: tuple[OrderKey, ...]
+
+
+
+
+def enumerate_join_plans(tables: list[TableRef], predicates,
+                         stats: StatisticsCatalog) -> list[PlanCandidate]:
+    """Enumerate every legal left-deep order for at most three tables.
+
+
+    For each outer prefix, consider a full inner scan and every parameterized
+    IndexScan whose seek key can be supplied by the outer row. LEFT JOIN edges
+    constrain order; inner joins may be reordered freely.
+
+
+    Return ALL of them. Do not prune to the cheapest plan per relation set:
+    that's the pruning step that loses interesting orders, and with at most six
+    orders there is nothing to gain by it.
+    """
 ```
 
 
-**Prove the heuristic with numbers, not an assertion.** The roadmap's success criterion is that on a
-deliberately asymmetric pair of tables you can show the page-read count for *both* orders. That's a
-five-line benchmark and it's the most persuasive thing in the week:
+For an equijoin `R.a = S.b`, use the standard uniform estimate when both distinct counts are known:
+
+
+```text
+join_rows ≈ |R| × |S| / max(NDV(R.a), NDV(S.b))
+```
+
+
+This is Selinger's 1979 selectivity for `column1 = column2`, `1/MAX(ICARD1, ICARD2)`, unchanged — worth
+knowing you're citing it rather than inventing it.
+
+
+`NDV` is derived, not stored: `quill_stat1` holds average rows per prefix, so
+`NDV(R.a) = R.row_count / rows_per_prefix[0]` — which means it is only available when `a` **leads an
+index on R**. For an unindexed join key there is no distinct count at all.
+
+
+```text
+TODO(human): define the equijoin fallback when NDV is unknown on one or both sides.
+
+
+Add the constant(s) to plan/cost.py alongside DEFAULT_EQUALITY_SELECTIVITY, and state the rule for
+each of the three cases: both NDVs known, one known, neither known.
+```
+
+
+Then cost nested loops as:
+
+
+```text
+outer total cost + outer estimated rows × parameterized inner lookup cost
+```
+
+
+At three tables there are at most `3! = 6` orders. Exhaustive enumeration is simpler and — because
+nothing is pruned — guarantees the minimum under quilldb's model, *including* the sort-avoidance
+comparison above. SQLite uses N3 because it must plan much larger joins quickly; copying N3 here would
+add machinery without improving the answer, and would reintroduce the interesting-orders problem that
+pruning creates.
+
+
+**Prove the search with estimates and actual counters.** On a deliberately asymmetric pair, show every
+candidate's cost and measure both executable orders:
 
 
 ```python
-def test_join_order_heuristic_picks_the_cheaper_order(db):
+def test_cost_search_picks_the_cheaper_join_order(db):
     small, large = 10, 100_000
-    cheap = measure_pages(db, "SELECT ... FROM small JOIN large ON ...")
-    forced = measure_pages(db, "SELECT ... FROM large JOIN small ON ...", disable_reordering=True)
+    candidates = enumerate_for("SELECT ... FROM small JOIN large ON ...")
+    chosen = min(candidates, key=lambda p: total_cost_with_ordering(p, order_by=[]))
+    cheap = measure_pages(db, chosen)
+    forced = measure_pages(db, most_expensive(candidates))
     assert cheap < forced / 10        # and PRINT both, for the README
+
+
+
+
+def test_sort_cost_is_inside_the_join_comparison(db):
+    """The interesting-orders regression. Construct a case where the cheapest
+    JOIN order needs a Sort and the second-cheapest does not, with the Sort
+    costing more than the gap between them. Ranking on cost.total alone picks
+    the first; the correct optimizer picks the second."""
+    q = "SELECT ... FROM a JOIN b ON ... ORDER BY b.indexed_col"
+    candidates = enumerate_for(q)
+    order_by = order_keys(q)
+
+
+    naive = min(candidates, key=lambda p: p.cost.total)
+    correct = min(candidates, key=lambda p: total_cost_with_ordering(p, order_by))
+    assert naive is not correct, "fixture doesn't exercise the trap — retune it"
+
+
+    assert sort_cost(correct, order_by) == 0.0
+    assert measure_pages(db, plan_for(q)) <= measure_pages(db, with_sort(naive))
 ```
+
+
+That second test is worth the twenty minutes it costs to build the fixture. Without it the trap above is
+invisible: every result is correct, every other test passes, and the only symptom is that the optimizer
+is mediocre in a way you can't see from the outside.
 
 
 Also, per the roadmap, a **compiled-plan cache** keyed by SQL text — a dict from the exact statement string
-to the bound, planned operator tree. One caveat that matters: **invalidate it on schema-cookie change**, or
-week 6's `CREATE INDEX` in another thread leaves you executing a plan against a schema that no longer
-exists. You built the cookie in week 3 for exactly this.
+to the bound, planned operator tree. Invalidate it whenever the schema cookie changes. `ANALYZE` also
+bumps that cookie: otherwise a cached plan keeps using the decision made from old statistics even after
+the statistics table changes.
 
 
 ---
@@ -425,7 +534,7 @@ differs from SQL's actual semantics, and each is one generated example away from
 | 3 | Aggregate functions + `HashAggregate`, no-`GROUP BY` single-row case | the six-row semantics table is green |
 | 4 | `GROUP BY`, `HAVING`, `DISTINCT`, `validate_aggregates` | headline query returns correct rows |
 | 5 | `Sort` with multi-key mixed direction, `Limit`/`OFFSET`, top-K heap | mixed ASC/DESC correct; `LIMIT 1` short-circuits |
-| 6 | Planner: sort avoidance, join ordering, `EXPLAIN` for all of it, plan cache | both page-read numbers measured |
+| 6 | Planner: `sort_cost` folded into the ranking key, exhaustive join search, `EXPLAIN`, plan cache | candidate costs and both page-read numbers recorded; the interesting-orders test is green |
 | 7 | Differential test generators over the NULL matrix | green across a few hundred generated queries |
 
 
@@ -440,9 +549,11 @@ compress it.
 
 
 - [ ] The headline query — join + `WHERE` + `GROUP BY` + `HAVING` + `ORDER BY` ordinal + `LIMIT` — works
-- [ ] `EXPLAIN` shows an index-driven inner loop when the inner side has a usable index, and a plain scan
-      when it doesn't
-- [ ] The join-order heuristic picks the cheaper order, and **you have the page-read count for both**
+- [ ] `EXPLAIN` shows an index-driven inner loop when its estimated total cost wins, and a scan-based
+      inner loop when the index is unavailable or more expensive
+- [ ] The optimizer costs every legal left-deep order, picks the minimum, and records actual page reads for both a cheap and expensive order
+- [ ] Candidates are ranked on join cost **plus** the Sort each one would require — the interesting-orders
+      regression test proves ranking on `cost.total` alone would pick a different plan
 - [ ] `LEFT JOIN` emits NULL-extended rows; a `WHERE` on the inner side visibly drops them (documented)
 - [ ] Two NULL join keys do not match each other
 - [ ] The inner cursor is closed once per outer row — pin counts return to baseline after a join
@@ -452,11 +563,11 @@ compress it.
 - [ ] `AVG` of integers returns a real; `AVG` keeps sum and count, not a running average
 - [ ] `GROUP BY` on a nullable column puts all NULL rows in one group
 - [ ] Multi-key `ORDER BY` with mixed `ASC`/`DESC` is correct; NULLs sort first
-- [ ] An `ORDER BY` matching an index prefix emits **no** `Sort` operator, and `EXPLAIN` shows that
+- [ ] An `ORDER BY` matching an index prefix creates a no-Sort candidate; it wins only when its total cost is lower
 - [ ] `ORDER BY indexed_col DESC` also avoids the sort
 - [ ] `Sort` raises `SortLimitExceededError` with an actionable message rather than exhausting memory
 - [ ] `LIMIT 1` over a million rows reads <10 pages — proven with the counter
-- [ ] The plan cache is invalidated when the schema cookie changes
+- [ ] The plan cache is invalidated after both DDL and `ANALYZE` through the schema cookie
 - [ ] Differential tests green over a few hundred generated join/aggregate queries including the whole
       NULL matrix
 - [ ] Deviations from SQLite (bare columns in aggregate queries, the sort row limit, three-table maximum)
