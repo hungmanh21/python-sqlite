@@ -20,11 +20,9 @@ against oracles (a dict, `sorted()`) instead of hand-picked expected values.
 
 import random
 
-
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-
 
 from quilldb.btree.btree import BTree
 from quilldb.btree.cells import decode_leaf_table_cell
@@ -35,8 +33,6 @@ from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import read_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
-
-
 
 
 def _new_tree(pager: Pager, pool: BufferPool) -> BTree:

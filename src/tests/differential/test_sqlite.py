@@ -27,13 +27,10 @@ for free.
 import sqlite3
 from typing import NamedTuple
 
-
 import pytest
-
 
 import quilldb
 from quilldb.codec.record import Value
-
 
 _USERS = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
 

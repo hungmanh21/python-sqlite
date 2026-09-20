@@ -177,19 +177,6 @@ def serialize_page(body: PageBody) -> bytearray:
     cell_ptr_start = hdr + body.page_type.header_size
 
 
-    # TODO(human): place each cell's bytes and write the pointer array.
-    #
-    # - Walk body.cells in order (index 0 first — key order, matching the
-    #   order the pointer array must come out in). Keep a cursor starting
-    #   at PAGE_SIZE.
-    # - For each cell: move the cursor back by len(cell), write the cell's
-    #   own bytes into `parsed_page` at the new cursor position, and
-    #   remember that cursor value as this cell's offset.
-    # - Once every cell is placed, write each remembered offset into the
-    #   pointer array starting at cell_ptr_start, 2 bytes each (big-endian),
-    #   in the same order as body.cells.
-    # - Write the final cursor value into parsed_page[5:7] (content start)
-    #   — this is PAGE_SIZE if body.cells is empty.
     cur_offset = PAGE_SIZE
    
     ptrs = []

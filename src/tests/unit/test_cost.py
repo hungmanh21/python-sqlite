@@ -15,7 +15,6 @@ from quilldb.plan.predicates import Predicate
 from quilldb.plan.statistics import IndexStats, TableStats
 from quilldb.sql.binder import BoundLiteral
 
-
 _TABLE_STATS = TableStats(row_count=10_000, page_count=200, height=3)
 _STATS = IndexStats(row_count=10_000, rows_per_prefix=(100, 10, 2), height=3, leaf_pages=100)
 

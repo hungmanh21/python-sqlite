@@ -27,7 +27,6 @@ Two mechanical steps get you the whole thing:
 
 from dataclasses import dataclass
 
-
 from quilldb.sql.binder import (
     BoundBinaryOp,
     BoundColumn,
@@ -36,7 +35,6 @@ from quilldb.sql.binder import (
     BoundLiteral,
     BoundUnaryOp,
 )
-
 
 # SQLite's optoverview.html SS2 list, minus what this grammar can't even
 # produce (IN, GLOB) and minus "!=" -- inequality-of-negation isn't in the

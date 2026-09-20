@@ -16,9 +16,7 @@ below record which.
 
 import itertools
 
-
 import pytest
-
 
 from quilldb.codec.record import encode_record
 from quilldb.errors import ColumnNotFoundError, TypeMismatchError
@@ -32,8 +30,6 @@ from quilldb.sql.binder import (
     BoundLiteral,
     BoundUnaryOp,
 )
-
-
 
 
 def _lit(value: object) -> BoundLiteral:

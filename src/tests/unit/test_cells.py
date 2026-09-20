@@ -2,7 +2,6 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-
 from quilldb.btree.cells import (
     MIN_LOCAL_PAYLOAD,
     decode_interior_index_cell,
@@ -19,7 +18,6 @@ from quilldb.btree.cells import (
 from quilldb.codec.varint import encode_uvarint, to_twos_complement
 from quilldb.constants import USABLE_SIZE, PageType
 from quilldb.errors import MalformedCellError
-
 
 I64_MIN = -(2**63)
 I64_MAX = 2**63 - 1

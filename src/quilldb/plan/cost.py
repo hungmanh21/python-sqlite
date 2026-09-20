@@ -25,10 +25,8 @@ default, not a measurement of this project's disk.
 
 import math
 
-
 from quilldb.plan.planner import AccessPath, PlanCost
 from quilldb.plan.statistics import IndexStats, TableStats
-
 
 SEQ_PAGE_COST = 1.0
 RANDOM_PAGE_COST = 4.0

@@ -39,7 +39,6 @@ the lifetime of a Connection.
 from functools import cmp_to_key
 from itertools import pairwise
 
-
 from quilldb.btree.cells import decode_leaf_table_cell, encode_leaf_table_cell
 from quilldb.btree.cursor import TableCursor
 from quilldb.btree.index import IndexBTree, compare_keys
@@ -61,7 +60,6 @@ from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.page import PageBody, parse_page, serialize_page, write_page_body
 from quilldb.storage.pager import Pager, page_header_offset
-
 
 _RESERVED_PREFIX = "sqlite_"
 _CATALOG_COLUMN_COUNT = 5

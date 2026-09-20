@@ -10,11 +10,8 @@ docstring goes into why load() has to work this way).
 
 from dataclasses import dataclass
 
-
 from quilldb.errors import ColumnNotFoundError
 from quilldb.sql.ast import DataType
-
-
 
 
 @dataclass(frozen=True)

@@ -2,7 +2,6 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-
 from quilldb.btree.cells import encode_interior_table_cell, encode_leaf_table_cell
 from quilldb.btree.search import (
     binary_search_leaf,
@@ -12,8 +11,6 @@ from quilldb.btree.search import (
 )
 from quilldb.constants import PageType
 from quilldb.storage.page import PageBody
-
-
 
 
 def _leaf_cell(rowid: int) -> bytes:

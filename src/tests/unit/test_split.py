@@ -2,10 +2,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-
 from quilldb.btree.split import split_cells, split_interior_cells
-
-
 
 
 def _cells_and_keys(keys: list[int]) -> tuple[list[bytes], list[int]]:

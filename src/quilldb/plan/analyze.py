@@ -181,16 +181,16 @@ def measure_index(pager: Pager, pool: BufferPool, root: int, n_key_columns: int)
             TableStats.page_count -- cost.py's IndexScan formula only ever
             scales `leaf_pages`, never counts interior pages, so that's the
             only page count worth keeping here).
-          - `rows_per_prefix`: computed below -- this is the TODO(human).
+          - `rows_per_prefix`: computed below, from `leaf_keys`.
 
 
     The page walk below (first loop) mirrors measure_table's DFS exactly,
     just over LEAF_INDEX/INTERIOR_INDEX pages via decode_interior_index_cell
     instead of decode_interior_table_cell. It leaves `leaf_keys` populated
     with every stored key IN INDEX ORDER (leaves are visited left to right,
-    and _decode_index_key preserves per-leaf cell order) -- ready for the
-    TODO(human) below to consume without doing any of its own tree
-    traversal.
+    and _decode_index_key preserves per-leaf cell order), so the
+    rows_per_prefix pass below consumes it without doing any of its own
+    tree traversal.
     """
     row_count = 0
     leaf_pages = 0

@@ -5,7 +5,6 @@ and the documented fallback for an unanalyzed table or index.
 
 import pytest
 
-
 from quilldb.catalog.schema import IndexSchema
 from quilldb.errors import CorruptDatabaseError
 from quilldb.plan.statistics import (
@@ -14,7 +13,6 @@ from quilldb.plan.statistics import (
     default_table_stats,
     parse_stat1,
 )
-
 
 _ABC = IndexSchema("abc", "t", ("a", "b", "c"), unique=False, root_page=3, sql="CREATE INDEX abc ON t(a,b,c)")
 _SINGLE = IndexSchema("ix_a", "t", ("a",), unique=False, root_page=4, sql="CREATE INDEX ix_a ON t(a)")

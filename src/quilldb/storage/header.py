@@ -141,25 +141,26 @@ class FileHeader:
         Raises:
             InvalidHeaderError: the file is well-formed but unsupported here.
         """
-        # TODO(human): decide, field by field, what quilldb refuses vs tolerates.
+        # REFUSE vs TOLERATE, decided field by field. Every field below can
+        # legally hold a value quilldb does not implement, so each one is
+        # either refused (InvalidHeaderError) or read past and ignored.
         #
-        # Every field below can legally hold values quilldb does not implement.
-        # For each one you must pick REFUSE (raise InvalidHeaderError) or
-        # TOLERATE (read the file anyway and ignore the field):
+        # The rule: TOLERATE is safe only when misreading the field cannot
+        # corrupt data or return wrong answers. Ignoring `user_version` costs
+        # nothing. Ignoring `reserved_space` makes every page shorter than
+        # this code believes, so payload bytes get read out of trailing space
+        # that isn't payload -- silent wrong answers, not a crash.
         #
-        #   page_size            not 4096 — you hardcoded 4096 everywhere
-        #   write_version == 2   the file is in WAL mode; you only do journals
-        #   read_version == 2    ditto, but for reading
-        #   reserved_space != 0  every page is shorter than you think it is
-        #   text_encoding != 1   UTF-16; your codec assumes UTF-8
-        #   schema_format != 4   1..3 lack serial types 8 and 9
-        #   largest_root_page    non-zero means auto-vacuum, with pointer maps
-        #     / incremental_vacuum   interleaved among the pages you'd walk
+        # Everything below came out REFUSE, because each one either changes
+        # where bytes live or what they mean:
         #
-        # The rule to reason from: TOLERATE is safe only when misreading the
-        # field cannot corrupt data or return wrong answers. Silently ignoring
-        # reserved_space makes you read bytes that are not payload. Silently
-        # ignoring user_version costs nothing.
+        #   page_size != 4096     4096 is hardcoded throughout
+        #   write/read_version 2  WAL mode; only rollback journals here
+        #   reserved_space != 0   every page is shorter than assumed
+        #   text_encoding != 1    UTF-16; the codec assumes UTF-8
+        #   schema_format != 4    1..3 lack serial types 8 and 9
+        #   largest_root_page     auto-vacuum, with pointer maps interleaved
+        #   / incremental_vacuum  among the pages a walk would visit
         if self.page_size != PAGE_SIZE:
             raise InvalidHeaderError(f"PAGE SIZE must be {PAGE_SIZE}")
        

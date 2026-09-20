@@ -52,7 +52,6 @@ matters most, since comparisons are what WHERE clauses are made of.
 
 from typing import Any
 
-
 from quilldb.codec.record import Value
 from quilldb.errors import ColumnNotFoundError, TypeMismatchError, UnsupportedFeatureError
 from quilldb.sql.binder import (
@@ -63,7 +62,6 @@ from quilldb.sql.binder import (
     BoundLiteral,
     BoundUnaryOp,
 )
-
 
 type Row = tuple[Value, ...]
 type TruthValue = bool | None
