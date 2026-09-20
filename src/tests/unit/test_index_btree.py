@@ -124,10 +124,16 @@ def _full_index_interior(right_child: int, start_child: int = 10_000) -> tuple[P
 
 
 def _build_two_leaf_index(pager: Pager, pool: BufferPool) -> tuple[IndexBTree, int, int, int]:
-    """Root -> {leaf_a ["a"], leaf_b ["b"] via right_child} -- hand-built,
-    never through insert(), so a delete-cascade failure here is unambiguous.
+    """Root -> {leaf_a ["A"], divider ["a"], leaf_b ["b"] via right_child} --
+    hand-built, never through insert(), so a delete-cascade failure here is
+    unambiguous.
+
+
+    Three entries, not two: the root's divider ("a", 1) is itself one of
+    them (SS11.6) and so must NOT be repeated in the leaf below it, which
+    therefore carries a strictly smaller key of its own.
     """
-    leaf_a = _write_page(pager, pool, PageBody(PageType.LEAF_INDEX, cells=[_leaf_index_cell(["a"], 1)]))
+    leaf_a = _write_page(pager, pool, PageBody(PageType.LEAF_INDEX, cells=[_leaf_index_cell(["A"], 0)]))
     leaf_b = _write_page(pager, pool, PageBody(PageType.LEAF_INDEX, cells=[_leaf_index_cell(["b"], 2)]))
     root = _write_page(
         pager,
@@ -287,7 +293,13 @@ def test_insert_splits_a_full_root_leaf_and_promotes_the_left_maximum(pager, poo
 
 
 def test_insert_splits_a_leaf_and_promotes_into_an_existing_parent(pager, pool) -> None:
-    left_leaf = _write_page(pager, pool, PageBody(PageType.LEAF_INDEX, cells=[_leaf_index_cell(["a"], -1)]))
+    """Note the fixture: the root's separator ("a", -1) does NOT also appear
+    in the leaf below it. An index interior cell is a live entry (SS11.6), so
+    a hand-built tree that repeats its separator downstairs is malformed --
+    it is the very shape a copy-up leaf split would wrongly produce. The left
+    leaf therefore holds a strictly smaller key of its own.
+    """
+    left_leaf = _write_page(pager, pool, PageBody(PageType.LEAF_INDEX, cells=[_leaf_index_cell(["A"], -2)]))
     full_right_leaf, next_n = _full_index_leaf(0)
     right_leaf = _write_page(pager, pool, full_right_leaf)
     root = _write_page(
@@ -321,7 +333,8 @@ def test_insert_splits_a_leaf_and_promotes_into_an_existing_parent(pager, pool) 
     assert root_body.right_child not in (left_leaf, right_leaf, root)
 
 
-    expected = [(["a"], -1)] + [([f"k{n:06d}"], n) for n in range(next_n + 1)]
+    # In-order: left leaf, then the root's own entry, then the right subtree.
+    expected = [(["A"], -2), (["a"], -1)] + [([f"k{n:06d}"], n) for n in range(next_n + 1)]
     assert list(idx.scan()) == expected
 
 
@@ -417,12 +430,15 @@ def test_delete_last_entry_collapses_root_to_an_empty_leaf(index) -> None:
 
 
 def test_delete_empty_non_root_leaf_frees_the_page(pager, pool) -> None:
+    """Emptying leaf_a frees it, and its divider ("a", 1) is not destroyed
+    along with the parent cell -- it descends into the sibling leaf_b.
+    """
     idx, leaf_a, leaf_b, root = _build_two_leaf_index(pager, pool)
 
 
-    assert idx.delete(["a"], 1) is True
-    assert list(idx.seek_eq(["a"])) == []
-    assert list(idx.scan()) == [(["b"], 2)]
+    assert idx.delete(["A"], 0) is True
+    assert list(idx.seek_eq(["A"])) == []
+    assert list(idx.scan()) == [(["a"], 1), (["b"], 2)]
     assert pager.allocate_page() == leaf_a  # freed page reused
 
 

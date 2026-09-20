@@ -1,4 +1,4 @@
-"""Index b-trees: the same B+tree with the payload thrown away.
+"""Index b-trees: a TRUE b-tree, unlike the table b-tree next door.
 
 
 An index entry is a RECORD whose columns are (indexed values..., rowid) -- the
@@ -39,7 +39,6 @@ regardless of how deep the tree got.
 from collections.abc import Iterator, Sequence
 from typing import Any, cast
 
-
 from quilldb.btree.cells import (
     decode_interior_index_cell,
     decode_leaf_index_cell,
@@ -49,14 +48,12 @@ from quilldb.btree.cells import (
 )
 from quilldb.btree.split import split_cells
 from quilldb.codec.record import Value, decode_record, encode_record
-from quilldb.constants import PageType
-from quilldb.errors import PageFullError
+from quilldb.constants import PAGE_SIZE, PageType
+from quilldb.errors import BTreeInvariantError, PageFullError
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.overflow import free_overflow_chain, read_overflow_chain, write_overflow_chain
 from quilldb.storage.page import PageBody, parse_page, serialize_page
 from quilldb.storage.pager import Pager
-
-
 
 
 def encode_index_key(values: Sequence[Value], rowid: int) -> bytes:
@@ -75,8 +72,6 @@ def encode_index_key(values: Sequence[Value], rowid: int) -> bytes:
         The encoded key -- exactly what a leaf/interior index cell's
         payload holds.
     """
-    # TODO(human): one line. What does week 1's record encoder already
-    # know how to do that makes this trivial?
     return encode_record((*values, rowid))
 
 
@@ -104,10 +99,6 @@ def compare_keys(a: Sequence[Value], b: Sequence[Value]) -> int:
     Returns:
         -1 if a < b, 0 if every compared column is equal, 1 if a > b.
     """
-    # TODO(human): for each of the first min(len(a), len(b)) columns, rank
-    # the value's storage class (NULL / numeric / text / blob), compare
-    # ranks first, and only compare same-class values directly. Return as
-    # soon as one column decides the answer.
     def _rank(value: Value) -> int:
         if value is None:
             return 0
@@ -295,33 +286,29 @@ class IndexBTree:
         """Remove the entry for exactly this (values, rowid).
 
 
-        Returns False if absent. Same uniform empty-page cascade as
-        btree.py's BTree.delete() -- see that method's docstring for the
-        two traps (removing a child from a parent is not "removing a row",
-        and a page read through the pool must be discard()ed before it's
-        freed) and the tolerated-single-child rule. The only real
-        difference is that a "child" in the loop below is identified by
-        slot, and an emptied interior page's own last cell/right_child is
-        removed the same way regardless of whether its keys are ints or
-        decoded tuples.
+        Returns False if absent. Unlike a table b-tree, the entry may live
+        on an INTERIOR page: an index divider is itself a live entry
+        (SS11.6), so there is no leaf copy to fall back on and deleting a
+        divider is the classic delete-from-an-internal-node problem. The
+        two cases split here and rejoin at _collapse_empty_leaf().
         """
         key = (*values, rowid)
-        path = self._find_leaf(key)
+        path, found_in_leaf = self._locate(key)
+        if path is None:
+            return False
+
+
+        if not found_in_leaf:
+            self._replace_divider_with_predecessor(path)
+            return True
+
+
         leaf_page_id, leaf_slot = path[-1]
-
-
         raw = self.pool.get_page(leaf_page_id)
         dirty = False
         try:
             body = parse_page(raw)
-            if leaf_slot >= len(body.cells):
-                return False
-            found_key = self._decode_key(PageType.LEAF_INDEX, body.cells[leaf_slot])
-            if compare_keys(found_key, key) != 0:
-                return False
             _, _, overflow_page = decode_leaf_index_cell(body.cells[leaf_slot])
-
-
             body.delete_cell(leaf_slot)
             leaf_now_empty = not body.cells
             raw[:] = serialize_page(body)
@@ -334,54 +321,281 @@ class IndexBTree:
             free_overflow_chain(self.pager, self.pool, overflow_page)
 
 
-        if not leaf_now_empty or leaf_page_id == self.root:
-            return True
+        if leaf_now_empty:
+            self._collapse_empty_leaf(path)
+        return True
 
 
-        child_to_free = leaf_page_id
-        level = len(path) - 2
+    def _locate(self, key: tuple[Value, ...]) -> tuple[list[tuple[int, int]] | None, bool]:
+        """Find `key` exactly, anywhere in the tree.
+
+
+        Returns (path, found_in_leaf). `path` is None when the key is
+        absent. When found_in_leaf is False the path's last element is the
+        INTERIOR page holding the entry, and its slot indexes the cell --
+        the case a table b-tree never has to consider.
+        """
+        path: list[tuple[int, int]] = []
+        page_id = self.root
 
 
         while True:
-            parent_page_id, child_slot = path[level]
-            parent_raw = self.pool.get_page(parent_page_id)
-            dirty = False
+            current_page_id = page_id
+            raw = self.pool.get_page(current_page_id)
             try:
-                parent = parse_page(parent_raw)
+                body = parse_page(raw)
 
 
-                if child_slot < len(parent.cells):
-                    parent.delete_cell(child_slot)
-                elif parent.cells:
-                    new_right_child = decode_interior_index_cell(parent.cells[-1])[0]
-                    parent.delete_cell(len(parent.cells) - 1)
-                    parent.right_child = new_right_child
-                else:
-                    parent.right_child = 0
+                if body.page_type is PageType.LEAF_INDEX:
+                    slot = self._leaf_lower_bound(body, key)
+                    path.append((current_page_id, slot))
+                    if slot >= len(body.cells):
+                        return None, True
+                    found = self._decode_key(PageType.LEAF_INDEX, body.cells[slot])
+                    return (path, True) if compare_keys(found, key) == 0 else (None, True)
 
 
-                parent_is_empty = not parent.cells and parent.right_child == 0
+                slot = self._interior_slot(body, key)
+                path.append((current_page_id, slot))
+                # _interior_slot sends "probe <= separator" left, so an exact
+                # match is always AT `slot`, never past it.
+                if slot < len(body.cells):
+                    separator = self._decode_key(PageType.INTERIOR_INDEX, body.cells[slot])
+                    if compare_keys(separator, key) == 0:
+                        return path, False
+                page_id = self._children(body)[slot]
+            finally:
+                self.pool.unpin(current_page_id)
 
 
-                if level == 0 and parent_is_empty:
+    def _rightmost_leaf_path(self, path: list[tuple[int, int]], page_id: int) -> list[tuple[int, int]]:
+        """Mirror of _descend_leftmost: descend to the RIGHTMOST leaf of the
+        subtree at `page_id`, appending one (page_id, slot) per level. An
+        interior page's slot is len(cells) -- the right_child position --
+        and the final leaf's slot indexes its last cell.
+        """
+        while True:
+            current_page_id = page_id
+            raw = self.pool.get_page(current_page_id)
+            try:
+                body = parse_page(raw)
+                if body.page_type is PageType.LEAF_INDEX:
+                    path.append((current_page_id, len(body.cells) - 1))
+                    return path
+                path.append((current_page_id, len(body.cells)))
+                page_id = body.right_child
+            finally:
+                self.pool.unpin(current_page_id)
+
+
+    def _replace_divider_with_predecessor(self, path: list[tuple[int, int]]) -> None:
+        """Delete the entry stored in an INTERIOR cell, named by path[-1]'s
+        (page_id, slot).
+
+
+        A divider cannot simply be dropped: its cell also carries the child
+        pointer for everything to its left, so removing the cell would
+        orphan that whole subtree. The standard move is to overwrite the
+        divider's PAYLOAD with a neighbouring entry promoted from a leaf --
+        keeping the child pointer untouched -- and then delete that entry
+        from the leaf it came from, where dropping a cell is safe.
+
+
+        Helpers available:
+            self._rightmost_leaf_path(list(path), child) -- path to the
+                rightmost leaf of the subtree at `child`, whose last cell is
+                the divider's in-order predecessor.
+            self._children(body)[slot] -- the divider's left child.
+            decode_leaf_index_cell / encode_interior_index_cell -- a leaf
+                cell's (total_len, local, overflow_page) transplant into an
+                interior cell unchanged, because both page types share one
+                max-local formula.
+            free_overflow_chain(self.pager, self.pool, page) -- release the
+                divider's own spilled pages once it is overwritten.
+            self._collapse_empty_leaf(leaf_path) -- run the empty-page
+                cascade if the donor leaf just lost its last cell.
+        """
+        page_id, slot = path[-1]
+
+
+        # The divider's child pointer is the one thing that must survive
+        # untouched; its payload is what we are replacing, so its overflow
+        # chain (if any) is about to become unowned.
+        raw = self.pool.get_page(page_id)
+        try:
+            body = parse_page(raw)
+            left_child, _, _, divider_overflow = decode_interior_index_cell(body.cells[slot])
+        finally:
+            self.pool.unpin(page_id)
+
+
+        # PREDECESSOR, not successor: the rightmost entry of the left subtree
+        # is the largest key still below the divider, so promoting it keeps
+        # "everything left of this cell < its key" true without touching the
+        # right subtree at all. The successor would work symmetrically, but
+        # the left child is the pointer this cell already owns, so the
+        # predecessor is the one reachable without consulting a sibling.
+        leaf_path = self._rightmost_leaf_path(list(path), left_child)
+        leaf_page_id, leaf_slot = leaf_path[-1]
+
+
+        raw = self.pool.get_page(leaf_page_id)
+        try:
+            leaf = parse_page(raw)
+            if not leaf.cells:
+                raise BTreeInvariantError(
+                    f"page {leaf_page_id}: the left subtree of the divider on page {page_id} "
+                    f"ends in an empty leaf, so it has no predecessor to promote"
+                )
+            promoted_len, promoted_local, promoted_overflow = decode_leaf_index_cell(leaf.cells[leaf_slot])
+        finally:
+            self.pool.unpin(leaf_page_id)
+
+
+        replacement = encode_interior_index_cell(left_child, promoted_len, promoted_local, promoted_overflow)
+
+
+        # Check the swap fits BEFORE anything is mutated. The predecessor's
+        # key can be longer than the divider it replaces, and serialize_page
+        # only discovers an over-full page after the caller has committed to
+        # the change -- which, with no rollback before week 5, would mean a
+        # half-applied delete.
+        raw = self.pool.get_page(page_id)
+        dirty = False
+        try:
+            body = parse_page(raw)
+            body.cells[slot] = replacement
+            if body.used_bytes() > PAGE_SIZE:
+                raise PageFullError(
+                    f"cannot delete this index divider: its replacement key is longer and page "
+                    f"{page_id} has no room -- needs interior rebalancing, unimplemented"
+                )
+            raw[:] = serialize_page(body)
+            dirty = True
+        finally:
+            self.pool.unpin(page_id, dirty=dirty)
+
+
+        # The promoted entry now lives upstairs and ONLY upstairs. Its
+        # overflow chain moved with it -- exactly one owner, as always.
+        raw = self.pool.get_page(leaf_page_id)
+        dirty = False
+        try:
+            leaf = parse_page(raw)
+            leaf.delete_cell(leaf_slot)
+            leaf_now_empty = not leaf.cells
+            raw[:] = serialize_page(leaf)
+            dirty = True
+        finally:
+            self.pool.unpin(leaf_page_id, dirty=dirty)
+
+
+        if divider_overflow:
+            free_overflow_chain(self.pager, self.pool, divider_overflow)
+
+
+        if leaf_now_empty:
+            self._collapse_empty_leaf(leaf_path)
+
+
+    def _collapse_empty_leaf(self, path: list[tuple[int, int]]) -> None:
+        """Free a page that just lost its last cell, preserving the divider
+        that pointed at it.
+
+
+        This is where an index b-tree parts company with btree.py's cascade
+        most sharply. There, an empty child is unlinked by deleting the
+        parent cell that pointed at it, and nothing is lost because a table
+        interior cell is pure routing. Here that cell is a live entry
+        (SS11.6), so deleting it would silently drop a row from the index.
+
+
+        So the divider DESCENDS instead -- the classic b-tree merge. The
+        empty child is dropped and its divider is pushed into the sibling it
+        used to separate, becoming an ordinary leaf entry there: prepended
+        to the right sibling, or appended to the left one when the empty
+        page was the rightmost child. Pages go away; entries never do.
+
+
+        Scope cut, documented rather than silent: if the sibling has no room
+        for the descending divider, the empty page is simply LEFT LINKED,
+        empty. That wastes a page until something reuses it, and is
+        deliberately preferred to raising -- a half-applied DELETE has no
+        rollback to fall back on before week 5, so a delete that has already
+        removed a cell must not then fail.
+        """
+        page_id, _ = path[-1]
+        if page_id == self.root:
+            return
+
+
+        parent_page_id, child_slot = path[-2]
+
+
+        parent_raw = self.pool.get_page(parent_page_id)
+        parent_dirty = False
+        unlink_parent_too = False
+        freed = False
+        try:
+            parent = parse_page(parent_raw)
+            children = self._children(parent)
+
+
+            if not parent.cells:
+                # A single-child interior page: no divider to rescue, so the
+                # page itself is redundant once its only child is gone.
+                parent.right_child = 0
+                freed = True
+                if parent_page_id == self.root:
                     parent_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX))
                 else:
                     parent_raw[:] = serialize_page(parent)
-                dirty = True
-            finally:
-                self.pool.unpin(parent_page_id, dirty=dirty)
+                    unlink_parent_too = True
+                parent_dirty = True
+            else:
+                if child_slot < len(parent.cells):
+                    donor_slot, sibling_id, prepend = child_slot, children[child_slot + 1], True
+                else:
+                    donor_slot = len(parent.cells) - 1
+                    sibling_id, prepend = children[donor_slot], False
 
 
-            self.pool.discard(child_to_free)
-            self.pager.free_page(child_to_free)
+                _, total_len, local, overflow_page = decode_interior_index_cell(parent.cells[donor_slot])
+                descending = encode_leaf_index_cell(total_len, local, overflow_page)
 
 
-            if level == 0 or not parent_is_empty:
-                return True
+                sibling_raw = self.pool.get_page(sibling_id)
+                sibling_dirty = False
+                merged = False
+                try:
+                    sibling = parse_page(sibling_raw)
+                    if sibling.page_type is PageType.LEAF_INDEX and sibling.fits(len(descending)):
+                        sibling.insert_cell(0 if prepend else len(sibling.cells), descending)
+                        sibling_raw[:] = serialize_page(sibling)
+                        sibling_dirty = True
+                        merged = True
+                finally:
+                    self.pool.unpin(sibling_id, dirty=sibling_dirty)
 
 
-            child_to_free = parent_page_id
-            level -= 1
+                if merged:
+                    parent.delete_cell(donor_slot)
+                    if not prepend:
+                        # The empty page WAS right_child; the sibling that
+                        # absorbed the divider takes over that role.
+                        parent.right_child = sibling_id
+                    parent_raw[:] = serialize_page(parent)
+                    parent_dirty = True
+                    freed = True
+        finally:
+            self.pool.unpin(parent_page_id, dirty=parent_dirty)
+
+
+        if freed:
+            self.pool.discard(page_id)
+            self.pager.free_page(page_id)
+        if unlink_parent_too:
+            self._collapse_empty_leaf(path[:-1])
 
 
     # ---- descent, keyed by compare_keys instead of int comparison --------
@@ -486,33 +700,30 @@ class IndexBTree:
                 self.pool.unpin(current_page_id)
 
 
-    def _next_leaf_path(self, path: list[tuple[int, int]]) -> list[tuple[int, int]] | None:
-        """Ascend past an exhausted leaf until an ancestor has an unvisited
-        next child, then descend leftmost from there. None if the whole
-        tree is exhausted.
-        """
-        path = list(path)
-        path.pop()
-        while path:
-            page_id, slot = path[-1]
-            raw = self.pool.get_page(page_id)
-            try:
-                body = parse_page(raw)
-                children = self._children(body)
-            finally:
-                self.pool.unpin(page_id)
-
-
-            if slot + 1 < len(children):
-                path[-1] = (page_id, slot + 1)
-                return self._descend_leftmost(path, children[slot + 1])
-            path.pop()
-
-
-        return None
-
-
     def _scan_forward(self, path: list[tuple[int, int]]) -> Iterator[tuple[Value, ...]]:
+        """Every entry from `path`'s position to the end of the tree, in key
+        order -- interior entries included.
+
+
+        This is a TRUE b-tree in-order walk, not a B+tree's leaf-to-leaf
+        chain, because an index interior cell holds a live entry rather than
+        a routing copy (SS11.6). The order is therefore
+
+
+            child[0], cells[0], child[1], cells[1], ..., cells[n-1], right_child
+
+
+        and an ancestor's cell is emitted on the way back UP out of the
+        subtree it separates -- which is precisely when that key's turn
+        comes. Skipping it, as a leaf-only walk does, silently drops one
+        entry per interior cell from every scan, seek and uniqueness check
+        built on this generator.
+
+
+        Descent already agrees with this: _interior_slot sends a probe equal
+        to a separator LEFT, so the subtree below is exhausted first and the
+        separator itself follows in the right place.
+        """
         path = list(path)
         while path:
             leaf_page_id, leaf_slot = path[-1]
@@ -527,10 +738,41 @@ class IndexBTree:
             yield from leaf_keys
 
 
-            next_path = self._next_leaf_path(path)
-            if next_path is None:
+            # Ascend until an ancestor still has a cell to its right. Because
+            # children == cells + [right_child], "slot < len(cells)" is both
+            # "there is a separator here to emit" and "there is another child
+            # after it" -- the two can never disagree.
+            path.pop()
+            descended = False
+            while path:
+                page_id, slot = path[-1]
+                raw = self.pool.get_page(page_id)
+                try:
+                    body = parse_page(raw)
+                    if slot < len(body.cells):
+                        separator = self._decode_key(PageType.INTERIOR_INDEX, body.cells[slot])
+                        next_child = self._children(body)[slot + 1]
+                    else:
+                        separator = None
+                        next_child = 0
+                finally:
+                    self.pool.unpin(page_id)
+
+
+                if separator is None:
+                    path.pop()
+                    continue
+
+
+                yield separator
+                path[-1] = (page_id, slot + 1)
+                path = self._descend_leftmost(path, next_child)
+                descended = True
+                break
+
+
+            if not descended:
                 return
-            path = next_path
 
 
     # ---- one-level split (see module docstring for the scope cut) --------
@@ -569,7 +811,29 @@ class IndexBTree:
             _, insert_slot = path[-1]
             combined_cells = body.cells[:insert_slot] + [new_cell] + body.cells[insert_slot:]
             combined_keys = keys[:insert_slot] + [key] + keys[insert_slot:]
-            left_cells, right_cells, separator = split_cells(combined_cells, combined_keys, use_append_split)
+            left_cells, right_cells, _separator = split_cells(combined_cells, combined_keys, use_append_split)
+
+
+            # THE index-vs-table difference (SS11.6). split_cells() picks the
+            # separator the way a TABLE leaf split needs it: as a COPY that
+            # stays in left_cells and is also promoted. That is right when the
+            # parent cell is pure routing ([child][rowid], no payload), because
+            # then promoting it adds no entry. An index interior cell carries a
+            # full record and IS a live entry, so copying would make the tree
+            # gain one entry per split -- a duplicate row to anything reading
+            # the file, and the reason `PRAGMA integrity_check` reports
+            # "wrong # of entries in index". So the separator is CONSUMED here,
+            # exactly as split_interior_cells() consumes one: it leaves the leaf
+            # and lives only upstairs. A split rebalances; it never invents.
+            promoted_index = len(left_cells) - 1
+            promoted_cell = left_cells.pop()
+
+
+            if not left_cells:
+                raise PageFullError(
+                    "cannot split this index leaf: promoting its separator would leave the left "
+                    "page empty -- needs three-way rebalancing, unimplemented"
+                )
 
 
             if not (_fits_one_leaf_index_page(left_cells) and _fits_one_leaf_index_page(right_cells)):
@@ -579,17 +843,17 @@ class IndexBTree:
                 )
 
 
-            # The separator's own cell is a FRESH, independent copy of its
-            # payload -- including its own overflow chain, if it spills --
-            # never a pointer shared with the leaf entry it was copied from.
-            # Two cells that both thought they owned the same overflow chain
-            # would double-free it the moment either one was deleted.
-            separator_payload = encode_record(list(separator))
-            sep_local_len = local_payload_size(PageType.INTERIOR_INDEX, len(separator_payload))
-            sep_local_payload = separator_payload[:sep_local_len]
-            sep_spills = sep_local_len < len(separator_payload)
+            # A consumed separator hands its payload to the interior cell
+            # wholesale -- including its overflow chain, whose pages simply
+            # change owner. That is safe here precisely because it is a MOVE:
+            # the leaf cell is gone, so exactly one cell points at the chain
+            # and nothing can double-free it. It is also exact: LEAF_INDEX and
+            # INTERIOR_INDEX share one max-local formula, so the local/spilled
+            # boundary lands on the same byte for both and the local prefix
+            # needs no re-cutting.
+            promoted_len, promoted_local, promoted_overflow = decode_leaf_index_cell(promoted_cell)
             placeholder_separator_cell = encode_interior_index_cell(
-                page_id, len(separator_payload), sep_local_payload, overflow_page=1 if sep_spills else 0
+                page_id, promoted_len, promoted_local, overflow_page=1 if promoted_overflow else 0
             )
 
 
@@ -603,10 +867,16 @@ class IndexBTree:
             if spills:
                 overflow_page = write_overflow_chain(self.pager, self.pool, payload[local_len:])
                 real_cell = encode_leaf_index_cell(len(payload), local_payload, overflow_page)
-                if insert_slot < len(left_cells):
+                # The new key may have landed on either side OR become the
+                # promoted separator itself -- all three are reachable, since
+                # split_cells chooses the boundary by bytes, not by slot.
+                if insert_slot < promoted_index:
                     left_cells[insert_slot] = real_cell
+                elif insert_slot == promoted_index:
+                    promoted_cell = real_cell
+                    promoted_len, promoted_local, promoted_overflow = decode_leaf_index_cell(real_cell)
                 else:
-                    right_cells[insert_slot - len(left_cells)] = real_cell
+                    right_cells[insert_slot - promoted_index - 1] = real_cell
 
 
             right_page_id = self.pager.allocate_page()
@@ -614,11 +884,8 @@ class IndexBTree:
                 right_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=right_cells))
 
 
-            sep_overflow_page = (
-                write_overflow_chain(self.pager, self.pool, separator_payload[sep_local_len:]) if sep_spills else 0
-            )
             new_left_cell = encode_interior_index_cell(
-                page_id, len(separator_payload), sep_local_payload, sep_overflow_page
+                page_id, promoted_len, promoted_local, promoted_overflow
             )
 
 
@@ -629,7 +896,7 @@ class IndexBTree:
 
 
                 new_left_cell = encode_interior_index_cell(
-                    left_page_id, len(separator_payload), sep_local_payload, sep_overflow_page
+                    left_page_id, promoted_len, promoted_local, promoted_overflow
                 )
                 new_root = PageBody(PageType.INTERIOR_INDEX, cells=[new_left_cell], right_child=right_page_id)
                 raw[:] = serialize_page(new_root)
