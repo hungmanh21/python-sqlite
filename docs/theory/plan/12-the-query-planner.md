@@ -495,6 +495,15 @@ a candidate available, and because "an index on `(a,b,c)` is useless for `WHERE 
 confident simplification that a well-read interviewer will correct. A planner can be genuinely
 cost-based without implementing every access path SQLite knows.
 
+> ELI5 version of the same point: this section is here to teach a *concept* — that statistics can make
+> a whole new plan possible, not just re-rank plans you already had — and skip-scan happens to be the
+> clearest example of that concept in the real SQLite docs. Building a toy engine to prove you
+> understand combustion doesn't require also bolting on a turbocharger; the lesson doesn't need the
+> extra part. The second reason is more defensive: it's on record that skip-scan was understood (its
+> statistics-gating, its ~18-duplicate threshold, its leading-gap-only behavior) and deliberately not
+> built, rather than missed. "We didn't implement it" and "we didn't know about it" read very
+> differently to a reviewer.
+
 
 ---
 
@@ -545,6 +554,15 @@ the decision changed with them.** That is what "cost-based" means, demonstrated 
 and controlled statistics injection is a useful diagnostic technique on a test copy. Directly editing
 production statistics is risky because every query sharing them may be replanned.
 
+> ELI5: picture two filing cabinets for finding a person — one sorted by eye color (only 2 possible
+> values, so "brown eyes" still leaves thousands of matches), one sorted by exact street address (1,000
+> possible values, so it narrows you to ~10 people). Asked to find "the brown-eyed person on Elm St,"
+> you obviously check the street-address cabinet first — it's the one statistics say is useful. The
+> experiment then secretly swaps the labels on the cabinets without moving a single folder, and SQLite
+> starts checking the *other* cabinet first. Nothing about the actual people changed — only the label
+> describing how useful each cabinet is — and the choice flipped anyway. That's the whole proof in one
+> picture.
+
 
 ### What's actually stored
 
@@ -585,10 +603,27 @@ withidx  | wp   | 500 1      -- UNIQUE index: last integer is 1, exactly as docu
 w        | w    | 500 1      -- WITHOUT ROWID: idx equals tbl, since the table IS the index
 ```
 
+> ELI5: these are "edge cases" because each one quietly breaks a different assumption hiding inside
+> the one-sentence format spec quoted just above. `noidx` breaks "there's always a real index with K
+> key columns to count" — this row describes the bare table, not an index, so the K+1 formula
+> degenerates to a single number. `withidx` breaks "the trailing integer is always *measured*" — for a
+> UNIQUE index there can never be a duplicate key by definition, so SQLite doesn't measure that last
+> number, it just asserts `1`. `w` breaks "an index name and a table name are always different
+> strings" — a WITHOUT ROWID table has no separate rowid B-tree for its index to sit next to; the
+> table's own B-tree *is* the index, so `idx` and `tbl` collapse to the same name. Each row is the
+> smallest example that forces the implicit assumption into view.
+
 
 Notice there is **no entry for the trailing rowid** — a 3-column index yields 4 integers, not 5.
 Statistics describe the *declared* key columns; the rowid's contribution is known to always make the
 key unique, so measuring it would be measuring a constant.
+
+> ELI5: `sqlite_stat1` is a cheat-sheet, not a photograph. For an index on `(a,b,c)` it stores just 4
+> numbers — total rows, then "on average, how many rows share the same `a`," then same for `(a,b)`,
+> then `(a,b,c)` — like summarizing a school roster as "10,000 students; ~100 share a first name; ~10
+> share a first+last name; ~2 share first+last+middle." No rowid entry exists because adding the rowid
+> to any key always drops the group size to exactly 1 — that's always true by definition, so writing it
+> down would tell you nothing you didn't already know.
 
 
 Also notice how *little* `stat1` is. Four integers per index. No histograms, no value distributions,
@@ -632,6 +667,16 @@ Since version 3.8.0 the search is the "next generation query planner," using **N
 planner kept only one — a pure greedy walk — which is fast but can be led astray by a locally cheap
 first join.
 
+> ELI5: `LogEst` stores costs as "how many zeroes," not the raw number — like writing "5" to mean
+> 100,000 instead of writing out all six digits. The payoff: when two costs *multiply* (which is what
+> happens when a join nests loops — "for each of these 100 rows, do that other thing 5,000 times" =
+> 500,000), their logarithms just *add*. Small integers, cheap addition, same ranking as if you'd
+> multiplied the big numbers. And "N Nearest Neighbors" is the search strategy on top of those costs:
+> instead of committing to whichever single next step looks cheapest right now (which can walk you into
+> a dead end — a cheap-looking first move that traps you in an expensive overall plan), it keeps the
+> top N candidate partial plans alive at each step, the way a chess player keeps a few good lines open
+> a few moves ahead instead of committing to the first plausible move.
+
 
 > ⚠️ **Citation trap.** `arch.html` is the natural place to look and it does **not** say "cost-based" —
 > it calls the planner *"an AI that strives to select the best algorithm from these millions of
@@ -661,7 +706,9 @@ should win: if `x=1` fetches half the table, one sequential pass may be cheaper 
 rowid lookups.
 
 
-That gives the pipeline worth remembering:
+That gives the pipeline worth remembering — an assembly line where each stage narrows what the next
+stage even sees: first throw out anything *illegal*, then guess row counts for what's left, then turn
+those counts into a cost, then search for the cheapest surviving path:
 
 
 ```text
@@ -681,12 +728,60 @@ Calling a planner cost-based requires this separation. Choosing the longest inde
 a number beside it is still a rule-based choice.
 
 
+### How SQLite actually builds that candidate list
+
+Everything above described candidate generation from the outside: "some process produces
+`SeqScan(t) + Filter(...)`, `IndexScan(cx, x=1) + Filter(...)`, etc." The mechanism inside `where.c`
+that actually produces those lines is worth naming, because it explains a structural choice quilldb
+deliberately didn't copy.
+
+Each candidate is a `WhereLoop` — one access path for one table. `whereLoopAddBtree()` runs once per
+table in the FROM list and, for every index on that table (plus an implicit loop for a plain rowid
+scan), calls `whereLoopAddBtreeIndex()`. That function walks the index's columns left to right — the
+same leading-column walk as §12.3 — but with two differences from "just return the longest legal
+prefix":
+
+1. **Every prefix length becomes its own candidate**, not only the longest one. Matching column `a`
+   alone is one `WhereLoop`; matching `a` and `b` is a second, independent `WhereLoop`; and so on.
+   SQLite doesn't assume longer is always cheaper — a two-column equality prefix can lose once join
+   order enters the picture, because a shorter prefix can leave a later column of the *same* index free
+   to serve as an ordering key for a downstream join, something a single-table view of the index can't
+   see.
+2. **Pruning happens during generation, not after.** Each new `WhereLoop` is handed to
+   `whereLoopInsert()` immediately, which runs the exact dominance check already quoted above in "How
+   the cost gets used": `if( rRun<=p->rRun && (prereq & p->prereq)==prereq )`. A candidate whose
+   run-cost is no better than one already kept, under the same or looser prerequisites, is discarded on
+   the spot. There is no separate "now that we have every candidate, go cost and prune them" phase —
+   costing and pruning are interleaved with generation, one column-extension at a time.
+
+A third path is worth naming even though it's out of scope for quilldb: `whereLoopAddOr()` builds a
+specialized loop for `WHERE a=1 OR b=2`, treating it as a union of two independent index seeks rather
+than one scan — the mechanism behind §12.2's "OR is special" observation.
+
+> ELI5: imagine planning a road trip through a fixed sequence of cities. SQLite doesn't just work out
+> "the longest chain of cities I can commit to, in order" and stop there — it writes down *every*
+> partial chain ("just city 1," "city 1 then city 2," "city 1 then city 2 then city 3"...) as its own
+> candidate route, and throws away a candidate the moment it's worse in every way than one already on
+> the list, without waiting until every route is written down first. Generating and comparing happen in
+> the same breath, not as two separate passes.
+
+
 ### How quilldb scopes the same architecture
 
 
 quilldb implements the complete pipeline, but over a deliberately bounded search space:
 
 
+- Candidate generation (`plan/planner.py`'s `enumerate_access_paths` and `_match_index_prefix`)
+  returns exactly one `AccessPath` per index — the single longest legal prefix — not one candidate per
+  prefix length the way `whereLoopAddBtreeIndex` does, and generation is a separate stage from costing:
+  every path is built first, then `plan/cost.py` prices all of them, then `search.py`'s
+  `choose_access_path` takes a plain `min()` over `cost.total`. There is no `whereLoopInsert`-style
+  pruning interleaved into generation. This is a legitimate simplification, not a missing feature: with
+  no join reordering benefit to a shorter prefix (single-table access paths only, at this stage) and a
+  candidate set bounded by "number of indexes on one table," generate-then-cost never grows large enough
+  for interleaved pruning to matter — the same reasoning chapter 12.6 gives for exhaustive join search
+  being fine at three tables instead of needing SQLite's N³ heuristic.
 - SQLite-style `ANALYZE` prefix averages in `quill_stat1`, without `stat4` histograms.
 - SeqScan, normal IndexScan, covering IndexScan, nested loop, index nested loop, and sort/no-sort
   alternatives. Skip-scan, OR decomposition, index intersection, and automatic indexes stay deferred.
@@ -862,8 +957,151 @@ The numbers are estimates, not promises. Keep the constants centralized, calibra
 page counters, and document them. Do not tune one magic multiplier until a preferred fixture wins.
 
 
+### Worked example: from SQL to cost
+
+Tie stages 1-3 together against one concrete query, using the same `t(a,b,c)` / index `abc` this
+chapter has used throughout.
+
+```sql
+CREATE INDEX abc ON t(a, b, c);
+SELECT * FROM t WHERE a = 1 AND b = 2 AND c > 3;
+```
+
+Stats, decoded from `quill_stat1`:
+
+```
+table_stats:  row_count=10000  page_count=100  height=3
+abc stats:    "10000 100 10 2" → row_count=10000  rows_per_prefix=(100, 10, 2)  height=3  leaf_pages=100
+```
+
+**Stage 1 — legal paths.** The `WHERE` clause splits on `AND` into three sargable predicates: `a=1`,
+`b=2`, `c>3`. Walking `abc` left to right: `a` has an equality (fully consumed, keep going — equality
+pins a single point, so `b` is still contiguous within it); `b` has an equality (same); `c` has only an
+inequality (consumed as the sandwich bound, then the walk stops — nothing is right of it anyway, since
+`c` is the last column). No gap anywhere, so the entire `WHERE` clause got absorbed into the seek:
+
+```
+seq_scan:            seek_terms=()                 residual=(a=1, b=2, c>3)
+index_scan (abc):    seek_terms=(a=1, b=2, c>3)     residual=()
+```
+
+**Stage 2 — row estimates.**
+
+```
+seq_scan:   rows_fetched = 10000                  (the whole table; nothing was sought)
+            est_rows     = 10000 * (1/3)^3 ≈ 370    (3 residual predicates, 1/3 selectivity each)
+
+index_scan: rows_fetched = rows_per_prefix[3-1] = rows_per_prefix[2] = 2   (3 distinct columns touched)
+            est_rows     = 2                         (nothing left to filter further)
+```
+
+One honest caveat: that `2` technically means "rows sharing one *exact* `(a,b,c)` value," but `c>3` is a
+range, not an equality. Row-count lookup only counts how many distinct *columns* got touched by the
+seek, not whether each one was pinned by `=` or merely bounded by `<`/`>` — `quill_stat1`'s flat K+1
+integers have no separate notion of range selectivity to draw on. This is a documented imprecision, not
+a bug: it can only make the estimate worse, never silently wrong.
+
+**Stage 3 — costs.**
+
+```
+SeqScan:    1.0 * 100  +  0.01 * 10000  =  100 + 100  =  200.0             (startup=0.0)
+
+IndexScan:  leaf_pages_touched = ceil(100 * 2 / 10000) = ceil(0.02) = 1
+            startup = 4.0 * 3 = 12.0
+            cost    = 1.0*(1-1) + 2*(4.0*3) + 0.01*2 = 0 + 24 + 0.02 = 24.02
+            total   = 12.0 + 24.02 = 36.02
+```
+
+`choose_access_path` picks `min(200.0, 36.02)` — the index scan, correctly: two selective equalities
+plus a tight bound on the third column make this a highly targeted seek.
+
+**What each cost component is, and why it's there.**
+
+SeqScan's two terms:
+
+- `SEQ_PAGE_COST × page_count` — the actual I/O: every page read exactly once, in physical order, no
+  jumping around. That's what "sequential" buys: the cheap rate.
+- `CPU_PER_ROW × row_count` — a seq scan has zero `seek_terms`, so every row, matching or not, still has
+  to be evaluated against the `WHERE` clause by `Filter`. Kept small relative to page cost, modeling
+  "I/O dominates until row counts get very large."
+
+IndexScan's four terms, in the order they're paid:
+
+- `RANDOM_PAGE_COST × height` (the seek, charged as `startup`) — descending from the index root to the
+  first matching leaf, one random page read per B+tree level.
+- `SEQ_PAGE_COST × (leaf_pages_touched - 1)` (further leaves) — leaf pages are linked, so matches
+  beyond the first leaf page are walked forward sequentially, not re-descended to from the root. The
+  `- 1` exists because `height` already paid for reaching that first leaf page during the descent.
+- `rows_fetched × (RANDOM_PAGE_COST × table_height)` (table lookups — usually the dominant term) —
+  quilldb's index entries store the indexed columns plus the rowid, not the full row, so every matched
+  row needs its own separate root-to-leaf descent into the *table's* B-tree. This is exactly what a
+  covering index would remove; quilldb doesn't model `covering` yet, so every index scan is priced as if
+  it always needs the table lookup — a deliberately pessimistic simplification, never a falsely
+  optimistic one.
+- `CPU_PER_ROW × rows_fetched` — the same per-row evaluation cost as SeqScan's, but charged only against
+  the rows the seek actually touched — the direct payoff of a selective seek.
+
+Why `RANDOM_PAGE_COST` must exceed `SEQ_PAGE_COST` at all: it's the one assumption everything else
+depends on. If random and sequential reads cost the same, an index scan's repeated table lookups
+wouldn't look any worse than a scan's forward read, and the model would lose the ability to tell "seek"
+apart from "scan."
+
+**How the seek actually finds a contiguous run, and where `leaf_pages_touched` comes from.** It's
+tempting to read this plan as "seek on `a,b`, then filter `c` once you reach the leaf" — but that's not
+quite it. `a`, `b`, and `c` are all part of the *same* index key, and the leaf level is sorted
+lexicographically on `(a,b,c)`: first by `a`, then by `b` within each `a`, then by `c` within each
+`(a,b)`. Every row with `a=1 AND b=2` already sits physically next to every other such row, sorted by
+`c` ascending:
+
+```
+(a=1, b=2, c=1) → rowid 401
+(a=1, b=2, c=2) → rowid 402
+(a=1, b=2, c=3) → rowid 403
+(a=1, b=2, c=4) → rowid 404   ← first row matching c>3
+(a=1, b=2, c=9) → rowid 405   ← still matching
+(a=1, b=3, c=1) → rowid 406   ← b changed: group is over
+```
+
+The seek descends using **all three bounds combined into one composite key** — "find the first entry
+≥ `(1,2,3+ε)`" — landing directly on the first genuinely matching row in one root-to-leaf trip. From
+there the cursor walks forward through the linked leaf pages, and the only thing it checks to know when
+to stop is whether `a` or `b` changed; it never re-checks `c>3` row by row, because `c` only increases
+within the group once the walk has started past `c=3`. A range on the *last* column of a composite index
+still gets this treatment — it narrows where the walk starts and stops, it doesn't become a separate
+filter pass (this is the mechanism behind §12.3's sandwich case).
+
+`leaf_pages_touched`, though, is never computed by actually walking the tree — costing happens *before*
+any I/O, which is the entire point of statistics-based estimation. It's inferred from density alone:
+
+```
+leaf_pages_touched = ceil(stats.leaf_pages * rows_fetched / stats.row_count)
+                    = ceil(100 * 2 / 10000) = ceil(0.02) = 1
+```
+
+The assumption: rows are spread roughly evenly across the index's leaf pages, so a contiguous run of
+just 2 rows out of a 10,000-row, 100-leaf-page index should occupy about `100 * (2/10000) = 0.02` of a
+page — "essentially nothing," rounded up to the minimum possible touch, 1 page. That's also why the
+`- 1` in the cost formula makes sense concretely here: `height` already paid for descending to that
+first matching leaf page, and the estimate says the whole 2-row run still fits on that same page — so
+zero additional sequential leaf reads get charged.
+
+> ELI5: the index's leaf level is one long sorted list, glued page to page. Looking for `a=1, b=2,
+> c>3` is like looking for "everyone in a phone book sorted by last name, then first name, then
+> birthday, whose last name is 'Al...' and who was born after March" — you don't scan the whole book,
+> you flip straight to the "Al" section (the seek), and you're already looking at a small, contiguous
+> slice of pages, not names scattered across the whole book. The planner doesn't count that slice by
+> actually flipping to it, though — it estimates the slice's size from how thick the whole book is and
+> what fraction of names it expects to match.
+
+
 ### Stage 4: search
 
+As of week 5, only the single-table half of this section is built. `plan/search.py`'s
+`choose_access_path` is literally `min(candidates, key=cost.total)` over one table's `AccessPath` list —
+there's no `Join` operator, no `Sort` operator, and no `ORDER BY` in the AST yet to search over. The
+join-order and `ORDER BY` material below is the target shape this stage grows into at week 7 (§12.7's
+"at most three tables" roadmap note), not what runs today. `choose_access_path` doesn't get rewritten
+when joins land — it becomes the per-table building block a join-order search calls repeatedly.
 
 For one table, choose the minimum-cost access path. For up to three inner-joined tables, enumerate every
 legal left-deep order and every usable parameterized inner index path. Cost a nested loop as:
@@ -873,6 +1111,23 @@ legal left-deep order and every usable parameterized inner index path. Cost a ne
 outer_cost + outer_estimated_rows × inner_lookup_cost
 ```
 
+
+Concretely: `orders(order_id, customer_id, total)` and `customers(customer_id, region)`, joined on
+`customer_id`, `WHERE region='US'` matching ~50 of 10,000 customers.
+
+- **outer=`customers`, inner=`orders`:** outer cost is cheap — an index seek on `region` fetching ~50
+  rows. For each of those 50 rows, one cheap seek into `orders` by that specific customer's
+  `customer_id` (~12 cost each, *parameterized* by the outer row's value). Total ≈
+  `outer_cost + 50 × 12`.
+- **outer=`orders`, inner=`customers`:** `region` lives on the *other* table, so `orders` has nothing of
+  its own to filter on — the outer side scans the whole table, maybe 100,000 rows, then seeks into
+  `customers` once per row. Total ≈ `outer_cost_huge + 100,000 × 12`.
+
+Same tables, same indexes, same query — only the join order changed, and the cost differs by orders of
+magnitude. That's why stage 4 for joins is a genuine search over *combinations*, not "cost each table's
+best standalone path and glue them together": the inner table's path here is parameterized by the outer
+row's value, which is why it can be far cheaper than anything that table's own stages 1-3 would produce
+querying it alone.
 
 LEFT JOIN restricts reordering because it is not commutative. For `ORDER BY`, compare a cheaper unordered
 path plus Sort against a potentially more expensive ordered index path. Avoiding Sort is a candidate
@@ -885,6 +1140,15 @@ plan per relation set, it gets this for free — pruning is what makes **interes
 because the plan you discard for being 5% pricier may have been the one that avoided the sort. System R
 handles this by keeping one extra plan per useful ordering; quilldb handles it by being small enough not
 to prune. See §12.7.
+
+> ELI5: imagine ranking delivery routes purely by gas cost and throwing away every route but the
+> cheapest. If the cheapest route happens to end somewhere inconvenient — say, the driver still has to
+> circle back before clocking out — you've thrown away a route that cost 5% more in gas but needed no
+> circling back at all, and only find out it would've been better after the fact. "Interesting orders"
+> is the same trap one level up: pruning by cost alone can discard a slightly pricier plan that was
+> already sorted the way a later step needed, forcing an expensive Sort you didn't have to pay for.
+> quilldb sidesteps the trap by never pruning early — with only six join orders total, it just keeps
+> everything until the final ranking, so nothing useful ever gets thrown away too soon.
 
 
 **Three traps:**
