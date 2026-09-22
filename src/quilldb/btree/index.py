@@ -685,8 +685,7 @@ class IndexBTree:
 
 
         if freed:
-            self.pool.discard(page_id)
-            self.pager.free_page(page_id)
+            self.pool.free_page(page_id)
         if shrink_parent:
             self._rebalance(path, level - 1)
 
@@ -708,8 +707,7 @@ class IndexBTree:
             root_raw[:] = serialize_page(promoted)
 
 
-        self.pool.discard(child_page_id)
-        self.pager.free_page(child_page_id)
+        self.pool.free_page(child_page_id)
 
 
     # ---- descent, keyed by compare_keys instead of int comparison --------
@@ -989,7 +987,7 @@ class IndexBTree:
                     right_cells[insert_slot - promoted_index - 1] = real_cell
 
 
-            right_page_id = self.pager.allocate_page()
+            right_page_id = self.pool.allocate_page()
             with self.pool.pinned_for_write(right_page_id) as right_raw:
                 right_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=right_cells))
 
@@ -1000,7 +998,7 @@ class IndexBTree:
 
 
             if parent is None:
-                left_page_id = self.pager.allocate_page()
+                left_page_id = self.pool.allocate_page()
                 with self.pool.pinned_for_write(left_page_id) as left_raw:
                     left_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=left_cells))
 
@@ -1187,7 +1185,7 @@ class IndexBTree:
                 )
 
 
-                new_right_page_id = self.pager.allocate_page()
+                new_right_page_id = self.pool.allocate_page()
                 with self.pool.pinned_for_write(new_right_page_id) as new_right_raw:
                     new_right_raw[:] = serialize_page(
                         PageBody(
@@ -1201,7 +1199,7 @@ class IndexBTree:
                 if level == 0:
                     # Root split: self.root keeps its page number and
                     # becomes the new top; BOTH halves move to fresh pages.
-                    new_left_page_id = self.pager.allocate_page()
+                    new_left_page_id = self.pool.allocate_page()
                     with self.pool.pinned_for_write(new_left_page_id) as new_left_raw:
                         new_left_raw[:] = serialize_page(
                             PageBody(

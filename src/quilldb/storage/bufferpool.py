@@ -288,15 +288,16 @@ class BufferPool:
         Retires the "writes through the pool's back" warning Pager.free_page
         used to carry permanently: the freelist-trunk write becomes an
         ordinary journalled page write like any other. This method is also
-        now the ONE place responsible for the stale-cache hazard that
-        warning made every CALLER work around by hand -- btree.py's
-        delete() and catalog.py's create_index both currently call
+        the ONE place responsible for the stale-cache hazard that warning
+        used to make every caller work around by hand -- btree.py's
+        delete(), index.py's delete(), catalog.py's create_index, and
+        overflow.py's free_overflow_chain all used to call
         self.pool.discard(page_id) themselves, immediately before
         self.pager.free_page(page_id), so a later flush of the page's old
-        dirty content (real row data, before it was emptied) can't clobber
-        the freelist-node bytes you're about to write here. Once this
-        method discards on its own, delete those two workarounds -- don't
-        leave both running.
+        dirty content (real row data, before it was emptied) couldn't
+        clobber the freelist-node bytes written here. Now that every call
+        site goes through this method instead, discarding is this method's
+        job alone.
 
         Contract:
           1. Reject page_id == 1 (ValueError) and out-of-range page_id

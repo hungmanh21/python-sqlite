@@ -209,17 +209,10 @@ class BTree:
         the same rebalancing work, deliberately out of scope.
 
 
-        Two traps:
-          1. Removing a child from a parent is a *different* operation
-             from removing a row: the parent's cell is `[left
-             child][separator]`, no payload, removed by *slot index* (the
-             same child_slot `_find_leaf` recorded), not by searching for
-             a key.
-          2. Freeing a page must go through `self.pool.discard()` before
-             `self.pager.free_page()` for any page that was read through
-             the pool -- otherwise a later flush of its still-cached
-             bytes can overwrite whatever `allocate_page()` hands out
-             next for that page number.
+        One trap: removing a child from a parent is a *different*
+        operation from removing a row: the parent's cell is `[left
+        child][separator]`, no payload, removed by *slot index* (the same
+        child_slot `_find_leaf` recorded), not by searching for a key.
 
 
         Raises:
@@ -294,8 +287,7 @@ class BTree:
                 self.pool.unpin(parent_page_id)
 
 
-            self.pool.discard(child_to_free)
-            self.pager.free_page(child_to_free)
+            self.pool.free_page(child_to_free)
 
 
             if level == 0 or not parent_is_empty:
@@ -482,7 +474,7 @@ class BTree:
                 parent_has_room = parent[2].fits(len(new_left_cell))
 
 
-            right_page_id = self.pager.allocate_page()
+            right_page_id = self.pool.allocate_page()
             with self.pool.pinned_for_write(right_page_id) as right_raw:
                 right_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=right_cells))
 
@@ -491,7 +483,7 @@ class BTree:
                 # Root split: self.root (== page_id) keeps its page number
                 # and becomes the new interior root; its old content moves
                 # into a freshly allocated left leaf.
-                left_page_id = self.pager.allocate_page()
+                left_page_id = self.pool.allocate_page()
                 with self.pool.pinned_for_write(left_page_id) as left_raw:
                     left_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=left_cells))
 
@@ -679,7 +671,7 @@ class BTree:
                 )
 
 
-                new_right_page_id = self.pager.allocate_page()
+                new_right_page_id = self.pool.allocate_page()
                 with self.pool.pinned_for_write(new_right_page_id) as new_right_raw:
                     new_right_raw[:] = serialize_page(
                         PageBody(PageType.INTERIOR_TABLE, cells=new_right_cells, right_child=new_right_right_child)
@@ -690,7 +682,7 @@ class BTree:
                     # Root split: self.root (== page_id) keeps its page
                     # number and becomes the new top interior page; BOTH
                     # halves of its own former content move to fresh pages.
-                    new_left_page_id = self.pager.allocate_page()
+                    new_left_page_id = self.pool.allocate_page()
                     with self.pool.pinned_for_write(new_left_page_id) as new_left_raw:
                         new_left_raw[:] = serialize_page(
                             PageBody(
