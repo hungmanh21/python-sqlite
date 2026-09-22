@@ -150,6 +150,35 @@ def test_read_page_past_physical_eof_reads_as_zeros(tmp_path) -> None:
     pager.close()
 
 
+def test_header_bytes_is_the_live_header_serialized(tmp_path) -> None:
+    pager = Pager.create(tmp_path / "test.db")
+    pager.allocate_page()
+    assert pager.header_bytes() == pager._header.to_bytes()
+    pager.close()
+
+
+def test_reload_header_resyncs_in_memory_state_from_disk(tmp_path) -> None:
+    """Simulates what rollback needs: the file's on-disk header (written by
+    a prior close()) is the source of truth. reload_header() must discard
+    whatever the in-memory header currently believes and replace it wholesale.
+    """
+    path = tmp_path / "test.db"
+    pager = Pager.create(path)
+    pager.allocate_page()
+    pager.bump_schema_cookie()
+    pager.close()  # persists page_count=2, schema_cookie=1
+
+    reopened = Pager.open(path)
+    reopened._header.page_count = 99     # simulate an in-flight transaction's
+    reopened._header.schema_cookie = 42  # mutations that never reached disk
+
+    reopened.reload_header()
+
+    assert reopened.page_count == 2
+    assert reopened._header.schema_cookie == 1
+    reopened.close()
+
+
 def test_allocate_extends_file_when_freelist_empty(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
     assert pager.page_count == 1

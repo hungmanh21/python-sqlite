@@ -143,6 +143,21 @@ class Pager:
         self._header.schema_cookie = (self._header.schema_cookie + 1) % 2**32
         return self._header.schema_cookie
 
+    def header_bytes(self) -> bytes:
+        """The live in-memory header, serialized."""
+        return self._header.to_bytes()
+
+    def reload_header(self) -> None:
+        """Re-read bytes 0..99 from the file, replacing the in-memory header
+        wholesale. Chapter 14 §14.3 step 10: after journal replay restores
+        page 1's bytes to their pre-transaction state, the in-memory header
+        (freelist_trunk, freelist_count, change_counter, schema_cookie, ...)
+        is still whatever this transaction last set it to -- this is what
+        rollback calls to resync memory from the now-restored file.
+        """
+        self._file.seek(0)
+        self._header = FileHeader.from_bytes(self._file.read(FILE_HEADER_SIZE))
+
     def read_page(self, page_id: int) -> bytearray:
         """Read one page.
 
