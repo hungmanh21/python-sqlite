@@ -250,7 +250,7 @@ class Catalog:
             )
 
 
-        with self.pool.pinned(root_page, dirty=True) as raw:
+        with self.pool.pinned_for_write(root_page) as raw:
             raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
 
 
@@ -368,7 +368,7 @@ class Catalog:
             )
 
 
-        with self.pool.pinned(root_page, dirty=True) as raw:
+        with self.pool.pinned_for_write(root_page) as raw:
             raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX))
 
 
@@ -533,7 +533,7 @@ class Catalog:
             PageFullError: page 1 is out of room (see the module's scope limit).
         """
         cell = encode_leaf_table_cell(rowid, len(payload), payload)
-        with self.pool.pinned(SCHEMA_ROOT_PAGE, dirty=True) as raw:
+        with self.pool.pinned_for_write(SCHEMA_ROOT_PAGE) as raw:
             body = parse_page(raw, page_header_offset(SCHEMA_ROOT_PAGE))
             index = len(body.cells)
             for i, existing in enumerate(body.cells):

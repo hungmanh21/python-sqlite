@@ -132,6 +132,24 @@ def test_sqlite3_sees_no_tables_in_a_fresh_database(tmp_path) -> None:
     assert result.stdout.strip() == "0"
 
 
+def test_read_page_past_physical_eof_reads_as_zeros(tmp_path) -> None:
+    """Week 5, session 0: BufferPool.allocate_page()'s growth path bumps
+    page_count without ever calling write_page -- the page shouldn't touch
+    disk until commit. Simulate exactly that (bump page_count by hand,
+    write nothing) and confirm a read still comes back full-size and zeroed,
+    not a short bytearray truncated at the real end of the file.
+    """
+    pager = Pager.create(tmp_path / "test.db")
+    pager._header.page_count += 1
+    page_id = pager._header.page_count
+
+    data = pager.read_page(page_id)
+
+    assert len(data) == PAGE_SIZE
+    assert bytes(data) == bytes(PAGE_SIZE)
+    pager.close()
+
+
 def test_allocate_extends_file_when_freelist_empty(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
     assert pager.page_count == 1

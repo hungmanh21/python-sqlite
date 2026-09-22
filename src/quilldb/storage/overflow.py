@@ -37,7 +37,7 @@ def write_overflow_chain(pager: Pager, pool: BufferPool, data: bytes) -> int:
 
     Args:
         pager: allocates each page in the chain via allocate_page().
-        pool: writes each page's bytes (get_page + unpin(dirty=True), so the
+        pool: writes each page's bytes (get_page_for_write + unpin(), so the
             pages participate in the shared cache like any other page).
         data: the spilled payload bytes -- everything past what cells.py kept
             local. Never empty: a payload that didn't spill has no chain to
@@ -71,10 +71,10 @@ def write_overflow_chain(pager: Pager, pool: BufferPool, data: bytes) -> int:
         chunk = data[i * CONTENT_PER_PAGE : (i + 1) * CONTENT_PER_PAGE]
 
 
-        raw = pool.get_page(page_id)
+        raw = pool.get_page_for_write(page_id)
         raw[0:4] = next_page_id.to_bytes(4, "big")
         raw[4 : 4 + len(chunk)] = chunk
-        pool.unpin(page_id, dirty=True)
+        pool.unpin(page_id)
 
 
     return page_ids[0]

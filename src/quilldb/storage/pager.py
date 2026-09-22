@@ -146,6 +146,15 @@ class Pager:
     def read_page(self, page_id: int) -> bytearray:
         """Read one page.
 
+        A page within page_count but past the physical end of the file reads
+        as all zeros, rather than a short bytearray -- week 5, session 0
+        needs this: BufferPool.allocate_page()'s growth path bumps
+        page_count without writing anything (the whole point is that a page
+        that only ever grew the file never touches disk until commit, so a
+        rollback's truncate erases it for free). Before that page's first
+        real write, it must still read back as a valid, full-size page --
+        logically zero, exactly like a page that WAS written as zeros would.
+
         Returns:
             A fresh mutable 4096-byte bytearray. Mutating it does NOT write to
             disk — call write_page.
@@ -157,7 +166,9 @@ class Pager:
         offset = (page_id - 1) * PAGE_SIZE
         self._file.seek(offset)
         data = self._file.read(PAGE_SIZE)
-        
+        if len(data) < PAGE_SIZE:
+            data = data.ljust(PAGE_SIZE, b"\x00")
+
         return bytearray(data)
 
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
