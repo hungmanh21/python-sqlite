@@ -16,7 +16,7 @@ never read or written. See allocate_page/free_page and chapter 01 §1.8.
 import io
 import os
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO
 
 from quilldb.constants import FILE_HEADER_SIZE, PAGE_SIZE, SCHEMA_ROOT_PAGE, PageType
 from quilldb.errors import CorruptDatabaseError, PageOutOfRangeError
@@ -55,6 +55,7 @@ class Pager:
     _path: Path | None
     _file: BinaryIO
     _header: FileHeader
+    _txn: Any
 
     def __init__(self, path: Path) -> None:
         """Prefer Pager.create() or Pager.open()."""
@@ -81,6 +82,7 @@ class Pager:
         self._path = path
         self._file = file
         self._header = header
+        self._txn = None
         return self
 
     @classmethod
@@ -99,6 +101,7 @@ class Pager:
         self._path = None
         self._file = file
         self._header = header
+        self._txn = None
         return self
 
 
@@ -127,6 +130,7 @@ class Pager:
         self._path = path
         self._file = file
         self._header = header
+        self._txn = None
         return self
 
     @property
@@ -192,6 +196,10 @@ class Pager:
         Raises:
             PageOutOfRangeError, ValueError: len(data) != PAGE_SIZE.
         """
+        assert self._txn is None or self._txn.barrier_passed, (
+            "database write before the journal was made valid — this is the one "
+            "ordering bug that corrupts data unrecoverably (chapter 13 §13.11)"
+        )
         if page_id < 1 or page_id > self.page_count:
             raise  PageOutOfRangeError(f"page {page_id} out of range (1..{self.page_count})")
 
@@ -320,3 +328,55 @@ class Pager:
         self._file.write(self._header.to_bytes())
         self.sync()
         self._file.close()
+
+    # Week 5, session 0, Task 5. Rollback and recovery (sessions 1-2) are the
+    # callers; nothing in this session's code calls either method yet.
+
+    def truncate(self, page_count: int) -> None:
+        """Shrink the file to `page_count` pages and set the header to match.
+
+        Rollback and recovery both need this; nothing today exposes it.
+
+        Resets freelist_trunk/freelist_count to 0 rather than preserving
+        whatever survives the shrink -- safe (a leak, never corruption,
+        consistent with this codebase's one-level freelist), and harmless
+        in the one real call sequence: chapter 14 §14.3 step 10 is replay,
+        then truncate(), then reload_header(), which overwrites these two
+        fields from the now-restored on-disk header anyway.
+
+        Raises:
+            ValueError: page_count < 1.
+        """
+        if page_count < 1:
+            raise ValueError("page_count must be >= 1 (since 1 is for header)")
+
+        self._file.truncate(page_count * PAGE_SIZE)
+        self._header.page_count = page_count
+        self._header.freelist_count = 0
+        self._header.freelist_trunk = 0
+        
+
+    def restore_page(self, page_id: int, data: bytes) -> None:
+        """Write a page during replay ONLY.
+
+        Bounds-checks against the JOURNAL's recorded page count, not the
+        live header's -- recovery restores pages BEFORE it truncates
+        (chapter 14 §14.5 bug 2), so a page above the CURRENT page_count is
+        expected here and does NOT raise PageOutOfRangeError the way
+        write_page() would. Seeking past the file's physical end and
+        writing zero-fills the gap on both a real file and io.BytesIO
+        (verified), so no explicit grow-first step is needed.
+
+        Raises:
+            PageOutOfRangeError: page_id < 1.
+            ValueError: len(data) != PAGE_SIZE.
+        """
+        if page_id < 1:
+            raise PageOutOfRangeError(f"page {page_id} out of range (1..{self.page_count})")
+
+        if len(data) != PAGE_SIZE:
+            raise ValueError(f"data length {len(data)} != PAGE_SIZE {PAGE_SIZE}")
+
+        offset = (page_id - 1) * PAGE_SIZE
+        self._file.seek(offset)
+        self._file.write(data)

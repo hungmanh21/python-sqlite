@@ -226,13 +226,12 @@ class BufferPool:
         Session 0, Task 3: this is Pager.allocate_page's old body, moved up
         because it has to write through the pool now, and Pager can't see
         the pool (bufferpool.py imports Pager, not the other way around).
-        Pager.allocate_page/free_page still exist untouched for now -- call
-        sites don't switch over until this and free_page() below are
-        implemented and tested in isolation. Same one-level freelist as
-        before: header.freelist_trunk heads a singly-linked chain of freed
-        pages, each holding only its own `next` pointer in its first 4 bytes
-        (see the still-live Pager.allocate_page/free_page for the exact
-        walkthrough while it lasts).
+        Pager.allocate_page/free_page still exist but are now unused dead
+        code -- every call site (catalog.py, btree.py, index.py,
+        overflow.py) goes through this and free_page() below instead. Same
+        one-level freelist as before: header.freelist_trunk heads a
+        singly-linked chain of freed pages, each holding only its own `next`
+        pointer in its first 4 bytes.
 
         Contract:
           Reuse path (freelist_trunk != 0):
@@ -257,16 +256,11 @@ class BufferPool:
                here is expected, not a bug -- see _evict_one and session 0
                §0.1's no-steal decision, which this task exists to unblock.
 
-        You'll need Pager to expose enough of `freelist_trunk`,
-        `freelist_count`, and `page_count` for this to work -- decide
-        whether to reach into `self._pager._header` directly (Pager and
-        BufferPool already cross that seam via read_page/write_page) or add
-        a few narrow accessor methods to Pager instead (more encapsulated,
-        and Task 4 is about to add header_bytes()/reload_header() there
-        anyway, so there's precedent). Either is defensible; be consistent
-        with whatever free_page() below ends up doing.
+        Reaches into `self._pager._header` directly for `freelist_trunk`,
+        `freelist_count`, and `page_count` rather than adding narrow
+        accessor methods to Pager -- Pager and BufferPool already cross that
+        seam via read_page/write_page, and free_page() below does the same.
         """
-        # TODO(human): implement allocate_page per the contract above.
         if self._pager._header.freelist_count > 0:
             # Reuse path
             page_id = self._pager._header.freelist_trunk
@@ -316,7 +310,6 @@ class BufferPool:
              bytes at offset 4 get misread as a leaf count by real sqlite3.
           5. freelist_trunk = page_id, freelist_count += 1.
         """
-        # TODO(human): implement free_page per the contract above.
         if page_id == 1:
             raise ValueError("Cannot free page 1 (header page)")
         if page_id > self._pager._header.page_count:
