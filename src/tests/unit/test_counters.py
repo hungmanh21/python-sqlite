@@ -17,8 +17,9 @@ def _build(path: pathlib.Path, rows: int, *, with_index: bool) -> None:
     db.execute("CREATE TABLE users (id INTEGER, email TEXT)")
     if with_index:
         db.execute("CREATE INDEX ix_email ON users (email)")
-    for i in range(1, rows + 1):
-        db.execute("INSERT INTO users VALUES (?, ?)", (i, f"u{i}@example.com"))
+    with db.transaction():
+        for i in range(1, rows + 1):
+            db.execute("INSERT INTO users VALUES (?, ?)", (i, f"u{i}@example.com"))
     db.close()
 
 
@@ -35,8 +36,9 @@ def test_a_cache_hit_is_not_counted_as_a_page_read() -> None:
     """The distinction the whole metric rests on."""
     db = quilldb.connect(":memory:")
     db.execute("CREATE TABLE t (id INTEGER)")
-    for i in range(1, 51):
-        db.execute("INSERT INTO t VALUES (?)", (i,))
+    with db.transaction():
+        for i in range(1, 51):
+            db.execute("INSERT INTO t VALUES (?)", (i,))
 
 
     # Everything is in the pool already, so re-scanning reads no pages.

@@ -30,8 +30,9 @@ def _build(path: pathlib.Path, rows: int, *, unique: bool = False) -> None:
     db = quilldb.connect(str(path))
     db.execute("CREATE TABLE t (id INTEGER, age INTEGER)")
     db.execute(f"CREATE {'UNIQUE ' if unique else ''}INDEX ix ON t (age)")
-    for i in range(1, rows + 1):
-        db.execute("INSERT INTO t VALUES (?, ?)", (i, i))
+    with db.transaction():
+        for i in range(1, rows + 1):
+            db.execute("INSERT INTO t VALUES (?, ?)", (i, i))
     db.close()
 
 
@@ -266,8 +267,9 @@ def test_deleting_every_divider_keeps_the_index_valid(tmp_path) -> None:
 
 
     db = quilldb.connect(str(path))
-    for age in dividers:
-        db.execute("DELETE FROM t WHERE age = ?", (age,))
+    with db.transaction():
+        for age in dividers:
+            db.execute("DELETE FROM t WHERE age = ?", (age,))
     db.close()
 
 
@@ -292,8 +294,9 @@ def test_delete_heavy_workload_leaves_a_clean_index(tmp_path) -> None:
 
 
     db = quilldb.connect(str(path))
-    for i in doomed:
-        db.execute("DELETE FROM t WHERE id = ?", (i,))
+    with db.transaction():
+        for i in doomed:
+            db.execute("DELETE FROM t WHERE id = ?", (i,))
     db.close()
 
 
@@ -319,8 +322,9 @@ def test_index_and_table_agree_after_a_delete_heavy_workload(tmp_path) -> None:
 
 
     db = quilldb.connect(str(path))
-    for i in doomed:
-        db.execute("DELETE FROM t WHERE id = ?", (i,))
+    with db.transaction():
+        for i in doomed:
+            db.execute("DELETE FROM t WHERE id = ?", (i,))
     via_index = sorted(row[0] for row in db.execute("SELECT id FROM t WHERE age >= 0").fetchall())
     via_scan = sorted(row[0] for row in db.execute("SELECT id FROM t").fetchall())
     db.close()
@@ -364,22 +368,23 @@ def test_index_agrees_with_the_table_after_random_mutations(tmp_path, seed: int)
 
     live: dict[int, int] = {}
     next_id = 1
-    for _ in range(1200):
-        roll = rnd.random()
-        if roll < 0.62 or not live:
-            age = rnd.randint(0, 400)
-            db.execute("INSERT INTO t VALUES (?, ?)", (next_id, age))
-            live[next_id] = age
-            next_id += 1
-        elif roll < 0.85:
-            victim = rnd.choice(list(live))
-            db.execute("DELETE FROM t WHERE id = ?", (victim,))
-            del live[victim]
-        else:
-            target = rnd.choice(list(live))
-            age = rnd.randint(0, 400)
-            db.execute("UPDATE t SET age = ? WHERE id = ?", (age, target))
-            live[target] = age
+    with db.transaction():
+        for _ in range(1200):
+            roll = rnd.random()
+            if roll < 0.62 or not live:
+                age = rnd.randint(0, 400)
+                db.execute("INSERT INTO t VALUES (?, ?)", (next_id, age))
+                live[next_id] = age
+                next_id += 1
+            elif roll < 0.85:
+                victim = rnd.choice(list(live))
+                db.execute("DELETE FROM t WHERE id = ?", (victim,))
+                del live[victim]
+            else:
+                target = rnd.choice(list(live))
+                age = rnd.randint(0, 400)
+                db.execute("UPDATE t SET age = ? WHERE id = ?", (age, target))
+                live[target] = age
 
 
     # `age >= 0` is sargable, so this reads through the index; the bare
@@ -416,8 +421,9 @@ def _build_wide_keys(path: pathlib.Path, rows: int, klen: int) -> list[str]:
     db = quilldb.connect(str(path))
     db.execute("CREATE TABLE t (id INTEGER, v TEXT)")
     db.execute("CREATE INDEX ix ON t (v)")
-    for i, value in enumerate(values, start=1):
-        db.execute("INSERT INTO t VALUES (?, ?)", (i, value))
+    with db.transaction():
+        for i, value in enumerate(values, start=1):
+            db.execute("INSERT INTO t VALUES (?, ?)", (i, value))
     db.close()
     return values
 
@@ -508,8 +514,9 @@ def test_deleting_from_a_multi_level_index_keeps_it_valid(tmp_path) -> None:
 
 
     db = quilldb.connect(str(path))
-    for rowid in doomed:
-        db.execute("DELETE FROM t WHERE id = ?", (rowid,))
+    with db.transaction():
+        for rowid in doomed:
+            db.execute("DELETE FROM t WHERE id = ?", (rowid,))
     db.close()
 
 
@@ -528,8 +535,9 @@ def test_index_scales_to_a_hundred_thousand_rows(tmp_path) -> None:
     db = quilldb.connect(str(path))
     db.execute("CREATE TABLE users (id INTEGER, email TEXT)")
     db.execute("CREATE INDEX ix_email ON users (email)")
-    for i in range(1, 100_001):
-        db.execute("INSERT INTO users VALUES (?, ?)", (i, f"u{i}@example.com"))
+    with db.transaction():
+        for i in range(1, 100_001):
+            db.execute("INSERT INTO users VALUES (?, ?)", (i, f"u{i}@example.com"))
     found = db.execute("SELECT id FROM users WHERE email = ?", ("u50000@example.com",)).fetchall()
     db.close()
 

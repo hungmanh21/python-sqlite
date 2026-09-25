@@ -20,6 +20,7 @@ from quilldb.errors import (
     ColumnNotFoundError,
     ParameterCountError,
     TableNotFoundError,
+    TransactionError,
     TypeMismatchError,
     UniqueViolationError,
 )
@@ -905,3 +906,204 @@ def test_plain_explain_does_not_run_the_query() -> None:
     assert "actual_rows" not in rows[0][0]
     assert _outstanding_pins(db) == 0
     db.close()
+
+
+
+
+# =====================================================================
+# BEGIN / COMMIT / ROLLBACK, db.transaction() -- week 5, session 4
+# =====================================================================
+
+
+class _Boom(Exception):
+    """A marker exception, so a caught-and-reraised AssertionError from a
+    real bug can't be mistaken for the test's own deliberate failure.
+    """
+
+
+def _journal_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + "-journal")
+
+
+def test_begin_commit_survives_close_and_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+
+
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("BEGIN")
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 41))
+        db.execute("COMMIT")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (2, "bob", 41)]
+    assert not _journal_path(path).exists()
+
+
+def test_begin_rollback_discards_changes_and_survives_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+
+
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))  # autocommit, kept
+        db.execute("BEGIN")
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 41))
+        db.execute("ROLLBACK")
+
+
+    with quilldb.connect(path) as db:
+        assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36)]
+    assert not _journal_path(path).exists()
+
+
+def test_nested_begin_raises_and_leaves_the_open_transaction_usable() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    with pytest.raises(TransactionError):
+        db.execute("BEGIN")
+
+
+    # The failed nested BEGIN must not have torn down the real transaction.
+    db.execute("ROLLBACK")
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+
+
+def test_commit_without_begin_raises_transaction_error() -> None:
+    db = quilldb.connect(":memory:")
+    with pytest.raises(TransactionError):
+        db.execute("COMMIT")
+    db.close()
+
+
+def test_rollback_without_begin_raises_transaction_error() -> None:
+    db = quilldb.connect(":memory:")
+    with pytest.raises(TransactionError):
+        db.execute("ROLLBACK")
+    db.close()
+
+
+def test_begin_rollback_on_memory_db_touches_no_filesystem(tmp_path: Path) -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+    db.execute("ROLLBACK")
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_transaction_context_manager_commits_on_clean_exit() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+
+
+    with db.transaction():
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (2, "bob", 41))
+
+
+    assert db.execute("SELECT * FROM users").fetchall() == [(1, "ada", 36), (2, "bob", 41)]
+    db.close()
+
+
+def test_transaction_context_manager_rolls_back_on_exception() -> None:
+    """Week 5 session 4's own definition of done: an exception inside the
+    context manager rolls back.
+    """
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+
+
+    with pytest.raises(_Boom), db.transaction():
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+        raise _Boom("fail mid-transaction")
+
+
+    assert db.execute("SELECT * FROM users").fetchall() == []
+    db.close()
+
+
+def test_transaction_context_manager_many_statements_ride_one_transaction(tmp_path: Path) -> None:
+    """The Week 5 contract's 10,000-row example: every statement inside
+    the block sees self._txn already set and rides the same transaction
+    instead of each getting its own autocommit.
+    """
+    path = tmp_path / "demo.db"
+
+
+    with quilldb.connect(path) as db:
+        db.execute(_USERS_SQL)
+        with db.transaction():
+            for i in range(1, 101):
+                db.execute("INSERT INTO users VALUES (?, ?, ?)", (i, f"user{i}", 20 + i % 50))
+
+
+    with quilldb.connect(path) as db:
+        assert len(db.execute("SELECT * FROM users").fetchall()) == 100
+    assert not _journal_path(path).exists()
+
+
+# ---- close() with a transaction still open (found during review) --------
+#
+# Connection.close() used to flush_all()/pager.close() unconditionally, with
+# no regard for self._txn. An open transaction with dirty pages made that
+# raise the write-barrier AssertionError instead of doing anything sensible;
+# an open transaction with NO writes yet closed "successfully" but left a
+# stray, never-cleaned-up "-journal" file that then made every future BEGIN
+# on that path fail with FileExistsError. close() now rolls back an open
+# transaction first, exactly like an interrupted script that never got to
+# COMMIT.
+
+
+def test_close_with_a_dirty_open_transaction_rolls_back_instead_of_raising(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    db = quilldb.connect(path)
+    db.execute(_USERS_SQL)
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.close()  # must not raise the write-barrier AssertionError
+
+
+    with quilldb.connect(path) as reopened:
+        assert reopened.execute("SELECT * FROM users").fetchall() == []
+    assert not _journal_path(path).exists()
+
+
+def test_close_with_a_clean_open_transaction_leaves_no_stray_journal(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    db = quilldb.connect(path)
+    db.execute(_USERS_SQL)
+    db.execute("BEGIN")  # no writes yet
+
+
+    db.close()
+
+
+    assert not _journal_path(path).exists()
+    # A stray journal previously made this fail with FileExistsError.
+    with quilldb.connect(path) as reopened:
+        reopened.execute("BEGIN")
+        reopened.execute("ROLLBACK")
+
+
+def test_close_is_idempotent_after_rolling_back_an_open_transaction(tmp_path: Path) -> None:
+    path = tmp_path / "demo.db"
+    db = quilldb.connect(path)
+    db.execute(_USERS_SQL)
+    db.execute("BEGIN")
+    db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
+
+
+    db.close()
+    db.close()  # must not raise a second time

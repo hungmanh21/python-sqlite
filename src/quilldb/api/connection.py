@@ -37,19 +37,22 @@ case that leaves an operator open past the call that created it.
 
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Generator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
 from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
-from quilldb.errors import UnsupportedFeatureError
+from quilldb.errors import TransactionError, UnsupportedFeatureError
 from quilldb.exec.operators import ExplainResult, Operator, build_operator
 from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.binder import (
     BoundAnalyze,
+    BoundBegin,
     BoundBinaryOp,
     BoundColumn,
+    BoundCommit,
     BoundCreateIndex,
     BoundCreateTable,
     BoundDelete,
@@ -58,6 +61,7 @@ from quilldb.sql.binder import (
     BoundInsert,
     BoundIsNull,
     BoundLiteral,
+    BoundRollback,
     BoundUnaryOp,
     BoundUpdate,
     bind,
@@ -65,6 +69,8 @@ from quilldb.sql.binder import (
 from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
+from quilldb.txn.journal import Journal
+from quilldb.txn.transaction import Transaction
 
 _MEMORY_PATH = ":memory:"
 
@@ -206,6 +212,7 @@ class Connection:
         self.stats = stats
         self._open_cursor: Cursor | None = None
         self._closed = False
+        self._txn: Transaction | None = None  # set only by an EXPLICIT BEGIN -- see _begin()
 
 
     # ---- measurement surface (chapter 19 SS19.2) -------------------------
@@ -246,6 +253,114 @@ class Connection:
         self.pool.reset_counters()
 
 
+    # ---- transactions (week 5, session 4) ---------------------------
+    #
+    # self._txn is set ONLY by an explicit BEGIN and cleared ONLY by the
+    # matching COMMIT/ROLLBACK -- an implicit (autocommit) transaction is
+    # begun and finished entirely inside _run_mutation() and never touches
+    # this attribute, so there is nothing here to distinguish "no
+    # transaction" from "mid-autocommit": from self._txn's point of view
+    # they're the same state, None.
+
+
+    def _begin(self) -> None:
+        """Open an explicit transaction. The BoundBegin dispatch in
+        execute() calls this directly.
+
+        Constructs the Journal and Transaction, calls journal.begin(), and
+        wires the hook onto both self.pager._txn and self.pool._txn last --
+        so a half-constructed Transaction is never visible through the hook
+        if something above it raises.
+        """
+        if self._txn is not None:
+            raise TransactionError("a transaction is already open")
+        journal = Journal(self.pager.path)
+        txn = Transaction(self.pager, self.pool, journal)
+        journal.begin(self.pager.page_count)
+        self.pager._txn = txn
+        self.pool._txn = txn
+        self._txn = txn
+
+
+    def _commit(self) -> None:
+        """Commit the open explicit transaction. The BoundCommit dispatch in
+        execute() calls this directly.
+
+        Unwiring the hook afterward is not optional: self._txn.commit()
+        deletes the journal, so a write that slipped through the hook after
+        this point would try to append to a file that no longer exists.
+        """
+        if self._txn is None:
+            raise TransactionError("no transaction is open")
+        self._txn.commit()
+        self.pager._txn = None
+        self.pool._txn = None
+        self._txn = None
+
+
+    def _rollback(self) -> None:
+        """Roll back the open explicit transaction. The BoundRollback
+        dispatch in execute() calls this directly. Same unwiring reasoning
+        as _commit().
+        """
+        if self._txn is None:
+            raise TransactionError("no transaction is open")
+        self._txn.rollback()
+        self.pager._txn = None
+        self.pool._txn = None
+        self._txn = None
+
+
+    def _run_mutation(self, body: Callable[[], object]) -> None:
+        """Run `body` (a CREATE TABLE / CREATE INDEX / INSERT / DELETE /
+        UPDATE's actual work) under a transaction, autocommitting if the
+        caller didn't open one explicitly.
+
+        If self._txn is already set, an explicit transaction is open: body's
+        writes ride along it, and COMMIT/ROLLBACK is the caller's job, not
+        this method's. Otherwise this statement gets its own implicit
+        transaction -- begin, run body, commit on success or roll back and
+        re-raise on any exception.
+
+        This is the one place that decides "does this statement get its own
+        transaction, or ride an existing one" -- every mutating call site in
+        execute() goes through it instead of deciding for itself, the same
+        reason get_page_for_write is the one place that decides write intent.
+        """
+        if self._txn is not None:
+            body()
+            return
+        self._begin()
+        try:
+            body()
+        except BaseException:
+            self._rollback()
+            raise
+        else:
+            self._commit()
+
+
+    @contextmanager
+    def transaction(self) -> Generator[None]:
+        """`with db.transaction():` -- commits on clean exit, rolls back on
+        any exception escaping the block.
+
+        Not built on top of _run_mutation(): the caller's block can contain
+        many statements (the Week 5 contract's 10,000-row example), each of
+        which will see self._txn already set and ride this same transaction
+        via _run_mutation's first branch -- this method owns the
+        begin/commit/rollback calls directly instead.
+        """
+        self._begin()
+        try:
+            yield
+        except BaseException:
+            self._rollback()
+            raise
+        else:
+            self._commit()
+
+
     def execute(self, sql: str, parameters: Sequence[Value] = ()) -> Cursor:
         """Parse, bind, and execute one statement.
 
@@ -266,13 +381,28 @@ class Connection:
         bound = bind(parse(sql), self.catalog, tuple(parameters))
 
 
+        if isinstance(bound, BoundBegin):
+            self._begin()
+            return Cursor(None, None, 0)
+
+
+        if isinstance(bound, BoundCommit):
+            self._commit()
+            return Cursor(None, None, 0)
+
+
+        if isinstance(bound, BoundRollback):
+            self._rollback()
+            return Cursor(None, None, 0)
+
+
         if isinstance(bound, BoundCreateTable):
-            self.catalog.create_table(bound.statement, sql)
+            self._run_mutation(lambda: self.catalog.create_table(bound.statement, sql))
             return Cursor(None, None, 0)
 
 
         if isinstance(bound, BoundCreateIndex):
-            self.catalog.create_index(bound.statement, sql)
+            self._run_mutation(lambda: self.catalog.create_index(bound.statement, sql))
             return Cursor(None, None, 0)
 
 
@@ -282,15 +412,23 @@ class Connection:
 
 
         if isinstance(bound, BoundInsert):
-            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
-                operator.next()
+            def _run_insert() -> None:
+                with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                    operator.next()
+            self._run_mutation(_run_insert)
             return Cursor(None, None, 1)
 
 
         if isinstance(bound, (BoundDelete, BoundUpdate)):
-            with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
-                operator.next()
-            return Cursor(None, None, operator.rows_affected)
+            rows_affected = 0
+
+            def _run_delete_or_update() -> None:
+                nonlocal rows_affected
+                with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                    operator.next()
+                    rows_affected = operator.rows_affected
+            self._run_mutation(_run_delete_or_update)
+            return Cursor(None, None, rows_affected)
 
 
         if isinstance(bound, BoundExplain):
@@ -326,9 +464,18 @@ class Connection:
 
 
     def close(self) -> None:
-        """Flush every dirty page and close the file. Idempotent."""
+        """Flush every dirty page and close the file. Idempotent.
+
+        An explicit transaction still open at this point never committed,
+        so it never happened -- close() rolls it back rather than flushing
+        its dirty pages, which would both violate the write barrier
+        (Pager.write_page's assertion) and, if the barrier weren't there,
+        silently persist uncommitted data.
+        """
         if self._closed:
             return
+        if self._txn is not None:
+            self._rollback()
         if self._open_cursor is not None:
             self._open_cursor.close()
             self._open_cursor = None
