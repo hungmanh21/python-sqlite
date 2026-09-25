@@ -141,4 +141,24 @@ class Explain:
     analyze: bool = False
 
 
-type Statement = CreateTable | Insert | Select | Delete | Update | CreateIndex | Analyze | Explain
+@dataclass(frozen=True)
+class Begin:
+    """No fields -- week 5 supports no BEGIN variant (IMMEDIATE/EXCLUSIVE
+    are week 6 locking modes, see docs/implementation/week5-transactions.md).
+    """
+
+
+@dataclass(frozen=True)
+class Commit:
+    pass
+
+
+@dataclass(frozen=True)
+class Rollback:
+    pass
+
+
+type Statement = (
+    CreateTable | Insert | Select | Delete | Update | CreateIndex | Analyze | Explain
+    | Begin | Commit | Rollback
+)

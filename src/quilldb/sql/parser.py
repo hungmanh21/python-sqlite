@@ -13,9 +13,11 @@ from quilldb.errors import SQLSyntaxError
 from quilldb.sql.ast import (
     Analyze,
     Assignment,
+    Begin,
     BinaryOp,
     Column,
     ColumnDef,
+    Commit,
     CreateIndex,
     CreateTable,
     DataType,
@@ -26,6 +28,7 @@ from quilldb.sql.ast import (
     IsNull,
     Literal,
     Parameter,
+    Rollback,
     Select,
     Statement,
     UnaryOp,
@@ -123,6 +126,12 @@ class Parser:
             statement = self._analyze()
         elif token.type is TokenType.EXPLAIN:
             statement = self._explain()
+        elif token.type is TokenType.BEGIN:
+            statement = self._begin()
+        elif token.type is TokenType.COMMIT:
+            statement = self._commit()
+        elif token.type is TokenType.ROLLBACK:
+            statement = self._rollback()
         else:
             raise SQLSyntaxError(
                 f"expected a statement, found {token.lexeme!r} at position {token.position}"
@@ -306,6 +315,21 @@ class Parser:
             self._advance()
             analyze = True
         return Explain(self._select(), analyze)
+
+
+    def _begin(self) -> Begin:
+        self._expect(TokenType.BEGIN, "expected BEGIN")
+        return Begin()
+
+
+    def _commit(self) -> Commit:
+        self._expect(TokenType.COMMIT, "expected COMMIT")
+        return Commit()
+
+
+    def _rollback(self) -> Rollback:
+        self._expect(TokenType.ROLLBACK, "expected ROLLBACK")
+        return Rollback()
 
 
     def _expression(self, min_binding_power: int = 0) -> Expression:

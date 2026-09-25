@@ -51,6 +51,9 @@ class TokenType(Enum):
     UNIQUE = auto()
     ANALYZE = auto()
     EXPLAIN = auto()
+    BEGIN = auto()
+    COMMIT = auto()
+    ROLLBACK = auto()
     INTEGER_TYPE = auto()
     REAL_TYPE = auto()
     TEXT_TYPE = auto()
@@ -97,6 +100,9 @@ KEYWORDS: dict[str, TokenType] = {
     "unique": TokenType.UNIQUE,
     "analyze": TokenType.ANALYZE,
     "explain": TokenType.EXPLAIN,
+    "begin": TokenType.BEGIN,
+    "commit": TokenType.COMMIT,
+    "rollback": TokenType.ROLLBACK,
     "integer": TokenType.INTEGER_TYPE,
     "real": TokenType.REAL_TYPE,
     "text": TokenType.TEXT_TYPE,
