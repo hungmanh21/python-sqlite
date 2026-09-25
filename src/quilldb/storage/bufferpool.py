@@ -25,9 +25,12 @@ from collections import OrderedDict
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING
 
 from quilldb.errors import PageOutOfRangeError, PoolExhaustedError
+
+if TYPE_CHECKING:
+    from quilldb.txn.transaction import Transaction
 from quilldb.storage.pager import PAGE_SIZE, Pager
 
 
@@ -73,12 +76,11 @@ class BufferPool:
         self.rows_examined = 0
 
         # Week 5, session 0: an inert hook. Nothing sets this yet -- it
-        # stays None for the entire session, which is what keeps this
-        # refactor a no-behavior-change land. Session 3 assigns a real
-        # Transaction here, and get_page_for_write starts calling it.
-        # Typed loosely (not "Transaction | None") because txn/ doesn't
-        # exist in the tree yet -- tighten once it does.
-        self._txn: Any = None
+        # stays None outside an open transaction, which is what keeps this
+        # refactor a no-behavior-change land in isolation. Session 3 assigns
+        # a real Transaction here (connect()/tests do `pool._txn = txn`),
+        # and get_page_for_write starts calling it.
+        self._txn: Transaction | None = None
 
 
     def reset_counters(self) -> None:
@@ -103,8 +105,10 @@ class BufferPool:
             The page's bytearray. pin_count is incremented by one; the
             caller must eventually call unpin() exactly that many times.
         Raises:
-            PoolExhaustedError: pool is at capacity and every cached page
-                is pinned, so nothing is available to evict.
+            PoolExhaustedError: pool is at capacity, every cached page is
+                pinned, and no transaction is in progress to explain it --
+                so nothing is available to evict and nothing justifies
+                growing past capacity either.
             PageOutOfRangeError: propagated from the pager on a miss.
         """
         if page_id in self._cache:
@@ -116,7 +120,12 @@ class BufferPool:
 
 
         # Check happens BEFORE inserting the new page, so hitting capacity
-        # exactly (not just exceeding it) is what must trigger an eviction.
+        # exactly (not just exceeding it) is what must trigger an eviction
+        # attempt. No-steal (session 3, §0.1): if every unpinned candidate
+        # is dirty under an active transaction, _evict_one() can't evict
+        # anything -- the pool grows past capacity for the length of the
+        # transaction rather than raising, since spilling would leave a
+        # committed page with no valid place to roll back to.
         if len(self._cache) >= self._capacity:
             self._evict_one()
 
@@ -130,15 +139,34 @@ class BufferPool:
     def _evict_one(self) -> None:
         """Evict the LRU entry that isn't pinned. Rule 1 and 2 first,
         rule 3 (recency) only decides which unpinned entry among ties.
+
+        No-steal (week 5, session 3, chapter 13 §13.10): inside a
+        transaction, a dirty page's original is journalled but its new
+        content isn't committed yet, so writing it back to the database
+        file would let uncommitted data survive a crash. Such a page simply
+        cannot be evicted -- only clean pages are candidates.
+
+        Silently does nothing (does not raise) if every unpinned candidate
+        is blocked by no-steal rather than genuinely unavailable -- the
+        caller's cache is then allowed to exceed `_capacity` for the
+        remainder of the transaction, which is how the pool "grows instead
+        of spilling" per §0.1. Only raises when there is truly no unpinned
+        page at all, no-steal or not.
         """
+        saw_no_steal_candidate = False
         for candidate_id, candidate in self._cache.items():
             if candidate.pin_count > 0:
+                continue
+            if candidate.dirty and self._txn is not None:
+                saw_no_steal_candidate = True
                 continue
             if candidate.dirty:
                 self._pager.write_page(candidate_id, candidate.data)
             # Stop iterating immediately: deleting from an OrderedDict
             # while still holding its iterator raises RuntimeError.
             del self._cache[candidate_id]
+            return
+        if saw_no_steal_candidate:
             return
         raise PoolExhaustedError("every cached page is pinned; nothing to evict")
 
@@ -190,6 +218,19 @@ class BufferPool:
         """flush_page every currently cached page."""
         for page_id in self._cache:
             self.flush_page(page_id)
+
+    def clear(self) -> None:
+        """Drop every cached entry without writing anything back.
+
+        Week 5, session 3: rollback's last pool-facing step (chapter 14
+        §14.3). Journal replay just rewrote the database file underneath
+        this pool directly, bypassing it entirely -- so every cached byte,
+        dirty or clean, pinned or not, now describes a database that no
+        longer exists. There is nothing safe to flush; the only correct
+        move is to discard the cache wholesale and let the next get_page()
+        re-read the restored file.
+        """
+        self._cache.clear()
 
 
     def discard(self, page_id: int) -> None:

@@ -137,6 +137,14 @@ class Pager:
     def page_count(self) -> int:
         return self._header.page_count
 
+    @property
+    def path(self) -> Path | None:
+        """None for an in-memory database -- Journal takes this straight
+        through to its own constructor, which already treats None as
+        "back this journal with an io.BytesIO instead of a file" (week 5).
+        """
+        return self._path
+
     def bump_schema_cookie(self) -> int:
         """Increment the header schema cookie modulo 2**32 and return it.
 
