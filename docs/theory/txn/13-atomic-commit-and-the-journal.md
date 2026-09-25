@@ -153,6 +153,29 @@ pointer.** Once you see the shape you'll use it in code that has nothing to do w
 You're going to keep a sidecar file. What goes in it — the pages as they *were*, or as they *will be*?
 
 
+Here's the problem both strategies are answering, stated once so the rest of this section isn't just a
+list of trade-offs. A transaction crashes somewhere in the middle. On restart you have a set of pages
+that partially reflect the transaction and partially don't — some old, some new, in a mix that depends
+on exactly which writes reached disk before power died. Recovery has to force every page into **one**
+consistent state: either **all pre-transaction** (the transaction never happened) or **all
+post-transaction** (it fully happened). You cannot tell which one a page *should* be just by looking at
+it — you need a separate record of the *other* version, the one that currently isn't on disk. That
+record is the journal, and there are exactly two things it can hold:
+
+
+- **The version about to be overwritten** (undo) — so that if the transaction turns out to be
+  incomplete, you can put it back and pretend nothing happened.
+- **The version about to replace it** (redo) — so that if the transaction turns out to be complete, you
+  can (re)apply it even though the database file never received the final bytes.
+
+
+That's the motivation for *both* existing as ideas: undo answers "how do I make an unfinished
+transaction disappear," redo answers "how do I make a finished transaction stick even though the disk
+copy is incomplete." Every crash-recovery scheme is built from one of these two primitives, or — in
+ARIES's case, §13.10 — both at once. Naming which one a system uses tells you immediately what its
+recovery routine does on startup: undo means "erase the losers," redo means "finish the winners."
+
+
 Both work, and the choice determines everything else about your design.
 
 
@@ -165,6 +188,25 @@ Both work, and the choice determines everything else about your design.
 | After a crash | **undo**: restore old pages | **redo**: replay new pages onto the db |
 | Reader sees | the db file, which is *being* modified | the db file plus a log it must consult |
 | SQLite calls it | `journal_mode=DELETE` (default) | `journal_mode=WAL` |
+
+
+### Trade-offs at a glance
+
+Five axes, and undo and redo split them almost evenly — which is *why* this is a real design decision
+and not an obviously-correct one:
+
+| Axis | Winner | Why |
+|---|---|---|
+| **Implementation complexity** | **Undo** | database file is always the truth; no log-lookup, no wal-index, no checkpointer |
+| **Commit latency / write cost** | **Redo** | commit is a sequential append + one sync; the expensive random writes into the db file are deferred to a batched checkpoint |
+| **Reader/writer concurrency** | **Redo** | the db file isn't touched mid-transaction, so readers never have to be locked out of it (§13.9's PENDING/EXCLUSIVE dance is a rollback-journal-only problem) |
+| **Disk footprint during a transaction** | **Undo** | the journal covers exactly the pages this one transaction dirtied, and is deleted the instant it commits; a WAL file accumulates across *many* transactions until a checkpoint runs |
+| **Torn-page recovery** | **Undo** | stores whole original pages, so a torn page is just overwritten wholesale on rollback; a redo log storing deltas needs a special case — PostgreSQL's `full_page_writes` — because a delta can't repair an unknown starting state (§13.10) |
+
+Notice undo wins on *simplicity* and *bounded resource use per transaction*, redo wins on *throughput*
+and *concurrency*. Neither list is longer than the other — which is exactly why production databases
+that need maximum concurrency (Postgres, MySQL/InnoDB) accept redo's complexity, while SQLite ships
+undo as the default and makes WAL an opt-in for people who specifically need concurrent readers.
 
 
 **Why undo is the simpler thing to build, and therefore the right week-5 choice.** With an undo
@@ -201,6 +243,16 @@ two modes.
 > an index over the log and a checkpoint process."
 
 
+**So which one does quilldb build, and why?** The rollback (undo) journal — for exactly the
+"simpler to build" reason above, not because redo is wrong. Undo keeps the database file as the single
+source of truth for every reader at every moment, so none of the read-path code from weeks 1–4 has to
+change: a page read is still just "go get page N." Redo would require every page read to first ask "is
+there a newer version of this page sitting in a log?", plus a shared index over that log so concurrent
+readers and writers agree on what "newer" means — that's real infrastructure (SQLite's `-shm` file and
+wal-index), not a small addition. §13.10 has the full cost/benefit case, including WAL's fsync-count
+numbers, once you've seen the whole commit sequence in §13.4 to compare it against.
+
+
 ---
 
 
@@ -226,6 +278,43 @@ you can reconstruct the sequence from first principles instead of memorizing it.
 | 3.11 | **Delete the journal** | unlink | ← **THIS IS THE COMMIT POINT** |
 | 3.12 | Release EXCLUSIVE and PENDING | — | — |
 
+
+### The lock states in that table, decoded
+
+Steps 3.2, 3.4, and 3.8 name four lock states without defining them — here's just enough to follow this
+chapter. (The full compatibility matrix, why PENDING specifically prevents writer starvation, and what
+happens when locks contend are chapter 16's job — [16 — Locking and deadlock](16-locking-and-deadlock.md).)
+
+Think of the lock as a single value stamped on the whole database file, escalating one step at a time as
+a transaction gets more serious about writing:
+
+| State | Means | Who else can be doing what |
+|---|---|---|
+| **UNLOCKED** | not touching the file | anyone, anything |
+| **SHARED** | reading | any number of other **SHARED** readers, simultaneously |
+| **RESERVED** | "I intend to write eventually, but I'm still only reading so far" | existing **SHARED** readers keep reading; no *other* writer may also take **RESERVED** |
+| **PENDING** | "I'm about to write — existing readers, please finish up" | current **SHARED** holders may finish; no *new* **SHARED** locks are granted |
+| **EXCLUSIVE** | actually writing the database file | nobody — the only state that locks out everyone else |
+
+Read §13.4's four lock-related steps again with this table next to them:
+
+- **SHARED** (3.2) is taken just to read the pages a statement needs, so a concurrent writer can't
+  change them underneath you mid-read.
+- **RESERVED** (3.4) is taken the *moment you know you'll eventually write* — before you've written a
+  single byte — specifically so a second would-be writer is turned away immediately, rather than doing
+  work (building its own journal) it would only have to discard. Notice **RESERVED** deliberately still
+  allows concurrent readers: you can build the journal and hold the original pages in memory without
+  blocking anyone who only wants to read.
+- **PENDING** (3.8, first half) is a one-way turnstile: existing readers drain, no new ones are admitted.
+  Without this step a writer jumping straight from RESERVED to EXCLUSIVE could wait forever if readers
+  kept arriving faster than the current ones finished.
+- Only once the last reader has left does the lock become **EXCLUSIVE** (3.8, second half) — and only
+  under EXCLUSIVE is it safe to actually overwrite pages in the database file (3.9). A reader can never
+  observe a half-written page, because no reader can hold *any* lock while EXCLUSIVE is held.
+
+The lock drops back to **UNLOCKED** at 3.12, right after the journal deletion that is the actual commit
+(3.11) — so for a brief moment the transaction is *committed but still holding its locks*, while cleanup
+finishes.
 
 Two of those deserve individual attention.
 
