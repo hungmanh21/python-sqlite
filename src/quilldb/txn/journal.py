@@ -170,7 +170,6 @@ class Journal:
         self._file.flush()
 
         if self.sync_mode == SyncMode.FULL and self.path is not None:
-            self._file.flush()
             os.fsync(self._file.fileno())
 
     def replay(self, pager: Pager) -> int:
