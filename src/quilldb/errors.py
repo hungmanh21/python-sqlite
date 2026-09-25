@@ -170,3 +170,17 @@ class TypeMismatchError(SQLError):
     isn't a storable Value, or an INSERT value incompatible with its column's
     declared type.
     """
+
+
+class TransactionError(QuillDBError):
+    """COMMIT with no transaction open, BEGIN inside one, etc. Caller mistake."""
+
+
+class JournalCorruptError(CorruptDatabaseError):
+    """The journal is structurally unreadable — not merely incomplete.
+
+    NOTE: an incomplete journal is NORMAL and is not this error. A missing
+    magic or nRec == 0 means "nothing to replay," which is a successful
+    outcome. Reserve this for a journal whose header parses but whose
+    self-described geometry is impossible (page size 0, absurd nRec).
+    """
