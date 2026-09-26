@@ -195,3 +195,37 @@ class SimulatedCrash(BaseException):
     test nothing — the transaction would look like it "handled" the crash
     instead of genuinely dying mid-write.
     """
+
+
+class DeadlockError(QuillDBError):
+    """This transaction was chosen as the victim to break a lock cycle.
+
+    Carries the cycle so the message is diagnosable — this is the entire
+    advantage of detection over a timeout, so don't throw it away:
+
+        DeadlockError: transaction 7 aborted to break cycle
+                       txn 7 waits for 'orders' (held by txn 4)
+                       txn 4 waits for 'users'  (held by txn 7)
+
+    The transaction is rolled back before this is raised. The caller may retry.
+    """
+
+    def __init__(self, victim: int, cycle: list[tuple[int, str, int]]) -> None:
+        self.victim = victim
+        self.cycle = cycle
+        lines = [f"transaction {victim} aborted to break cycle"]
+        for waiter, resource, holder in cycle:
+            lines.append(f"txn {waiter} waits for {resource!r} (held by txn {holder})")
+        super().__init__("\n".join(lines))
+
+
+class LockTimeoutError(QuillDBError):
+    """The busy timeout expired. NOT a deadlock — the backstop fired.
+
+    If you see this in tests where you expect DeadlockError, your detection has
+    a gap. Keep the two distinct; collapsing them hides real bugs.
+    """
+
+
+class ThreadingError(QuillDBError):
+    """A Connection was used from a thread other than its owner."""

@@ -246,3 +246,53 @@ where the *assumption* was the interesting part.
   anything else — an uncommitted transaction never happened, so `close()` undoes it rather than
   flushing it. *Lesson: "the caller will always clean up first" is a claim about callers, not
   about the type system — it needs an explicit check exactly where it's cheapest to add one.*
+
+---
+
+## Week 6 — locks, threads, and deadlock detection
+
+### B6-1 ★ Two bugs wearing one flaky test — a clock quirk hiding a real missed-wakeup
+- **Symptom:** `test_waiters_are_fifo_so_nobody_starves` failed intermittently (roughly half the
+  runs), with a queued reader apparently granted while a writer was still ahead of it in line —
+  but the four other session-1 tests (including `test_exclusive_excludes`, which blocks the exact
+  same way) never once failed across hundreds of runs.
+- **Assumed (round 1):** a blocked `LockManager.acquire()` reader "unexpectedly granted" meant the
+  compatibility/FIFO check in `acquire()` had a real ordering bug — the natural read, since that's
+  the only code that decides who gets granted.
+- **Actually (round 1):** it wasn't the FIFO check. Isolated with a bare `threading.Condition` and
+  zero `LockManager` code: one thread blocked in `cond.wait(timeout=5.0)`, a second thread only
+  doing `with cond: pass` in a tight loop (no `notify()` anywhere) — and the waiter woke up
+  **early**, reporting a timeout after ~3.4 real seconds. Heavy contention on a `Condition`'s
+  underlying lock from other threads can make `wait(timeout=...)` return before the requested time
+  elapses on this environment (WSL2's virtualized clock under load is the leading suspect, not
+  proven). The FIFO test was the only one of the five hammering the *same* condition from six
+  threads at once — enough concurrent lock traffic to trigger it; the two-thread
+  `test_exclusive_excludes` never generated enough contention to.
+- **Fix (round 1):** hardened `acquire()`'s wait loop to never trust `wait()`'s return value as the
+  timeout signal by itself — it now always re-derives "did I actually time out" from
+  `deadline - time.monotonic()` at the top of the next loop iteration, so a spurious early wakeup
+  just costs one extra loop instead of a false `LockTimeoutError`. Then rewrote the test to stop
+  racing a short (0.1s) `acquire()` timeout against wall-clock threading, using `timeout=None` on
+  the blocking calls instead (a `None` timeout can't expire early — it's purely notify-driven) and
+  proving order by polling `LockManager`'s own internal `waiters`/`holders` state, the way other
+  tests in this repo already reach into `pager._header`.
+- **Assumed (round 2):** with the clock dependency gone, the test would be clean.
+- **Actually (round 2):** a *different*, genuine bug immediately surfaced, because `timeout=None`
+  removed the thing that had been silently working around it: readers 3 through 7 queued correctly
+  behind the writer, the writer was correctly granted first — and then only reader 3 ever woke up.
+  Readers 4-7 hung forever. `acquire()` only called `entry.condition.notify_all()` from
+  `release_all()`. When N transactions queue behind each other with no `release_all()` in between,
+  the one `notify_all()` that wakes the queue lets only the front waiter (whoever's `grantable()`
+  is now `True`) through; nobody notifies the *next* waiter that removing that front entry changed
+  what's grantable for them. They go back to sleep waiting for a notification that never comes.
+  This was real and present the whole time — the original test's *short timeouts* had been quietly
+  masking it, since each reader's own timeout loop re-polled `grantable()` on its own schedule
+  regardless of whether anyone notified it.
+- **Fix (round 2):** every successful grant inside `acquire()` — not just `release_all()` — now
+  calls `entry.condition.notify_all()` before returning, so leaving the front of the queue always
+  gives the next waiter a chance to recheck. *Lesson: a flaky concurrency test can be two bugs deep.
+  The first fix (stop trusting a wobbly clock) was necessary but made the test's own masking effect
+  disappear too, which is what exposed the second, real bug. Don't stop investigating just because
+  the first plausible cause checks out — especially not for concurrency code, where a "fix" that
+  only changes the odds of triggering a bug (rather than removing the mechanism) can look identical
+  to a real fix for a long time.*
