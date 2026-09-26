@@ -36,9 +36,12 @@ def write_overflow_chain(pager: Pager, pool: BufferPool, data: bytes) -> int:
 
 
     Args:
-        pager: allocates each page in the chain via allocate_page().
-        pool: writes each page's bytes (get_page + unpin(dirty=True), so the
-            pages participate in the shared cache like any other page).
+        pager: unused directly, but kept symmetric with read_overflow_chain
+            and free_overflow_chain -- allocation is now pool-mediated too
+            (week 5, session 0).
+        pool: allocates and writes each page's bytes (allocate_page(), then
+            get_page_for_write() + unpin(), so the pages participate in the
+            shared cache like any other page).
         data: the spilled payload bytes -- everything past what cells.py kept
             local. Never empty: a payload that didn't spill has no chain to
             write in the first place.
@@ -57,7 +60,7 @@ def write_overflow_chain(pager: Pager, pool: BufferPool, data: bytes) -> int:
     # A page's `next` pointer must be known BEFORE that page is written, but
     # allocate_page() only hands out numbers in the order you ask for them.
     # So allocate the whole chain up front, then write it in a second pass.
-    page_ids = [pager.allocate_page() for _ in range(page_count)]
+    page_ids = [pool.allocate_page() for _ in range(page_count)]
 
 
     for i, page_id in enumerate(page_ids):
@@ -71,10 +74,10 @@ def write_overflow_chain(pager: Pager, pool: BufferPool, data: bytes) -> int:
         chunk = data[i * CONTENT_PER_PAGE : (i + 1) * CONTENT_PER_PAGE]
 
 
-        raw = pool.get_page(page_id)
+        raw = pool.get_page_for_write(page_id)
         raw[0:4] = next_page_id.to_bytes(4, "big")
         raw[4 : 4 + len(chunk)] = chunk
-        pool.unpin(page_id, dirty=True)
+        pool.unpin(page_id)
 
 
     return page_ids[0]
@@ -150,11 +153,12 @@ def free_overflow_chain(pager: Pager, pool: BufferPool, first_page: int) -> None
 
 
     Args:
-        pager: frees each page via free_page() once the pool no longer
-            caches it.
-        pool: reads each page's `next` pointer before it's discarded --
-            same get_page/unpin pair read_overflow_chain uses, since a
-            page mid-chain may still be sitting in the shared cache.
+        pager: unused directly, but kept symmetric with write_overflow_chain
+            and read_overflow_chain -- freeing is now pool-mediated too
+            (week 5, session 0).
+        pool: reads each page's `next` pointer, then frees it -- free_page()
+            discards any cached entry itself, so no manual discard is
+            needed first even though a page mid-chain may still be cached.
         first_page: a cell's decoded overflow_page field. A no-op if 0
             (the payload never spilled, so there's no chain to free).
     Raises:
@@ -174,8 +178,7 @@ def free_overflow_chain(pager: Pager, pool: BufferPool, first_page: int) -> None
         raw = pool.get_page(current_page)
         next_page = int.from_bytes(raw[0:4], "big")
         pool.unpin(current_page)
-        pool.discard(current_page)
-        pager.free_page(current_page)
+        pool.free_page(current_page)
 
 
         current_page = next_page

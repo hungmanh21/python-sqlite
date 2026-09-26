@@ -170,3 +170,28 @@ class TypeMismatchError(SQLError):
     isn't a storable Value, or an INSERT value incompatible with its column's
     declared type.
     """
+
+
+class TransactionError(QuillDBError):
+    """COMMIT with no transaction open, BEGIN inside one, etc. Caller mistake."""
+
+
+class JournalCorruptError(CorruptDatabaseError):
+    """The journal is structurally unreadable — not merely incomplete.
+
+    NOTE: an incomplete journal is NORMAL and is not this error. A missing
+    magic or nRec == 0 means "nothing to replay," which is a successful
+    outcome. Reserve this for a journal whose header parses but whose
+    self-described geometry is impossible (page size 0, absurd nRec).
+    """
+
+
+class SimulatedCrash(BaseException):
+    """Injected by the week-5/6 fault-injection harness (FaultyFile).
+    Deliberately inherits BaseException, NOT Exception.
+
+    This matters: an `except Exception:` block anywhere in the commit or
+    recovery path must NOT swallow it, or the crash matrix would silently
+    test nothing — the transaction would look like it "handled" the crash
+    instead of genuinely dying mid-write.
+    """

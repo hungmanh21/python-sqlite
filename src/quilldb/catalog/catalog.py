@@ -225,7 +225,7 @@ class Catalog:
             raise TableAlreadyExistsError(f"table {statement.name!r} already exists")
 
 
-        root_page = self.pager.allocate_page()
+        root_page = self.pool.allocate_page()
 
 
         _, schema_body = self._schema_page()
@@ -234,23 +234,18 @@ class Catalog:
         cell_len = len(encode_leaf_table_cell(rowid, len(payload), payload))
 
 
-        # Page 1's room is checked HERE -- after allocate_page(), which wrote
-        # the new page through the pager directly, but before this page is ever
-        # touched through the BufferPool. That ordering is what makes the
-        # free_page() below safe: nothing is cached for `root_page` yet, so
-        # reclaiming it can't be undone by a later pool flush. Initialize the
-        # root first and the pool's dirty copy would overwrite the freelist
-        # trunk free_page() just wrote, turning a leaked page into a corrupt
-        # freelist (a LEAF_TABLE type byte read as a trunk pointer).
+        # Page 1's room is checked HERE -- before this page is ever touched
+        # through the pool for content of its own. free_page() discards any
+        # cached entry for it first, so this is safe regardless.
         if not schema_body.fits(cell_len):
-            self.pager.free_page(root_page)
+            self.pool.free_page(root_page)
             raise PageFullError(
                 f"sqlite_schema (page 1) has no room for table {statement.name!r}: the catalog "
                 "lives on page 1 alone and never splits (see this module's scope limit)"
             )
 
 
-        with self.pool.pinned(root_page, dirty=True) as raw:
+        with self.pool.pinned_for_write(root_page) as raw:
             raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
 
 
@@ -348,7 +343,7 @@ class Catalog:
             self._reject_existing_duplicate(statement.name, table, column_indices)
 
 
-        root_page = self.pager.allocate_page()
+        root_page = self.pool.allocate_page()
 
 
         _, schema_body = self._schema_page()
@@ -357,33 +352,24 @@ class Catalog:
         cell_len = len(encode_leaf_table_cell(rowid, len(payload), payload))
 
 
-        # Same reasoning as create_table(): checked before this page is ever
-        # touched through the pool, so free_page() below can't be undone by
-        # a later pool flush.
+        # Same reasoning as create_table(): free_page() discards any cached
+        # entry for root_page first, so this is safe either way.
         if not schema_body.fits(cell_len):
-            self.pager.free_page(root_page)
+            self.pool.free_page(root_page)
             raise PageFullError(
                 f"sqlite_schema (page 1) has no room for index {statement.name!r}: the catalog "
                 "lives on page 1 alone and never splits (see this module's scope limit)"
             )
 
 
-        with self.pool.pinned(root_page, dirty=True) as raw:
+        with self.pool.pinned_for_write(root_page) as raw:
             raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX))
 
 
         try:
             self._backfill(root_page, table, column_indices, unique=statement.unique)
         except PageFullError:
-            # root_page was written through the pool above (and possibly
-            # again mid-backfill, if it split) -- discard() drops that stale
-            # cached copy BEFORE free_page() writes a freelist trunk header
-            # straight to disk, otherwise a later pool.flush_all() (e.g.
-            # Connection.close()) would overwrite that trunk header with the
-            # stale cached page and corrupt the freelist. Same rule
-            # btree.py's delete() and index.py's delete() already follow.
-            self.pool.discard(root_page)
-            self.pager.free_page(root_page)
+            self.pool.free_page(root_page)
             raise
 
 
@@ -533,7 +519,7 @@ class Catalog:
             PageFullError: page 1 is out of room (see the module's scope limit).
         """
         cell = encode_leaf_table_cell(rowid, len(payload), payload)
-        with self.pool.pinned(SCHEMA_ROOT_PAGE, dirty=True) as raw:
+        with self.pool.pinned_for_write(SCHEMA_ROOT_PAGE) as raw:
             body = parse_page(raw, page_header_offset(SCHEMA_ROOT_PAGE))
             index = len(body.cells)
             for i, existing in enumerate(body.cells):

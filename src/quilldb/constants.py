@@ -110,4 +110,17 @@ class PageType(IntEnum):
         return LEAF_HEADER_SIZE if self.is_leaf else INTERIOR_HEADER_SIZE
 
 
+# --- week 5: the rollback journal (docs/theory/txn/13-atomic-commit-and-the-journal.md) ---
+SECTOR_SIZE = 512               # journal header is padded to this (chapter 13 §13.5)
+JOURNAL_MAGIC = b"quilldbj"     # 8 bytes, deliberately not SQLite's d9d505f920a163d7
+
+
+class SyncMode(IntEnum):
+    """PRAGMA synchronous. Controls how many fsyncs commit_barrier() does."""
+
+    OFF = 0
+    NORMAL = 1
+    FULL = 2
+
+
 

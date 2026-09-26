@@ -65,7 +65,7 @@ Not supported, rejected with a typed error:
 - reading arbitrary SQLite `-journal` files — quilldb writes its own format (chapter 13 §13.11)
 
 
-**Three rules that are not negotiable:**
+**Four rules that are not negotiable:**
 
 
 1. **Journal the page's ORIGINAL content, before its first modification.** Journalling the modified page
@@ -73,6 +73,8 @@ Not supported, rejected with a typed error:
 2. **No database page may be written before `commit_barrier()` returns.** This single ordering constraint
    is what the whole design rests on.
 3. **fsync the database before deleting the journal** — in commit *and* in recovery.
+4. **No-steal, with no exceptions.** A dirty page is never evicted while a transaction is open; the pool
+   grows instead. This is what keeps rule 2 absolute and the journal single-segment — see session 0 §0.1.
 
 
 ---
@@ -85,12 +87,22 @@ Not supported, rejected with a typed error:
 src/quilldb/
 ├── txn/                          NEW
 │   ├── journal.py                Journal — write, sync, replay, validate
-│   ├── transaction.py            Transaction — dirty set, commit, rollback
+│   ├── transaction.py            Transaction — journalled set, commit, rollback
 │   └── recovery.py               recover_if_needed()
 ├── storage/
-│   ├── pager.py                  + journal hook, + write barrier assertion
-│   └── bufferpool.py             + "don't evict a dirty page of an open txn"
+│   ├── bufferpool.py             + get_page_for_write / pinned_for_write  (the journal hook)
+│   │                             + allocate_page / free_page  (moved up from Pager)
+│   │                             + no-steal: never evict a dirty page mid-txn
+│   ├── pager.py                  + truncate, restore_page, reload_header, header_bytes
+│   │                             + write-barrier assertion in write_page
+│   │                             - allocate_page / free_page  (MOVED to BufferPool)
+│   └── header.py                 unchanged
+├── btree/{btree,index,cursor}.py call sites: get_page → get_page_for_write where dirty
+├── catalog/catalog.py            same, + pager.allocate_page → pool.allocate_page
+├── plan/analyze.py               same
+├── storage/overflow.py           same
 ├── api/connection.py             + BEGIN/COMMIT/ROLLBACK, autocommit, transaction()
+│                                 + recover_if_needed() inside connect()
 ├── constants.py                  + SECTOR_SIZE, JOURNAL_MAGIC, SyncMode
 └── errors.py                     + TransactionError, SimulatedCrash, JournalCorruptError
 
@@ -101,6 +113,267 @@ src/tests/
     ├── test_crash_matrix.py
     └── test_crash_during_recovery.py
 ```
+
+
+**Two thirds of the week-5 diff is in files that already exist.** That is not incidental — see session 0.
+
+
+---
+
+
+## Session 0 — reconcile the storage layer first ⚠️
+
+
+> **Do this before session 1, and land it green against the existing suite.** It contains no
+> transactions, no journal, and no new behaviour. It is the refactor that gives the journal exactly one
+> place to live.
+
+
+**Why this session exists.** Week 5 does not add a layer on top of weeks 1–4. It retroactively imposes an
+invariant *on* them: *no page is modified without its original reaching the journal first.* That is a
+claim about code spread over seven files that never had any reason to signal write intent. The roadmap
+already made this argument once — §1.4 builds the buffer pool in week 1 rather than week 6 because
+"retrofitting a cache touches every call site in the pager and B-tree." Journalling is the same retrofit
+one layer up, and it is the same size.
+
+
+Three things in the tree today are structurally incompatible with the journal, and all three are
+load-bearing:
+
+
+1. **Write intent is declared too late.** The established idiom is `get_page()` → mutate in place →
+   `unpin(page_id, dirty=True)`. The journal needs to know *before* the mutation; the pool is told
+   *after* it. There are 55 `get_page`/`pinned` call sites, ~30 of which end up dirty.
+2. **`allocate_page` and `free_page` write straight to the file**, bypassing the pool entirely —
+   `free_page`'s own docstring says *"⚠️ WRITES THROUGH THE POOL'S BACK."* Both call `Pager.write_page`,
+   which is precisely where the barrier assertion goes, so every allocation inside a transaction would
+   trip it.
+3. **The file header is only ever written in `Pager.close()`.** `page_count`, `freelist_trunk`,
+   `freelist_count`, `change_counter` and `schema_cookie` live in an in-memory `FileHeader` that no
+   page-oriented journal can see.
+
+
+### 0.1 The decision to make before writing any code: what happens when the pool fills
+
+
+The obvious answer — "spill mid-transaction, but only after `commit_barrier()`, so the journal is already
+valid" — does not work, and it is worth knowing why before you build around it. (An earlier draft of this
+plan recommended exactly that.) Once the barrier writes `nRec = k`, the journal is sealed. Any
+page dirtied *after* that point has nowhere to be journalled that `replay()` will honour — so if it then
+reaches the database file, a rollback leaves it there. That is a mixed state, which is the one thing the
+crash matrix exists to forbid. SQLite's answer is a **new journal segment** per spill, with a fresh nonce
+(chapter 13 §13.5); that is a real feature, not a detail.
+
+
+**quilldb takes the other branch: full no-steal, and the journal stays single-segment.** A dirty page is
+never evicted and never written to the database before the barrier — not even once. When the pool is full
+of dirty pages, it **grows** rather than spilling:
+
+
+| | Bounded dirty set (raise when full) | **Grow the dirty set (chosen)** | Multi-segment journal |
+|---|---|---|---|
+| Journal format | single segment | **single segment** | N headers, N nonces |
+| `commit_barrier()` called | once | **once** | once per spill |
+| Max transaction | 128 pages | **available RAM** | unbounded |
+| Extra work | none | **~5 lines** | ~3 hours |
+| Roadmap's 10,000-row demo | ✗ breaks | **✓** | ✓ |
+
+
+The bounded option is out because the roadmap's headline snippet commits 10,000 rows in one transaction,
+which is several hundred pages against a 128-page pool. Growing costs about five lines and caps a
+transaction at RAM — roughly 1.2 MB of `bytearray` for that demo.
+
+
+**This is the ARIES conversation, and it is worth being able to have.** Chapter 13 §13.10: *"Your design
+forbids stealing … which is exactly the constraint ARIES was invented to remove."* Say it as: *"I forbid
+steal, so a transaction's dirty set has to fit in memory. ARIES buys that constraint back with LSNs on
+every page and a redo phase at recovery — which is a lot of machinery to avoid a limit I can state in one
+sentence."* Record the limit in `docs/durability.md`; only clean pages are evictable under LRU, so reads
+stay bounded and it is the write set alone that grows.
+
+
+### 0.2 The six tasks
+
+
+**Task 1 — write intent on the pool, with an inert hook.**
+`get_page_for_write` goes on `BufferPool`, not `Pager`. §30's snippet has it on the Pager calling
+`self._pool` — that inverts the layering, since `bufferpool.py` imports `Pager` and wraps it, and
+CLAUDE.md forbids upward dependencies.
+
+
+```python
+# storage/bufferpool.py
+    def get_page_for_write(self, page_id: int) -> bytearray:
+        """The ONLY way to obtain a page you intend to modify.
+
+
+        Journals the original first, then pins and marks dirty immediately —
+        so there is no code path to a mutable page that skipped journalling,
+        because this function IS the path.
+        """
+        if self._txn is not None:
+            self._txn.will_modify(page_id)      # inert until session 3
+        page = self.get_page(page_id)
+        self._cache[page_id].dirty = True       # dirty at acquisition, not at unpin
+        return page
+
+
+    @contextmanager
+    def pinned_for_write(self, page_id: int) -> Generator[bytearray]:
+        """get_page_for_write, yield, unpin — including when the body raises."""
+```
+
+
+`self._txn` starts as `None` and nothing sets it this session. The refactor lands and the suite stays
+green *before* any transaction semantics exist, which is the whole point of doing it separately.
+
+
+**Task 2 — convert the call sites.** Mechanical, and there are ~30:
+
+
+```python
+raw = self.pool.get_page(page_id)              raw = self.pool.get_page_for_write(page_id)
+try:      ...mutate...                    →    try:      ...mutate...
+finally:  self.pool.unpin(page_id, True)       finally:  self.pool.unpin(page_id)
+```
+
+
+Sites that compute dirtiness conditionally — [`index.py`](../../src/quilldb/btree/index.py)'s
+`dirty = False` … `dirty=dirty` pattern is the common one — cannot be rewritten mechanically, and the
+rule that makes them easy is:
+
+
+> **Over-declaring write intent is safe; under-declaring is corruption.** Journalling a page you end up
+> not modifying costs one wasted page image, and rollback assigns identical bytes back over it. Missing
+> one loses data. When a branch *might* write, declare the write.
+
+
+Leave genuinely read-only paths — `validate.py`, the scan side of `cursor.py` — on plain `get_page`.
+Journalling every page a sequential scan touches would be a real performance bug.
+
+
+**Task 3 — move allocation onto the pool.** `allocate_page` and `free_page` need the pool, and `Pager`
+cannot see it, so they move up. Call sites change `self.pager.allocate_page()` →
+`self.pool.allocate_page()` (~10 of them).
+
+
+```python
+# storage/bufferpool.py
+    def allocate_page(self) -> int:
+        """Reuse a freed page, or grow the file. Contents are undefined.
+
+
+        A page taken off the freelist is journalled (it existed before the
+        transaction). A page that grows the file is NOT — it gets a zeroed
+        entry in the cache and never touches disk until commit, so rollback's
+        truncate erases it for free.
+        """
+
+
+    def free_page(self, page_id: int) -> None:
+        """Return a page to the freelist, THROUGH the pool.
+
+
+        Retires the 'writes through the pool's back' warning permanently: the
+        freelist trunk is now an ordinary journalled page write like any other.
+        """
+```
+
+
+This also fixes the stale-cache hazard that `free_page`'s current docstring and three comments in
+`catalog.py` work around by hand. Delete those workarounds as you go.
+
+
+**Task 4 — make the header a page write.** Page 1's bytes 0–99 are the file header, and page 1 is a
+perfectly ordinary journalled page — so the header becomes transactional the moment it is written
+*through the pool* instead of direct to the file at `close()`.
+
+
+```python
+# storage/pager.py
+    def header_bytes(self) -> bytes:        """The live in-memory header, serialized."""
+    def reload_header(self) -> None:        """Re-read bytes 0..99 from the file. Chapter 14 §14.3 step 10."""
+```
+
+
+Commit stamps it in before the barrier, so page 1's original is journalled along with everything else:
+
+
+```python
+    # txn/transaction.py, first line of commit() — BEFORE commit_barrier()
+    self._pool.get_page_for_write(SCHEMA_ROOT_PAGE)[:FILE_HEADER_SIZE] = self._pager.header_bytes()
+```
+
+
+Two bugs this closes, neither of which the rest of the plan addresses. A committed transaction that grew
+the file previously lost its `page_count` unless `close()` ran — and since `write_page` bounds-checks
+against `page_count`, recovery restoring page 30 into a file whose header claims 29 raises
+`PageOutOfRangeError`. And **rollback must restore the in-memory header too**, not merely truncate:
+`freelist_trunk`, `freelist_count`, `change_counter` and `schema_cookie` all still hold the rolled-back
+transaction's values otherwise. `reload_header()` is what §30's `rollback()` calls after replay.
+
+
+In session 0 this is just plumbing: add the two methods, have `close()` route the header through
+`get_page_for_write(1)` + `flush_all()` rather than seeking to byte 0 itself, and confirm the suite is
+still green.
+
+
+**Task 5 — the Pager additions recovery needs.**
+
+
+```python
+    def truncate(self, page_count: int) -> None:
+        """Shrink the file to `page_count` pages and set the header to match.
+        Rollback and recovery both need this; nothing today exposes it."""
+
+
+    def restore_page(self, page_id: int, data: bytes) -> None:
+        """Write a page during replay ONLY.
+
+
+        Bounds-checks against the JOURNAL's recorded page count, not the live
+        header's — recovery restores pages BEFORE it truncates (chapter 14
+        §14.5 bug 2), so a page above the current count is expected here and
+        must not raise PageOutOfRangeError."""
+```
+
+
+And the barrier assertion, which is the one piece of §30 that lands exactly as written:
+
+
+```python
+    def write_page(self, page_id: int, data: bytes | bytearray) -> None:
+        assert self._txn is None or self._txn.barrier_passed, (
+            "database write before the journal was made valid — this is the one "
+            "ordering bug that corrupts data unrecoverably (chapter 13 §13.11)"
+        )
+```
+
+
+**Task 6 — decide what `:memory:` does.** [`connect()`](../../src/quilldb/api/connection.py) supports
+`":memory:"` and the test suite leans on it, but `Pager.memory()` sets `_path = None` and the journal
+path is defined as *db\_path + "-journal"*. Cheapest correct answer: **`Journal` takes a file object, not
+a path**, and an in-memory database journals to an `io.BytesIO`. Every fsync becomes a no-op, `delete()`
+drops the buffer, and `BEGIN`/`ROLLBACK` get real semantics on `:memory:` for free. Recovery is
+meaningless there — process death takes the database with it — so `recover_if_needed()` returns `False`
+immediately when `_path is None`. This also makes the whole of session 1 testable without touching disk.
+
+
+### 0.3 Done when
+
+
+- [ ] `ruff check .`, `mypy`, and the full existing suite are green, with **no behaviour change**
+- [ ] `git grep -n "pool.get_page(" src/quilldb` — every surviving hit is a genuinely read-only path
+- [ ] `git grep -n "unpin(.*dirty=True\|pinned(.*dirty=True"` returns nothing
+- [ ] `git grep -n "pager.allocate_page\|pager.free_page"` returns nothing outside `bufferpool.py`
+- [ ] `Pager.write_page` is called from exactly two places: `BufferPool._evict_one` and
+      `BufferPool.flush_page`
+- [ ] `sqlite3 file.db "PRAGMA integrity_check"` still says `ok` after the differential suite
+- [ ] `BufferPool` has a `_txn` attribute that is always `None` and a growth path for dirty pages
+
+
+**Budget: one session, possibly two.** The call-site conversion is the long pole. The session table below
+assumes it lands in one.
 
 
 ---
@@ -190,6 +463,13 @@ Format (chapter 13 §13.5 — SQLite's layout, quilldb's magic):
 The magic and nRec are withheld until the body is synced, so a torn journal is
 rejected two independent ways. See §13.6 — this is the single most important
 property of the format.
+
+
+ONE SEGMENT ONLY, deliberately. Real SQLite journals hold many headers, one
+per mid-transaction spill (chapter 13 §13.5). quilldb forbids spilling
+outright — see session 0 §0.1 — so there is exactly one header at offset 0 and
+`commit_barrier()` is called exactly once per transaction. If you ever relax
+no-steal, this is the first thing that has to change, and it changes the format.
 """
 
 
@@ -213,8 +493,16 @@ def journal_checksum(page: bytes, nonce: int) -> int:
 
 
 class Journal:
-    def __init__(self, db_path: Path, sync_mode: SyncMode = SyncMode.FULL) -> None:
-        """The journal lives at db_path with '-journal' appended."""
+    def __init__(self, db_path: Path | None, sync_mode: SyncMode = SyncMode.FULL) -> None:
+        """The journal lives at db_path with '-journal' appended.
+
+
+        db_path is None for an in-memory database (Pager.memory() sets
+        _path = None): the journal is an io.BytesIO, every fsync is a no-op,
+        and delete() drops the buffer. Rollback still works exactly as it does
+        on disk — only recovery is meaningless, since the database dies with
+        the process. Session 0 §0.2 task 6.
+        """
 
 
     def begin(self, page_count_before: int) -> None:
@@ -358,10 +646,11 @@ class Transaction:
     """
 
 
-    def __init__(self, pager: Pager, journal: Journal) -> None:
+    def __init__(self, pager: Pager, pool: BufferPool, journal: Journal) -> None:
         self._journalled: set[int] = set()
         self._page_count_before = pager.page_count
         self._active = True
+        self.barrier_passed = False     # read by the write_page assertion
 
 
     def will_modify(self, page_id: int) -> None:
@@ -372,6 +661,12 @@ class Transaction:
         disk, write it to the journal, and add it to the set.
 
 
+        Read it with pager.read_page(), NOT through the pool: this is an
+        internal read, and routing it through get_page() would pin a page
+        nobody unpins and inflate the `pages_read` benchmark counter that
+        chapter 19 reports.
+
+
         A page allocated fresh in this transaction (page_id > page_count_before)
         does NOT need journalling — it didn't exist before, so rollback's
         truncate erases it. Skipping those is a real saving on insert-heavy
@@ -380,13 +675,33 @@ class Transaction:
 
 
     def commit(self) -> None:
-        """journal.commit_barrier() -> write dirty pages -> fsync db ->
-        journal.delete(). In that order, no exceptions."""
+        """stamp the header into page 1 -> journal.commit_barrier() ->
+        pool.flush_all() -> pager.sync() -> journal.delete().
+        In that order, no exceptions.
+
+
+        The header stamp comes FIRST and goes through get_page_for_write, so
+        page 1's original is journalled like any other page. Skip it and a
+        committed transaction that grew the file loses its page_count unless
+        close() happens to run — see session 0 §0.2 task 4.
+        """
 
 
     def rollback(self) -> None:
-        """journal.replay() -> truncate to _page_count_before -> fsync ->
-        journal.delete() -> discard the buffer pool."""
+        """journal.replay() -> pager.truncate(_page_count_before) ->
+        pager.sync() -> journal.delete() -> pool.clear() ->
+        pager.reload_header().
+
+
+        Restore BEFORE truncate, fsync BEFORE delete (chapter 14 §14.3).
+
+
+        The last two steps are the ones people drop. The buffer pool now
+        describes a file that changed underneath it, and the in-memory
+        FileHeader still holds this transaction's freelist_trunk,
+        freelist_count, change_counter and schema_cookie — truncating fixes
+        page_count and nothing else.
+        """
 ```
 
 
@@ -397,21 +712,18 @@ Rule 1 of the contract — journal the original, before modification — is a ru
 and rules about call ordering get broken. Make it impossible instead:
 
 
+**Session 0 already built the mechanism** — `BufferPool.get_page_for_write()` is the only route to a
+mutable page, and every dirtying call site goes through it. All this session adds is the object on the
+other end of the hook:
+
+
 ```python
-# storage/pager.py
-    def get_page_for_write(self, page_id: int) -> bytearray:
-        """The ONLY way to obtain a mutable page.
-
-
-        Journals the original first, then returns the buffer. There is no code
-        path to a writable page that skipped journalling, because this function
-        is the path.
-        """
+# storage/bufferpool.py — the hook session 0 left inert
         if self._txn is not None:
-            self._txn.will_modify(page_id)
-        return self._pool.pin_for_write(page_id)
+            self._txn.will_modify(page_id)     # now actually journals
 
 
+# storage/pager.py — the assertion, which needs no session-0 caveat
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         assert self._txn is None or self._txn.barrier_passed, (
             "database write before the journal was made valid — this is the one "
@@ -423,7 +735,8 @@ and rules about call ordering get broken. Make it impossible instead:
 
 **That assertion is worth more than a test.** It fires the first time you get the order wrong, in
 whichever test happened to exercise it, with a message that says what's wrong. Leave it in — it costs a
-branch on a path already doing I/O.
+branch on a path already doing I/O. It is also why session 0 had to move `allocate_page` and `free_page`
+off the Pager: both wrote through `write_page` directly, so both would trip this on every allocation.
 
 
 ### Buffer-pool consequence (no-steal)
@@ -431,19 +744,22 @@ branch on a path already doing I/O.
 
 ```python
 # storage/bufferpool.py — in the eviction candidate loop
-    if frame.dirty and self._txn_open:
+    if candidate.dirty and self._txn is not None:
         continue    # cannot evict: its original is journalled but the new content
                     # isn't committed. ARIES calls being ALLOWED to do this "steal";
                     # you forbid it. Chapter 13 §13.10.
 ```
 
 
-And the failure mode to guard: if every frame is dirty and unevictable, the pool must **spill by
-committing nothing** — it can't. So either grow the pool or raise. SQLite handles this by escalating to
-EXCLUSIVE and writing dirty pages into the database mid-transaction (which is why chapter 14 §14.3's
-transcript found uncommitted data in the file). **You may do the same, but only after
-`commit_barrier()`** — journal first, then spill is safe. Write a test that fills the pool inside one
-transaction.
+And the failure mode that follows: if every unpinned entry is dirty, there is no victim. Per session 0
+§0.1 the pool **grows** rather than spilling — no database page may be written before the barrier, and
+that includes an eviction. Clean pages stay evictable under LRU, so only the write set grows.
+
+
+Write two tests: one that runs a transaction several times larger than `capacity` and commits correctly,
+and one that asserts `pager.write_page` was not called at all before `commit_barrier()` — a spy on the
+pager is the easiest way, and it catches an eviction that slipped through much more directly than a
+corrupted file would.
 
 
 ---
@@ -467,8 +783,41 @@ def recover_if_needed(db_path: Path, pager: Pager) -> bool:
 
     Must be idempotent: after a crash mid-recovery, the next open re-runs it,
     which is safe because every journal record is an assignment (§14.2).
+
+
+    Returns False immediately for an in-memory database (pager._path is None):
+    nothing survives the process, so there is nothing to recover.
+
+
+    Replay writes through pager.restore_page(), NOT write_page — a page above
+    the live header's page_count is expected here, because restoring precedes
+    truncating (chapter 14 §14.5 bug 2). Finish with pager.reload_header():
+    recovery just changed page_count and the freelist head underneath the
+    header object that open() built (§14.3 step 10).
     """
 ```
+
+
+### Where it goes in `connect()`
+
+
+Ordering matters more than it looks. `connect()` currently runs
+`Pager.open()` → `BufferPool(pager)` → `Catalog(...)` → `catalog.load()`, and `catalog.load()` reads
+page 1 **through the pool**. Recovery has to complete before anything populates the cache, or the catalog
+caches a schema read out of a file that is about to be rolled back underneath it:
+
+
+```python
+    pager = Pager.open(path) if path.exists() else Pager.create(path)
+    recover_if_needed(path, pager)      # <-- HERE: after open, before the pool exists
+    pool = BufferPool(pager)
+    catalog = Catalog(pager, pool)
+    catalog.load()
+```
+
+
+Putting it before `BufferPool` is construction makes the constraint structural rather than a comment:
+there is no cache to invalidate because there is no cache yet.
 
 
 ### The tests, in the order to write them
@@ -583,7 +932,8 @@ SCENARIOS = [
     ("delete_freeing_page",  ...),      # exercises the freelist transactionally
     ("update_with_indexes",  ...),      # table page + N index pages: the week-4 consistency risk
     ("analyze_refresh",      ...),      # quill_stat1 is replaced atomically, never half-published
-    ("multi_page_txn",       ...),      # bigger than the buffer pool: forces a mid-txn spill
+    ("multi_page_txn",       ...),      # several times the pool's capacity: forces the pool to grow,
+                                        # and proves nothing reached the db before the barrier
 ]
 
 
@@ -655,18 +1005,25 @@ embarrassingly easy to write a matrix that passes because the transaction never 
 
 | #   | 2 hours on                                                                             | Done when                                                 |
 | --- | -------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| **0** | **Session 0 above: write-intent API, move allocate/free, header as a page write, Pager additions** | **the existing suite is green with no behaviour change** |
 | 1   | `journal.py`: header, records, `journal_checksum`, `begin` / `record_original`         | the magic-and-nRec-withheld test is green                 |
 | 2   | `commit_barrier`, `replay`, and all four "replays nothing" cases                       | a hand-built corrupt journal is correctly ignored         |
-| 3   | `Transaction`, `get_page_for_write`, the write-barrier assertion, no-steal in the pool | the byte-identical rollback hash test is green            |
+| 3   | `Transaction`, wire up the inert hook, the write-barrier assertion, no-steal            | the byte-identical rollback hash test is green            |
 | 4   | `BEGIN` / `COMMIT` / `ROLLBACK`, autocommit, `db.transaction()`                        | exception inside the context manager rolls back           |
 | 5   | `recovery.py` + hot-journal detection wired into `connect()`                           | kill a process mid-txn, reopen, data is pre-transaction   |
 | 6   | `FaultyFile`, and the write matrix for one scenario                                    | one scenario × every write boundary is green              |
 | 7   | Full matrix, sync matrix, crash-during-recovery, `docs/durability.md`                  | all six scenarios green; the doc names the non-guarantees |
 
 
-**Session 3 is the one to slow down on.** If `get_page_for_write` isn't the only route to a mutable page,
-every later session builds on a foundation that can silently skip journalling. Grep for direct
-`bytearray` mutation of pooled pages before moving on.
+**This is eight sessions, not seven.** Session 0 is the price of the retrofit, and it is the one session
+that cannot be cut — sessions 3 through 7 all assume `get_page_for_write` is the only route to a mutable
+page. Take the extra two hours out of session 7's optional scenarios if the week is tight.
+
+
+**Session 3 is still the one to slow down on**, but session 0 has already done its hardest part. What
+remains is verifying the invariant actually holds now that something depends on it: grep for direct
+`bytearray` mutation of pooled pages, and check that the write-barrier assertion fires if you
+deliberately reorder `commit()`.
 
 
 ---
@@ -690,8 +1047,16 @@ every later session builds on a foundation that can silently skip journalling. G
 - [ ] **Crash during recovery** green — the nastiest case, and the one that catches fsync-before-unlink
 - [ ] After every crash point: unmixed state, valid trees, indexes agree with tables, statistics are
       complete-or-absent, and `integrity_check` is `ok`
-- [ ] A transaction larger than the buffer pool works (mid-transaction spill after the barrier)
+- [ ] A transaction several times larger than the buffer pool commits correctly — the pool grew, and
+      `pager.write_page` was **not called once** before `commit_barrier()`
 - [ ] Pages allocated within the transaction are **not** journalled — and rollback still truncates them away
+- [ ] `free_page` goes through the pool: freeing a page inside a transaction is journalled, and a
+      rollback puts it back on the freelist it came from
+- [ ] After `ROLLBACK`, the in-memory `FileHeader` matches the file — `freelist_trunk`, `freelist_count`,
+      `change_counter` and `schema_cookie`, not just `page_count`
+- [ ] A committed transaction that grew the file survives a crash **without** a clean `close()` —
+      the header was stamped into page 1 at commit, not at close
+- [ ] `BEGIN` / `ROLLBACK` work on `connect(":memory:")` and touch no filesystem path
 - [ ] `PRAGMA synchronous = OFF | NORMAL | FULL` changes the fsync count; assert the counts
 - [ ] `docs/durability.md` names the commit point precisely **and** lists the non-guarantees: lying
       `fsync`, torn sectors, no directory fsync after unlink, and what the matrix cannot simulate
@@ -699,6 +1064,7 @@ every later session builds on a foundation that can silently skip journalling. G
 
 
 **If the week runs short, cut in this order:** `synchronous` levels, then the sync matrix, then the
-largest optional workload scenarios. **Never cut** the byte-identical rollback test, the write matrix,
-or crash-during-recovery.
-Those three are the week's entire value.
+largest optional workload scenarios. **Never cut** session 0, the byte-identical rollback test, the write
+matrix, or crash-during-recovery. The last three are the week's entire value, and session 0 is what makes
+them mean anything — a crash matrix over a journal that some call site can bypass is a matrix that proves
+nothing.

@@ -39,8 +39,10 @@ from quilldb.errors import (
 )
 from quilldb.sql.ast import (
     Analyze,
+    Begin,
     BinaryOp,
     Column,
+    Commit,
     CreateIndex,
     CreateTable,
     DataType,
@@ -51,6 +53,7 @@ from quilldb.sql.ast import (
     IsNull,
     Literal,
     Parameter,
+    Rollback,
     Select,
     Statement,
     UnaryOp,
@@ -233,6 +236,21 @@ class BoundExplain:
 
 
 
+@dataclass(frozen=True)
+class BoundBegin:
+    statement: Begin
+
+
+@dataclass(frozen=True)
+class BoundCommit:
+    statement: Commit
+
+
+@dataclass(frozen=True)
+class BoundRollback:
+    statement: Rollback
+
+
 type BoundStatement = (
     BoundCreateTable
     | BoundCreateIndex
@@ -242,6 +260,9 @@ type BoundStatement = (
     | BoundUpdate
     | BoundAnalyze
     | BoundExplain
+    | BoundBegin
+    | BoundCommit
+    | BoundRollback
 )
 
 
@@ -297,6 +318,12 @@ def bind(
         bound = BoundAnalyze(statement)
     elif isinstance(statement, Explain):
         bound = BoundExplain(binder.bind_select(statement.statement), statement.analyze)
+    elif isinstance(statement, Begin):
+        bound = BoundBegin(statement)
+    elif isinstance(statement, Commit):
+        bound = BoundCommit(statement)
+    elif isinstance(statement, Rollback):
+        bound = BoundRollback(statement)
     else:
         raise UnsupportedFeatureError(f"cannot bind a {type(statement).__name__} statement")
 

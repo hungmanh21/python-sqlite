@@ -465,6 +465,6 @@ def test_delete_frees_an_overflow_chain_for_reuse(pager, pool) -> None:
     assert freed >= 1  # at least the overflow chain's own pages
 
 
-    reused = {pager.allocate_page() for _ in range(freed)}
+    reused = {pool.allocate_page() for _ in range(freed)}
     assert overflow_page in reused
     validate_btree(pager, pool, bt.root)

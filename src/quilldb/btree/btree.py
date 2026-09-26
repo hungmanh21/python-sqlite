@@ -123,13 +123,12 @@ class BTree:
         """
         path = self._find_leaf(rowid)
         page_id, slot = path[-1]
-        raw = self.pool.get_page(page_id)
+        raw = self.pool.get_page_for_write(page_id)
         body = parse_page(raw)
 
 
         # Keep the target leaf pinned while preparing its replacement. The
         # finally block releases it on every success and error path.
-        dirty = False
         leaf_is_pinned = True
         try:
             if slot < len(body.cells):
@@ -172,10 +171,9 @@ class BTree:
 
             body.insert_cell(slot, cell)
             raw[:] = serialize_page(body)
-            dirty = True
         finally:
             if leaf_is_pinned:
-                self.pool.unpin(page_id, dirty=dirty)
+                self.pool.unpin(page_id)
 
 
     def delete(self, rowid: int) -> bool:
@@ -211,17 +209,10 @@ class BTree:
         the same rebalancing work, deliberately out of scope.
 
 
-        Two traps:
-          1. Removing a child from a parent is a *different* operation
-             from removing a row: the parent's cell is `[left
-             child][separator]`, no payload, removed by *slot index* (the
-             same child_slot `_find_leaf` recorded), not by searching for
-             a key.
-          2. Freeing a page must go through `self.pool.discard()` before
-             `self.pager.free_page()` for any page that was read through
-             the pool -- otherwise a later flush of its still-cached
-             bytes can overwrite whatever `allocate_page()` hands out
-             next for that page number.
+        One trap: removing a child from a parent is a *different*
+        operation from removing a row: the parent's cell is `[left
+        child][separator]`, no payload, removed by *slot index* (the same
+        child_slot `_find_leaf` recorded), not by searching for a key.
 
 
         Raises:
@@ -232,8 +223,7 @@ class BTree:
         leaf_page_id, leaf_slot = path[-1]
 
 
-        raw = self.pool.get_page(leaf_page_id)
-        dirty = False
+        raw = self.pool.get_page_for_write(leaf_page_id)
         try:
             body = parse_page(raw)
             if leaf_slot >= len(body.cells):
@@ -246,9 +236,8 @@ class BTree:
             body.delete_cell(leaf_slot)
             leaf_now_empty = not body.cells
             raw[:] = serialize_page(body)
-            dirty = True
         finally:
-            self.pool.unpin(leaf_page_id, dirty=dirty)
+            self.pool.unpin(leaf_page_id)
 
 
         if overflow_page:
@@ -268,8 +257,7 @@ class BTree:
 
         while True:
             parent_page_id, child_slot = path[level]
-            parent_raw = self.pool.get_page(parent_page_id)
-            dirty = False
+            parent_raw = self.pool.get_page_for_write(parent_page_id)
             try:
                 parent = parse_page(parent_raw)
 
@@ -295,13 +283,11 @@ class BTree:
                     parent_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
                 else:
                     parent_raw[:] = serialize_page(parent)
-                dirty = True
             finally:
-                self.pool.unpin(parent_page_id, dirty=dirty)
+                self.pool.unpin(parent_page_id)
 
 
-            self.pool.discard(child_to_free)
-            self.pager.free_page(child_to_free)
+            self.pool.free_page(child_to_free)
 
 
             if level == 0 or not parent_is_empty:
@@ -387,16 +373,14 @@ class BTree:
             InvalidPageTypeError, MalformedCellError: propagated unchanged
                 from parse_page/decode_* if a page is corrupt.
         """
-        raw = self.pool.get_page(page_id)
-        leaf_dirty = False
+        raw = self.pool.get_page_for_write(page_id)
 
 
         parent: tuple[int, bytearray, PageBody, int] | None = None
-        parent_dirty = False
         parent_has_room = True
         if len(path) > 1:
             parent_id, child_slot = path[-2]
-            parent_raw = self.pool.get_page(parent_id)
+            parent_raw = self.pool.get_page_for_write(parent_id)
             parent = (parent_id, parent_raw, parse_page(parent_raw), child_slot)
 
 
@@ -490,8 +474,8 @@ class BTree:
                 parent_has_room = parent[2].fits(len(new_left_cell))
 
 
-            right_page_id = self.pager.allocate_page()
-            with self.pool.pinned(right_page_id, dirty=True) as right_raw:
+            right_page_id = self.pool.allocate_page()
+            with self.pool.pinned_for_write(right_page_id) as right_raw:
                 right_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=right_cells))
 
 
@@ -499,8 +483,8 @@ class BTree:
                 # Root split: self.root (== page_id) keeps its page number
                 # and becomes the new interior root; its old content moves
                 # into a freshly allocated left leaf.
-                left_page_id = self.pager.allocate_page()
-                with self.pool.pinned(left_page_id, dirty=True) as left_raw:
+                left_page_id = self.pool.allocate_page()
+                with self.pool.pinned_for_write(left_page_id) as left_raw:
                     left_raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=left_cells))
 
 
@@ -510,14 +494,12 @@ class BTree:
                     right_child=right_page_id,
                 )
                 raw[:] = serialize_page(new_root)
-                leaf_dirty = True
                 return
 
 
             # Non-root split: page_id keeps the left half in place -- only
             # the right half needed a new page.
             raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE, cells=left_cells))
-            leaf_dirty = True
 
 
             if parent_has_room:
@@ -533,14 +515,13 @@ class BTree:
 
 
                 parent_raw[:] = serialize_page(parent_body)
-                parent_dirty = True
             # else: the parent has no room. Leave it untouched here --
             # _promote_separator() below will re-fetch and split it once
             # this leaf's own pins are released.
         finally:
-            self.pool.unpin(page_id, dirty=leaf_dirty)
+            self.pool.unpin(page_id)
             if parent is not None:
-                self.pool.unpin(parent[0], dirty=parent_dirty)
+                self.pool.unpin(parent[0])
 
 
         if parent is not None and not parent_has_room:
@@ -607,8 +588,7 @@ class BTree:
         """
         while True:
             page_id, child_slot = path[level]
-            raw = self.pool.get_page(page_id)
-            dirty = False
+            raw = self.pool.get_page_for_write(page_id)
             try:
                 body = parse_page(raw)
                 new_left_cell = encode_interior_table_cell(left_child, separator)
@@ -625,7 +605,6 @@ class BTree:
                         body.cells[child_slot] = encode_interior_table_cell(right_child, old_separator)
                         body.insert_cell(child_slot, new_left_cell)
                     raw[:] = serialize_page(body)
-                    dirty = True
                     return
 
 
@@ -692,8 +671,8 @@ class BTree:
                 )
 
 
-                new_right_page_id = self.pager.allocate_page()
-                with self.pool.pinned(new_right_page_id, dirty=True) as new_right_raw:
+                new_right_page_id = self.pool.allocate_page()
+                with self.pool.pinned_for_write(new_right_page_id) as new_right_raw:
                     new_right_raw[:] = serialize_page(
                         PageBody(PageType.INTERIOR_TABLE, cells=new_right_cells, right_child=new_right_right_child)
                     )
@@ -703,8 +682,8 @@ class BTree:
                     # Root split: self.root (== page_id) keeps its page
                     # number and becomes the new top interior page; BOTH
                     # halves of its own former content move to fresh pages.
-                    new_left_page_id = self.pager.allocate_page()
-                    with self.pool.pinned(new_left_page_id, dirty=True) as new_left_raw:
+                    new_left_page_id = self.pool.allocate_page()
+                    with self.pool.pinned_for_write(new_left_page_id) as new_left_raw:
                         new_left_raw[:] = serialize_page(
                             PageBody(
                                 PageType.INTERIOR_TABLE, cells=new_left_cells, right_child=new_left_right_child
@@ -718,7 +697,6 @@ class BTree:
                         right_child=new_right_page_id,
                     )
                     raw[:] = serialize_page(new_root)
-                    dirty = True
                     return
 
 
@@ -728,9 +706,8 @@ class BTree:
                 raw[:] = serialize_page(
                     PageBody(PageType.INTERIOR_TABLE, cells=new_left_cells, right_child=new_left_right_child)
                 )
-                dirty = True
             finally:
-                self.pool.unpin(page_id, dirty=dirty)
+                self.pool.unpin(page_id)
 
 
             level -= 1

@@ -473,7 +473,7 @@ def test_delete_emptying_a_leaf_merges_and_shrinks_the_tree(pager, pool) -> None
 
 
     # leaf_a was merged away and leaf_b was pulled up, so both are reusable.
-    assert {pager.allocate_page(), pager.allocate_page()} == {leaf_a, leaf_b}
+    assert {pool.allocate_page(), pool.allocate_page()} == {leaf_a, leaf_b}
 
 
 

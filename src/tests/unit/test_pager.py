@@ -132,6 +132,53 @@ def test_sqlite3_sees_no_tables_in_a_fresh_database(tmp_path) -> None:
     assert result.stdout.strip() == "0"
 
 
+def test_read_page_past_physical_eof_reads_as_zeros(tmp_path) -> None:
+    """Week 5, session 0: BufferPool.allocate_page()'s growth path bumps
+    page_count without ever calling write_page -- the page shouldn't touch
+    disk until commit. Simulate exactly that (bump page_count by hand,
+    write nothing) and confirm a read still comes back full-size and zeroed,
+    not a short bytearray truncated at the real end of the file.
+    """
+    pager = Pager.create(tmp_path / "test.db")
+    pager._header.page_count += 1
+    page_id = pager._header.page_count
+
+    data = pager.read_page(page_id)
+
+    assert len(data) == PAGE_SIZE
+    assert bytes(data) == bytes(PAGE_SIZE)
+    pager.close()
+
+
+def test_header_bytes_is_the_live_header_serialized(tmp_path) -> None:
+    pager = Pager.create(tmp_path / "test.db")
+    pager.allocate_page()
+    assert pager.header_bytes() == pager._header.to_bytes()
+    pager.close()
+
+
+def test_reload_header_resyncs_in_memory_state_from_disk(tmp_path) -> None:
+    """Simulates what rollback needs: the file's on-disk header (written by
+    a prior close()) is the source of truth. reload_header() must discard
+    whatever the in-memory header currently believes and replace it wholesale.
+    """
+    path = tmp_path / "test.db"
+    pager = Pager.create(path)
+    pager.allocate_page()
+    pager.bump_schema_cookie()
+    pager.close()  # persists page_count=2, schema_cookie=1
+
+    reopened = Pager.open(path)
+    reopened._header.page_count = 99     # simulate an in-flight transaction's
+    reopened._header.schema_cookie = 42  # mutations that never reached disk
+
+    reopened.reload_header()
+
+    assert reopened.page_count == 2
+    assert reopened._header.schema_cookie == 1
+    reopened.close()
+
+
 def test_allocate_extends_file_when_freelist_empty(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
     assert pager.page_count == 1
@@ -214,3 +261,78 @@ def test_freed_pages_are_fully_zeroed(tmp_path) -> None:
         capture_output=True, text=True, check=True,
     )
     assert result.stdout.strip() == "ok"
+
+
+def test_write_page_barrier_assertion_is_inert_this_session(tmp_path) -> None:
+    """Pager._txn is always None right now -- session 1 wires up the real
+    guard. This just confirms write_page still works when it's unset.
+    """
+    pager = Pager.create(tmp_path / "test.db")
+    assert pager._txn is None
+    pager.write_page(1, bytearray(PAGE_SIZE))
+    pager.close()
+
+
+def test_write_page_barrier_assertion_fires_before_barrier_passed(tmp_path) -> None:
+    class _StubTxn:
+        barrier_passed = False
+
+    pager = Pager.create(tmp_path / "test.db")
+    pager._txn = _StubTxn()
+    with pytest.raises(AssertionError):
+        pager.write_page(1, bytearray(PAGE_SIZE))
+    pager._txn = None
+    pager.close()
+
+
+def test_truncate_shrinks_file_and_updates_page_count(tmp_path) -> None:
+    path = tmp_path / "test.db"
+    pager = Pager.create(path)
+    pager.allocate_page()
+    pager.allocate_page()
+    pager.allocate_page()
+    assert pager.page_count == 4
+
+    pager.truncate(2)
+
+    assert pager.page_count == 2
+    pager.sync()
+    assert path.stat().st_size == 2 * PAGE_SIZE
+    pager.close()
+
+
+def test_truncate_makes_pages_beyond_the_new_count_unreadable(tmp_path) -> None:
+    pager = Pager.create(tmp_path / "test.db")
+    pager.allocate_page()
+    pager.allocate_page()
+
+    pager.truncate(1)
+
+    with pytest.raises(PageOutOfRangeError):
+        pager.read_page(2)
+    pager.close()
+
+
+def test_restore_page_writes_past_the_current_page_count(tmp_path) -> None:
+    """Recovery restores pages BEFORE it truncates -- a page number above the
+    live header's page_count must be writable, unlike write_page().
+    """
+    path = tmp_path / "test.db"
+    pager = Pager.create(path)
+    assert pager.page_count == 1
+
+    payload = b"\xcd" * PAGE_SIZE
+    pager.restore_page(5, payload)  # page_count is still 1 here
+
+    pager.sync()
+    with path.open("rb") as f:
+        f.seek(4 * PAGE_SIZE)
+        assert f.read(PAGE_SIZE) == payload
+    pager.close()
+
+
+def test_restore_page_rejects_wrong_size(tmp_path) -> None:
+    pager = Pager.create(tmp_path / "test.db")
+    with pytest.raises(ValueError):
+        pager.restore_page(1, b"too short")
+    pager.close()

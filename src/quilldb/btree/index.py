@@ -192,8 +192,7 @@ class IndexBTree:
         page_id, slot = path[-1]
 
 
-        raw = self.pool.get_page(page_id)
-        dirty = False
+        raw = self.pool.get_page_for_write(page_id)
         leaf_is_pinned = True
         try:
             body = parse_page(raw)
@@ -214,10 +213,9 @@ class IndexBTree:
             cell = encode_leaf_index_cell(len(payload), local_payload, overflow_page)
             body.insert_cell(slot, cell)
             raw[:] = serialize_page(body)
-            dirty = True
         finally:
             if leaf_is_pinned:
-                self.pool.unpin(page_id, dirty=dirty)
+                self.pool.unpin(page_id)
 
 
     def seek_eq(self, values: Sequence[Value]) -> Iterator[int]:
@@ -304,17 +302,15 @@ class IndexBTree:
 
 
         leaf_page_id, leaf_slot = path[-1]
-        raw = self.pool.get_page(leaf_page_id)
-        dirty = False
+        raw = self.pool.get_page_for_write(leaf_page_id)
         try:
             body = parse_page(raw)
             _, _, overflow_page = decode_leaf_index_cell(body.cells[leaf_slot])
             body.delete_cell(leaf_slot)
             leaf_now_empty = not body.cells
             raw[:] = serialize_page(body)
-            dirty = True
         finally:
-            self.pool.unpin(leaf_page_id, dirty=dirty)
+            self.pool.unpin(leaf_page_id)
 
 
         if overflow_page:
@@ -460,8 +456,7 @@ class IndexBTree:
         # only discovers an over-full page after the caller has committed to
         # the change -- which, with no rollback before week 5, would mean a
         # half-applied delete.
-        raw = self.pool.get_page(page_id)
-        dirty = False
+        raw = self.pool.get_page_for_write(page_id)
         try:
             body = parse_page(raw)
             body.cells[slot] = replacement
@@ -471,23 +466,20 @@ class IndexBTree:
                     f"{page_id} has no room -- needs interior rebalancing, unimplemented"
                 )
             raw[:] = serialize_page(body)
-            dirty = True
         finally:
-            self.pool.unpin(page_id, dirty=dirty)
+            self.pool.unpin(page_id)
 
 
         # The promoted entry now lives upstairs and ONLY upstairs. Its
         # overflow chain moved with it -- exactly one owner, as always.
-        raw = self.pool.get_page(leaf_page_id)
-        dirty = False
+        raw = self.pool.get_page_for_write(leaf_page_id)
         try:
             leaf = parse_page(raw)
             leaf.delete_cell(leaf_slot)
             leaf_now_empty = not leaf.cells
             raw[:] = serialize_page(leaf)
-            dirty = True
         finally:
-            self.pool.unpin(leaf_page_id, dirty=dirty)
+            self.pool.unpin(leaf_page_id)
 
 
         if divider_overflow:
@@ -562,8 +554,7 @@ class IndexBTree:
 
 
         parent_page_id, child_slot = path[level - 1]
-        parent_raw = self.pool.get_page(parent_page_id)
-        parent_dirty = False
+        parent_raw = self.pool.get_page_for_write(parent_page_id)
         freed = False
         shrink_parent = False
 
@@ -596,8 +587,7 @@ class IndexBTree:
             prefer_rotation = merge_would_empty_parent and parent_page_id != self.root
 
 
-            sibling_raw = self.pool.get_page(sibling_id)
-            sibling_dirty = False
+            sibling_raw = self.pool.get_page_for_write(sibling_id)
             merged = False
             rotated = False
             try:
@@ -632,7 +622,6 @@ class IndexBTree:
                     sibling.insert_cell(0 if prepend else len(sibling.cells), descending)
                     sibling.right_child = absorbed_right_child
                     sibling_raw[:] = serialize_page(sibling)
-                    sibling_dirty = True
                     merged = True
                 elif can_rotate:
                     borrow_slot = 0 if prepend else len(sibling.cells) - 1
@@ -665,10 +654,9 @@ class IndexBTree:
                     if not is_leaf and not prepend:
                         sibling.right_child = borrow_child
                     sibling_raw[:] = serialize_page(sibling)
-                    sibling_dirty = True
 
 
-                    with self.pool.pinned(page_id, dirty=True) as empty_raw:
+                    with self.pool.pinned_for_write(page_id) as empty_raw:
                         empty_raw[:] = serialize_page(refilled)
 
 
@@ -679,7 +667,7 @@ class IndexBTree:
                     )
                     rotated = True
             finally:
-                self.pool.unpin(sibling_id, dirty=sibling_dirty)
+                self.pool.unpin(sibling_id)
 
 
             if merged:
@@ -692,14 +680,12 @@ class IndexBTree:
 
             if merged or rotated:
                 parent_raw[:] = serialize_page(parent)
-                parent_dirty = True
         finally:
-            self.pool.unpin(parent_page_id, dirty=parent_dirty)
+            self.pool.unpin(parent_page_id)
 
 
         if freed:
-            self.pool.discard(page_id)
-            self.pager.free_page(page_id)
+            self.pool.free_page(page_id)
         if shrink_parent:
             self._rebalance(path, level - 1)
 
@@ -717,12 +703,11 @@ class IndexBTree:
             self.pool.unpin(child_page_id)
 
 
-        with self.pool.pinned(self.root, dirty=True) as root_raw:
+        with self.pool.pinned_for_write(self.root) as root_raw:
             root_raw[:] = serialize_page(promoted)
 
 
-        self.pool.discard(child_page_id)
-        self.pager.free_page(child_page_id)
+        self.pool.free_page(child_page_id)
 
 
     # ---- descent, keyed by compare_keys instead of int comparison --------
@@ -908,15 +893,13 @@ class IndexBTree:
     def _split_leaf(
         self, page_id: int, path: list[tuple[int, int]], key: tuple[Value, ...], payload: bytes
     ) -> None:
-        raw = self.pool.get_page(page_id)
-        leaf_dirty = False
+        raw = self.pool.get_page_for_write(page_id)
 
 
         parent: tuple[int, bytearray, PageBody, int] | None = None
-        parent_dirty = False
         if len(path) > 1:
             parent_id, child_slot = path[-2]
-            parent_raw = self.pool.get_page(parent_id)
+            parent_raw = self.pool.get_page_for_write(parent_id)
             parent = (parent_id, parent_raw, parse_page(parent_raw), child_slot)
 
 
@@ -1004,8 +987,8 @@ class IndexBTree:
                     right_cells[insert_slot - promoted_index - 1] = real_cell
 
 
-            right_page_id = self.pager.allocate_page()
-            with self.pool.pinned(right_page_id, dirty=True) as right_raw:
+            right_page_id = self.pool.allocate_page()
+            with self.pool.pinned_for_write(right_page_id) as right_raw:
                 right_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=right_cells))
 
 
@@ -1015,8 +998,8 @@ class IndexBTree:
 
 
             if parent is None:
-                left_page_id = self.pager.allocate_page()
-                with self.pool.pinned(left_page_id, dirty=True) as left_raw:
+                left_page_id = self.pool.allocate_page()
+                with self.pool.pinned_for_write(left_page_id) as left_raw:
                     left_raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=left_cells))
 
 
@@ -1025,12 +1008,10 @@ class IndexBTree:
                 )
                 new_root = PageBody(PageType.INTERIOR_INDEX, cells=[new_left_cell], right_child=right_page_id)
                 raw[:] = serialize_page(new_root)
-                leaf_dirty = True
                 return
 
 
             raw[:] = serialize_page(PageBody(PageType.LEAF_INDEX, cells=left_cells))
-            leaf_dirty = True
 
 
             _, parent_raw, parent_body, child_slot = parent
@@ -1050,13 +1031,12 @@ class IndexBTree:
 
 
                 parent_raw[:] = serialize_page(parent_body)
-                parent_dirty = True
             # else: leave the parent untouched here -- _promote_separator()
             # re-fetches and splits it after this leaf's pins are released.
         finally:
-            self.pool.unpin(page_id, dirty=leaf_dirty)
+            self.pool.unpin(page_id)
             if parent is not None:
-                self.pool.unpin(parent[0], dirty=parent_dirty)
+                self.pool.unpin(parent[0])
 
 
         if parent is not None and not parent_has_room:
@@ -1119,8 +1099,7 @@ class IndexBTree:
         """
         while True:
             page_id, child_slot = path[level]
-            raw = self.pool.get_page(page_id)
-            dirty = False
+            raw = self.pool.get_page_for_write(page_id)
             try:
                 body = parse_page(raw)
                 new_left_cell = encode_interior_index_cell(left_child, *separator)
@@ -1141,7 +1120,6 @@ class IndexBTree:
                         )
                         body.insert_cell(child_slot, new_left_cell)
                     raw[:] = serialize_page(body)
-                    dirty = True
                     return
 
 
@@ -1207,8 +1185,8 @@ class IndexBTree:
                 )
 
 
-                new_right_page_id = self.pager.allocate_page()
-                with self.pool.pinned(new_right_page_id, dirty=True) as new_right_raw:
+                new_right_page_id = self.pool.allocate_page()
+                with self.pool.pinned_for_write(new_right_page_id) as new_right_raw:
                     new_right_raw[:] = serialize_page(
                         PageBody(
                             PageType.INTERIOR_INDEX,
@@ -1221,8 +1199,8 @@ class IndexBTree:
                 if level == 0:
                     # Root split: self.root keeps its page number and
                     # becomes the new top; BOTH halves move to fresh pages.
-                    new_left_page_id = self.pager.allocate_page()
-                    with self.pool.pinned(new_left_page_id, dirty=True) as new_left_raw:
+                    new_left_page_id = self.pool.allocate_page()
+                    with self.pool.pinned_for_write(new_left_page_id) as new_left_raw:
                         new_left_raw[:] = serialize_page(
                             PageBody(
                                 PageType.INTERIOR_INDEX,
@@ -1238,7 +1216,6 @@ class IndexBTree:
                         right_child=new_right_page_id,
                     )
                     raw[:] = serialize_page(new_root)
-                    dirty = True
                     return
 
 
@@ -1250,9 +1227,8 @@ class IndexBTree:
                         right_child=new_left_right_child,
                     )
                 )
-                dirty = True
             finally:
-                self.pool.unpin(page_id, dirty=dirty)
+                self.pool.unpin(page_id)
 
 
             level -= 1
