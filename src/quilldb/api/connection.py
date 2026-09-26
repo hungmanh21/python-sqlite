@@ -70,6 +70,7 @@ from quilldb.sql.parser import parse
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
 from quilldb.txn.journal import Journal
+from quilldb.txn.recovery import recover_if_needed
 from quilldb.txn.transaction import Transaction
 
 _MEMORY_PATH = ":memory:"
@@ -509,6 +510,10 @@ def connect(path: str | Path) -> Connection:
         pager = Pager.open(path) if path.exists() else Pager.create(path)
 
 
+    # Recovery completes before the pool exists -- there is no cache to
+    # invalidate because there is no cache yet (week5-transactions.md
+    # SS"Where it goes in connect()").
+    recover_if_needed(pager.path, pager)
     pool = BufferPool(pager)
     catalog = Catalog(pager, pool)
     catalog.load()

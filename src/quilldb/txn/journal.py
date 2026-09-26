@@ -129,6 +129,45 @@ class Journal:
         self._file.flush()
         self._nrec += 1
 
+    def exists(self) -> bool:
+        """True if a journal file is present at self.path -- checked
+        without opening it, so recovery can decide whether to bother at
+        all. Always False in-memory (self.path is None): there is nothing
+        on disk to check, and nothing to recover.
+        """
+        return self.path is not None and self.path.exists()
+
+    def open_for_recovery(self) -> None:
+        """Open an EXISTING journal file for replay/inspection, read-only.
+
+        Unlike begin(), this does not create the file and does not pick a
+        new nonce -- the nonce a hot journal's checksums were written with
+        is whatever the crashed process chose, and is read back from the
+        header the first time is_hot() or replay() looks at it.
+        """
+        assert self.path is not None, "open_for_recovery() is meaningless in-memory"
+        self._file = self.path.open("rb")
+
+    def is_hot(self) -> bool:
+        """True if this journal's commit_barrier() completed: magic
+        present AND nRec > 0 (chapter 14 SS14.3 step 4). False either
+        means the journal never became valid, or it validly describes
+        zero pages -- both cases mean "delete it, change nothing" rather
+        than "replay it".
+        """
+        assert self._file is not None, "is_hot() called before begin()/open_for_recovery()"
+        self._file.seek(0)
+        header = self._file.read(12)
+        return header[0:8] == JOURNAL_MAGIC and int.from_bytes(header[8:12], "big") > 0
+
+    def page_count_before(self) -> int:
+        """The page count recorded in the header at begin() time -- what
+        truncate() must restore the file to on rollback or recovery.
+        """
+        assert self._file is not None, "page_count_before() called before begin()/open_for_recovery()"
+        self._file.seek(16)
+        return int.from_bytes(self._file.read(4), "big")
+
     def commit_barrier(self) -> None:
         """Make the journal valid. Nothing may touch the database before this.
 
