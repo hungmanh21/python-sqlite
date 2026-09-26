@@ -184,3 +184,14 @@ class JournalCorruptError(CorruptDatabaseError):
     outcome. Reserve this for a journal whose header parses but whose
     self-described geometry is impossible (page size 0, absurd nRec).
     """
+
+
+class SimulatedCrash(BaseException):
+    """Injected by the week-5/6 fault-injection harness (FaultyFile).
+    Deliberately inherits BaseException, NOT Exception.
+
+    This matters: an `except Exception:` block anywhere in the commit or
+    recovery path must NOT swallow it, or the crash matrix would silently
+    test nothing — the transaction would look like it "handled" the crash
+    instead of genuinely dying mid-write.
+    """
