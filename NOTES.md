@@ -205,3 +205,44 @@ where the *assumption* was the interesting part.
   is a legitimate seek. *Lesson: an index may only change a query's speed, never its results —
   and the test that enforces that is "run it with and without the index and diff", which is the
   only reason this was ever found.*
+
+---
+
+## Week 5 — atomic commit and crash recovery
+
+### B5-1 ★ `Transaction.commit()` leaked a pin on the header page, once per commit
+- **Symptom:** nothing failed — found by writing a throwaway script that committed the same
+  transaction object's descendants three times in a row and watched
+  `pool._cache[SCHEMA_ROOT_PAGE].pin_count` climb 1 → 2 → 3 instead of returning to 0.
+- **Assumed:** `BufferPool.get_page_for_write()` was interchangeable with the
+  `pinned_for_write()` context manager it backs — both "give me a mutable page," so either call
+  site should be fine.
+- **Actually:** they're not symmetric. `pinned_for_write()` unpins on `__exit__`;
+  `get_page_for_write()` does not, because its normal callers are already mid-mutation and pin
+  again themselves for the write proper. `commit()`'s header-stamp line called
+  `get_page_for_write()` directly, stamped the header, and returned — no second pin was coming,
+  so the first one was never released. Harmless-looking on one commit (page 1 stays cached
+  anyway); fatal under the no-steal invariant this same session added, since a pin count that
+  only ever grows eventually makes the page permanently ineligible for eviction.
+- **Fix:** `with self._pool.pinned_for_write(SCHEMA_ROOT_PAGE) as page: page[:FILE_HEADER_SIZE] =
+  self._pager.header_bytes()`. *Lesson: two APIs that produce the same mutable view are not the
+  same API if only one of them promises to clean up after itself — the leak was invisible
+  precisely because both looked correct in isolation.*
+
+### B5-2 `Connection.close()` had no plan for an open transaction
+- **Symptom:** two different failures depending on what the abandoned transaction had done: an
+  `AssertionError` crash inside `close()` if it had written anything, or — if it had written
+  nothing — a silent stray `t.db-journal` file that then blocked the *next* `BEGIN` with
+  `FileExistsError`, on a connection that otherwise looked perfectly healthy.
+- **Assumed:** `close()` only ever runs after a matched `COMMIT`/`ROLLBACK` pair, so an in-flight
+  explicit transaction wasn't a state it needed to reason about.
+- **Actually:** nothing stopped a caller from opening `BEGIN` and just calling `close()` (or
+  letting the object go out of scope) without either — an ordinary client mistake, not a crash.
+  `close()`'s `pool.flush_all()` then tried to write pages that were dirtied but never
+  journalled or barriered, tripping the very assertion this week added to forbid unbarriered
+  writes. A transaction that never wrote anything skipped that crash but still left its journal
+  file on disk, since nothing had called `journal.delete()`.
+- **Fix:** `close()` now checks for an open transaction first and rolls it back before touching
+  anything else — an uncommitted transaction never happened, so `close()` undoes it rather than
+  flushing it. *Lesson: "the caller will always clean up first" is a claim about callers, not
+  about the type system — it needs an explicit check exactly where it's cheapest to add one.*
