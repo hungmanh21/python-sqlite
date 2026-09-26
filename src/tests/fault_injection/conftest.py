@@ -71,28 +71,41 @@ class FaultyFile:
         self._real.close()
 
 
+class SyncCounter:
+    """Returned by patch_fsync so a caller measuring (not faulting) can read
+    off how many real syncs happened, the same way FaultyFile.writes does
+    for writes.
+    """
+
+    def __init__(self) -> None:
+        self.syncs = 0
+
+
 def patch_fsync(
     monkeypatch: pytest.MonkeyPatch,
     *,
     target_fd: int,
     fail_at_sync: int | None,
-) -> None:
+) -> SyncCounter:
     """Make os.fsync raise SimulatedCrash the `fail_at_sync`-th time it is
     called on `target_fd` specifically -- fsyncs on any other descriptor
     (the OTHER file, or anything pytest itself does) pass through untouched.
+    `fail_at_sync=None` counts without ever raising, which is what the
+    sync-boundary matrix's own MAX_SYNCS measurement uses.
 
     Scoped to this one test via monkeypatch: os.fsync is a single shared
     module attribute, so this patches it process-wide for the duration of
     the test and monkeypatch restores the real function on teardown.
     """
     real_fsync = os.fsync
-    counter = {"syncs": 0}
+    counter = SyncCounter()
 
     def fake_fsync(fd: int) -> None:
         if fd == target_fd:
-            counter["syncs"] += 1
-            if counter["syncs"] == fail_at_sync:
-                raise SimulatedCrash(f"sync #{counter['syncs']} on fd {fd}")
+            counter.syncs += 1
+            if counter.syncs == fail_at_sync:
+                raise SimulatedCrash(f"sync #{counter.syncs} on fd {fd}")
         real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", fake_fsync)
+    return counter
