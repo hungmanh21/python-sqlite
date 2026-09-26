@@ -37,7 +37,7 @@ def _leaf_cell(rowid: int) -> bytes:
 
 
 def _write_page(pager: Pager, pool: BufferPool, body: PageBody) -> int:
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     with pool.pinned(page_id, dirty=True) as raw:
         raw[:] = serialize_page(body)
     return page_id

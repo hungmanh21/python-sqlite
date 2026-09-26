@@ -15,6 +15,7 @@ never read or written. See allocate_page/free_page and chapter 01 §1.8.
 
 import io
 import os
+import threading
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -56,6 +57,7 @@ class Pager:
     _file: BinaryIO
     _header: FileHeader
     _txn: Any
+    _io_lock: threading.Lock
 
     def __init__(self, path: Path) -> None:
         """Prefer Pager.create() or Pager.open()."""
@@ -83,6 +85,7 @@ class Pager:
         self._file = file
         self._header = header
         self._txn = None
+        self._io_lock = threading.Lock()
         return self
 
     @classmethod
@@ -102,6 +105,7 @@ class Pager:
         self._file = file
         self._header = header
         self._txn = None
+        self._io_lock = threading.Lock()
         return self
 
 
@@ -131,6 +135,7 @@ class Pager:
         self._file = file
         self._header = header
         self._txn = None
+        self._io_lock = threading.Lock()
         return self
 
     @property
@@ -186,6 +191,11 @@ class Pager:
         real write, it must still read back as a valid, full-size page --
         logically zero, exactly like a page that WAS written as zeros would.
 
+        On a real file, os.pread does the seek and the read as one syscall --
+        no shared cursor for a second thread to move between them (week6-
+        concurrency.md SS37.1). io.BytesIO (the :memory: case) has no pread,
+        so that path takes self._io_lock around the seek-then-read instead.
+
         Returns:
             A fresh mutable 4096-byte bytearray. Mutating it does NOT write to
             disk — call write_page.
@@ -195,8 +205,12 @@ class Pager:
         if page_id < 1 or page_id > self.page_count:
             raise PageOutOfRangeError
         offset = (page_id - 1) * PAGE_SIZE
-        self._file.seek(offset)
-        data = self._file.read(PAGE_SIZE)
+        if self._path is not None:
+            data = os.pread(self._file.fileno(), PAGE_SIZE, offset)
+        else:
+            with self._io_lock:
+                self._file.seek(offset)
+                data = self._file.read(PAGE_SIZE)
         if len(data) < PAGE_SIZE:
             data = data.ljust(PAGE_SIZE, b"\x00")
 
@@ -204,6 +218,8 @@ class Pager:
 
     def write_page(self, page_id: int, data: bytes | bytearray) -> None:
         """Write one page.
+
+        Same pread/pwrite-or-lock split as read_page -- see there for why.
 
         Raises:
             PageOutOfRangeError, ValueError: len(data) != PAGE_SIZE.
@@ -219,12 +235,24 @@ class Pager:
             raise ValueError
 
         offset = (page_id - 1) * PAGE_SIZE
-        self._file.seek(offset)
-        
-        self._file.write(data)
+        if self._path is not None:
+            os.pwrite(self._file.fileno(), bytes(data), offset)
+        else:
+            with self._io_lock:
+                self._file.seek(offset)
+                self._file.write(data)
 
-    def allocate_page(self) -> int:
+    def _allocate_page(self) -> int:
         """Get a page for new data — reusing a freed one if any.
+
+        Private (week6-concurrency.md SS37.3): BufferPool.allocate_page() is
+        the one production callers use -- it has to seed a cache entry for
+        the new page, which this method knows nothing about. Two
+        implementations touching header.freelist_trunk directly would mean
+        latching one leaves the race live in the other, so this one is no
+        longer part of the public surface; it stays for the Pager-layer
+        tests that exercise the freelist in isolation, single-threaded, with
+        no BufferPool involved.
 
         Returns:
             The page number. Contents are undefined; the caller must initialize.
@@ -275,8 +303,10 @@ class Pager:
             return self._header.page_count
 
 
-    def free_page(self, page_id: int) -> None:
+    def _free_page(self, page_id: int) -> None:
         """Return a page to the freelist.
+
+        Private, same reason as _allocate_page above (SS37.3).
 
         ⚠️ WRITES THROUGH THE POOL'S BACK: this writes the freelist trunk
         straight to the file, so a caller running above a BufferPool must be

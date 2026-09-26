@@ -21,6 +21,7 @@ pcache/btree split, not just a shortcut. See ADR-001.
 """
 
 
+import threading
 from collections import OrderedDict
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -55,6 +56,19 @@ class BufferPool:
         # touch marks "most recently used", so the LRU victim is always
         # whichever entry currently sits at the front.
         self._cache: OrderedDict[int, _Entry] = OrderedDict()
+
+        # TODO(human): guards self._cache (both the dict and its recency
+        # order) plus pin_count/dirty on every _Entry. Every method below
+        # that reads or mutates those -- get_page, unpin, _evict_one,
+        # allocate_page, free_page, flush_page/flush_all, clear, discard --
+        # needs to take this latch. The one trap (week6-concurrency.md
+        # SS37.6, chapter 16 SS16.3): NEVER hold it across a disk read.
+        # get_page()'s miss path has to insert a placeholder frame, pin it,
+        # RELEASE the latch, do pager.read_page(), then re-acquire to fill
+        # the real data in -- holding it across I/O serializes every thread
+        # on disk latency, which is exactly what a pool exists to avoid.
+        # Not wired in yet; every method below still runs unlatched.
+        self._latch = threading.Lock()
 
 
         # Chapter 19 SS19.2's benchmark metric. A "page read" is exactly a
@@ -111,13 +125,24 @@ class BufferPool:
                 growing past capacity either.
             PageOutOfRangeError: propagated from the pager on a miss.
         """
+        with self._latch:
+            return self._get_page_locked(page_id)
+
+    def _get_page_locked(self, page_id: int) -> bytearray:
+        """Same contract as get_page(), but assumes the caller already
+        holds self._latch -- lets _get_page_for_write_locked reuse this
+        logic without re-entering get_page() and deadlocking.
+
+        Still holds the latch across the disk read below (self._pager.
+        read_page) -- correct, not yet the placeholder-frame pattern
+        week6-concurrency.md SS37.6 describes for releasing it during I/O.
+        """
         if page_id in self._cache:
             entry = self._cache[page_id]
             entry.pin_count += 1
             self._cache.move_to_end(page_id)
             self.hits += 1
             return entry.data
-
 
         # Check happens BEFORE inserting the new page, so hitting capacity
         # exactly (not just exceeding it) is what must trigger an eviction
@@ -128,7 +153,6 @@ class BufferPool:
         # committed page with no valid place to roll back to.
         if len(self._cache) >= self._capacity:
             self._evict_one()
-
 
         data = self._pager.read_page(page_id)
         self._cache[page_id] = _Entry(data=data, pin_count=1, dirty=False)
@@ -182,20 +206,25 @@ class BufferPool:
         Raises:
             ValueError: page_id isn't cached, or has no outstanding pin.
         """
+        with self._latch:
+            self._unpin_locked(page_id, dirty)
+
+    def _unpin_locked(self, page_id: int, dirty: bool = False) -> None:
+        """Same contract as unpin(), but assumes the caller already holds
+        self._latch -- for allocate_page/free_page to call while they hold
+        it themselves, instead of re-entering unpin() and deadlocking.
+        """
         if page_id not in self._cache:
             raise ValueError(f"page {page_id} is not cached")
-
 
         entry = self._cache[page_id]
         if entry.pin_count == 0:
             raise ValueError(f"page {page_id} has no outstanding pin")
 
-
         entry.pin_count -= 1
         # Sticky: only ever set to True here. Clearing it is flush's job.
         if dirty:
             entry.dirty = True
-
 
     def flush_page(self, page_id: int) -> None:
         """Write `page_id` back to the pager if it's dirty, then clear the
@@ -204,19 +233,20 @@ class BufferPool:
 
         A no-op if `page_id` isn't currently cached.
         """
-        if page_id not in self._cache:
-            return
-
-
-        entry = self._cache[page_id]
-        if entry.dirty:
-            self._pager.write_page(page_id, entry.data)
-            entry.dirty = False
+        with self._latch:
+            if page_id not in self._cache:
+                return
+    
+    
+            entry = self._cache[page_id]
+            if entry.dirty:
+                self._pager.write_page(page_id, entry.data)
+                entry.dirty = False
 
 
     def flush_all(self) -> None:
         """flush_page every currently cached page."""
-        for page_id in self._cache:
+        for page_id in list(self._cache.keys()):
             self.flush_page(page_id)
 
     def clear(self) -> None:
@@ -230,7 +260,8 @@ class BufferPool:
         move is to discard the cache wholesale and let the next get_page()
         re-read the restored file.
         """
-        self._cache.clear()
+        with self._latch:
+            self._cache.clear()
 
 
     def discard(self, page_id: int) -> None:
@@ -253,6 +284,13 @@ class BufferPool:
 
         Raises:
             ValueError: page_id is cached and still pinned.
+        """
+        with self._latch:
+            self._discard_locked(page_id)
+
+    def _discard_locked(self, page_id: int) -> None:
+        """Same contract as discard(), but assumes the caller already holds
+        self._latch -- same reason as _unpin_locked above.
         """
         entry = self._cache.get(page_id)
         if entry is None:
@@ -302,20 +340,21 @@ class BufferPool:
         accessor methods to Pager -- Pager and BufferPool already cross that
         seam via read_page/write_page, and free_page() below does the same.
         """
-        if self._pager._header.freelist_count > 0:
-            # Reuse path
-            page_id = self._pager._header.freelist_trunk
-            page = self.get_page_for_write(page_id)
-            next_pointer = int.from_bytes(page[:4], byteorder='big')
-            self._pager._header.freelist_trunk = next_pointer
-            self._pager._header.freelist_count -= 1
-            self.unpin(page_id)
-            return page_id
-        else:
-            self._pager._header.page_count += 1
-            page_id = self._pager._header.page_count
-            self._cache[page_id] = _Entry(data=bytearray(PAGE_SIZE), pin_count=0, dirty=True)
-            return page_id
+        with self._latch:
+            if self._pager._header.freelist_count > 0:
+                # Reuse path
+                page_id = self._pager._header.freelist_trunk
+                page = self._get_page_for_write_locked(page_id)
+                next_pointer = int.from_bytes(page[:4], byteorder='big')
+                self._pager._header.freelist_trunk = next_pointer
+                self._pager._header.freelist_count -= 1
+                self._unpin_locked(page_id)
+                return page_id
+            else:
+                self._pager._header.page_count += 1
+                page_id = self._pager._header.page_count
+                self._cache[page_id] = _Entry(data=bytearray(PAGE_SIZE), pin_count=0, dirty=True)
+                return page_id
 
     def free_page(self, page_id: int) -> None:
         """Return a page to the freelist, THROUGH the pool.
@@ -351,18 +390,19 @@ class BufferPool:
              bytes at offset 4 get misread as a leaf count by real sqlite3.
           5. freelist_trunk = page_id, freelist_count += 1.
         """
-        if page_id == 1:
-            raise ValueError("Cannot free page 1 (header page)")
-        if page_id > self._pager._header.page_count:
-            raise PageOutOfRangeError(f"Cannot free page {page_id} (out of range)")
-        self.discard(page_id)
-        page_content = self.get_page_for_write(page_id)
-        next_pointer = self._pager._header.freelist_trunk
-        page_content[:4] = next_pointer.to_bytes(4, byteorder='big')
-        page_content[4:] = bytearray(len(page_content) - 4)  # Zero the rest of the page
-        self.unpin(page_id)
-        self._pager._header.freelist_trunk = page_id
-        self._pager._header.freelist_count += 1
+        with self._latch:
+            if page_id == 1:
+                raise ValueError("Cannot free page 1 (header page)")
+            if page_id > self._pager._header.page_count:
+                raise PageOutOfRangeError(f"Cannot free page {page_id} (out of range)")
+            self._discard_locked(page_id)
+            page_content = self._get_page_for_write_locked(page_id)
+            next_pointer = self._pager._header.freelist_trunk
+            page_content[:4] = next_pointer.to_bytes(4, byteorder='big')
+            page_content[4:] = bytearray(len(page_content) - 4)  # Zero the rest of the page
+            self._unpin_locked(page_id)
+            self._pager._header.freelist_trunk = page_id
+            self._pager._header.freelist_count += 1
 
     @contextmanager
     def pinned(self, page_id: int, dirty: bool = False) -> Generator[bytearray]:
@@ -400,9 +440,21 @@ class BufferPool:
         of at unpin." Confirm that's true with a test before moving on --
         it's the whole reason this task is separable from session 3.
         """
+        with self._latch:
+            return self._get_page_for_write_locked(page_id)
+
+    def _get_page_for_write_locked(self, page_id: int) -> bytearray:
+        """Same contract as get_page_for_write(), but assumes the caller
+        already holds self._latch -- same reason as _unpin_locked above.
+
+        Calls _get_page_locked, not get_page(): get_page() now takes the
+        latch itself, so calling it from in here (already latched, via
+        get_page_for_write() or allocate_page/free_page) would re-enter and
+        deadlock the same way the public unpin()/discard() calls used to.
+        """
         if self._txn is not None:
             self._txn.will_modify(page_id)
-        page = self.get_page(page_id)
+        page = self._get_page_locked(page_id)
         entry = self._cache[page_id]
         entry.dirty = True
         return page

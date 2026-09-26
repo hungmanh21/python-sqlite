@@ -109,3 +109,39 @@ def patch_fsync(
 
     monkeypatch.setattr(os, "fsync", fake_fsync)
     return counter
+
+
+class WriteCounter:
+    """Returned by patch_pwrite, same role as SyncCounter for patch_fsync."""
+
+    def __init__(self) -> None:
+        self.writes = 0
+
+
+def patch_pwrite(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target_fd: int,
+    fail_at_write: int | None,
+) -> WriteCounter:
+    """Make os.pwrite raise SimulatedCrash the `fail_at_write`-th time it is
+    called on `target_fd` specifically -- same shape as patch_fsync, needed
+    for the same reason: Pager.write_page() (week6-concurrency.md SS37.1)
+    calls os.pwrite directly on the raw fd for thread safety, which bypasses
+    FaultyFile.write() entirely -- FaultyFile only ever sees calls that go
+    through a wrapped file OBJECT's `.write()` method. Journal still calls
+    `.write()` directly, so FaultyFile is still the right tool there;
+    `target == "db"` write-fault injection needs this instead.
+    """
+    real_pwrite = os.pwrite
+    counter = WriteCounter()
+
+    def fake_pwrite(fd: int, data: bytes, offset: int) -> int:
+        if fd == target_fd:
+            counter.writes += 1
+            if counter.writes == fail_at_write:
+                raise SimulatedCrash(f"write #{counter.writes} on fd {fd}")
+        return real_pwrite(fd, data, offset)
+
+    monkeypatch.setattr(os, "pwrite", fake_pwrite)
+    return counter

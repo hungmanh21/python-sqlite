@@ -16,7 +16,7 @@ from collections.abc import Callable, Sequence
 from typing import BinaryIO
 
 import pytest
-from conftest import FaultyFile, patch_fsync
+from conftest import FaultyFile, patch_fsync, patch_pwrite
 
 import quilldb
 from quilldb.btree.validate import validate_btree, validate_index_btree
@@ -114,7 +114,13 @@ def _run_scenario(
     then, and the fault has to be live before the scenario's own writes
     start -- which is also why this can't reuse Connection.transaction():
     that helper's own commit() would run to completion before this
-    function got a chance to swap in the FaultyFile.
+    function got a chance to wire the fault in.
+
+    `target == "db"` uses patch_pwrite, not FaultyFile: Pager.write_page()
+    calls os.pwrite on the raw fd for thread safety (week6-concurrency.md
+    SS37.1), which bypasses a wrapped file object's `.write()` entirely.
+    Journal still writes through `.write()`, so FaultyFile is still right
+    for `target == "journal"`.
     """
     db = quilldb.connect(str(path))
     db.execute("BEGIN")
@@ -123,7 +129,7 @@ def _run_scenario(
 
     if target == "db":
         real_file: BinaryIO = db.pager._file
-        db.pager._file = FaultyFile(real_file, fail_at_write=crash_at)  # type: ignore[assignment]
+        patch_pwrite(monkeypatch, target_fd=real_file.fileno(), fail_at_write=crash_at)
     elif target == "journal":
         assert txn._journal._file is not None
         real_file = txn._journal._file
@@ -169,9 +175,16 @@ def _run_scenario_sync_fault(
 
 def _measure_real_write_count(path: pathlib.Path, scenario: str, target: str) -> int:
     """The honest source for how many write boundaries a (scenario, target)
-    pair actually has: run it to completion with `fail_at_write=None` --
-    nothing ever crashes -- and read off how many real `.write()` calls
-    FaultyFile counted.
+    pair actually has: run it to completion with faulting disabled -- nothing
+    ever crashes -- and read off how many real writes happened.
+
+    `db` uses patch_pwrite: Pager.write_page() calls os.pwrite on the raw fd
+    (week6-concurrency.md SS37.1), which bypasses a wrapped file object's
+    `.write()` entirely. `journal` still counts through FaultyFile, since
+    Journal writes through `.write()` directly. This runs at COLLECTION time
+    via _write_boundaries, before any pytest `monkeypatch` fixture exists --
+    the `db` branch opens its own pytest.MonkeyPatch.context() instead, same
+    as _measure_recovery_write_count below.
 
     `db` and `journal` are different files with very different write
     counts for the same scenario, so this is called once per target rather
@@ -182,22 +195,26 @@ def _measure_real_write_count(path: pathlib.Path, scenario: str, target: str) ->
     txn = db._txn
     assert txn is not None
 
+    # No db.close() in either branch below: _run_scenario never calls it
+    # either (a real crash never gets a clean close), and close() does its
+    # own extra header write -- counting it would fabricate a crash_at that
+    # can't happen.
     if target == "db":
-        faulty = FaultyFile(db.pager._file, fail_at_write=None)
-        db.pager._file = faulty  # type: ignore[assignment]
-    elif target == "journal":
+        with pytest.MonkeyPatch.context() as mp:
+            counter = patch_pwrite(mp, target_fd=db.pager._file.fileno(), fail_at_write=None)
+            SCENARIOS[scenario](db)
+            db.execute("COMMIT")
+        return counter.writes
+
+    if target == "journal":
         assert txn._journal._file is not None
         faulty = FaultyFile(txn._journal._file, fail_at_write=None)
         txn._journal._file = faulty  # type: ignore[assignment]
-    else:
-        raise ValueError(f"unknown target {target!r}")
+        SCENARIOS[scenario](db)
+        db.execute("COMMIT")
+        return faulty.writes
 
-    SCENARIOS[scenario](db)
-    db.execute("COMMIT")
-    # No db.close() here: _run_scenario never calls it either (a real crash
-    # never gets a clean close), and close() does its own extra header
-    # write -- counting it would fabricate a crash_at that can't happen.
-    return faulty.writes
+    raise ValueError(f"unknown target {target!r}")
 
 
 def _measure_real_sync_count(path: pathlib.Path, scenario: str, target: str, monkeypatch: pytest.MonkeyPatch) -> int:
