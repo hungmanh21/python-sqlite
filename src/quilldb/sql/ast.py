@@ -143,9 +143,14 @@ class Explain:
 
 @dataclass(frozen=True)
 class Begin:
-    """No fields -- week 5 supports no BEGIN variant (IMMEDIATE/EXCLUSIVE
-    are week 6 locking modes, see docs/implementation/week5-transactions.md).
+    """`immediate=True` for `BEGIN IMMEDIATE` (week6-concurrency.md,
+    "declare write intent up front") -- claims the global writer lock
+    right away instead of leaving it to the transaction's first real
+    write. EXCLUSIVE (SQLite's third variant) has no meaning under
+    quilldb's table-level locking -- there's no separate "block new
+    readers too" mode to name -- so it isn't parsed.
     """
+    immediate: bool = False
 
 
 @dataclass(frozen=True)

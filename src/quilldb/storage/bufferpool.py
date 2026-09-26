@@ -249,19 +249,41 @@ class BufferPool:
         for page_id in list(self._cache.keys()):
             self.flush_page(page_id)
 
-    def clear(self) -> None:
-        """Drop every cached entry without writing anything back.
+    def clear(self, pages: set[int] | None = None) -> None:
+        """Drop cached entries without writing anything back.
 
         Week 5, session 3: rollback's last pool-facing step (chapter 14
-        §14.3). Journal replay just rewrote the database file underneath
-        this pool directly, bypassing it entirely -- so every cached byte,
-        dirty or clean, pinned or not, now describes a database that no
-        longer exists. There is nothing safe to flush; the only correct
-        move is to discard the cache wholesale and let the next get_page()
-        re-read the restored file.
+        §14.3), for the single-threaded case where `pages` is omitted --
+        journal replay rewrote the WHOLE database file underneath this pool
+        directly, so every cached byte, dirty or clean, pinned or not, now
+        describes a database that no longer exists, and the only correct
+        move is to discard the cache wholesale.
+
+        week6-concurrency.md §37.5: with concurrent readers, that wholesale
+        drop is too blunt -- replay only actually changed the pages
+        `Transaction._journalled` tracked (the pre-existing pages it
+        recorded originals for, plus pages allocated-then-truncated-away),
+        and every OTHER cached page is still a faithful copy of the file. A
+        reader with an unrelated page pinned must not have it yanked out
+        from under it. Pass that set as `pages` to discard only those.
+
+        Args:
+            pages: if given, discard only these page_ids (each via
+                discard()'s existing contract -- a no-op if not cached,
+                ValueError if still pinned, which is deliberate: every page
+                in this set belongs to a table this transaction held
+                EXCLUSIVE on, or was truncated away outright, so 2PL says
+                nothing else should still be holding a pin on it. If None
+                (default), drop everything -- today's behaviour.
         """
         with self._latch:
-            self._cache.clear()
+            if pages is None:
+                self._cache.clear()
+            else:
+                for page_id in pages:
+                    self._discard_locked(page_id)
+
+            
 
 
     def discard(self, page_id: int) -> None:

@@ -319,7 +319,11 @@ class Parser:
 
     def _begin(self) -> Begin:
         self._expect(TokenType.BEGIN, "expected BEGIN")
-        return Begin()
+        immediate = False
+        if self._peek().type is TokenType.IMMEDIATE:
+            self._advance()
+            immediate = True
+        return Begin(immediate)
 
 
     def _commit(self) -> Commit:

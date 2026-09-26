@@ -52,6 +52,7 @@ class TokenType(Enum):
     ANALYZE = auto()
     EXPLAIN = auto()
     BEGIN = auto()
+    IMMEDIATE = auto()
     COMMIT = auto()
     ROLLBACK = auto()
     INTEGER_TYPE = auto()
@@ -101,6 +102,7 @@ KEYWORDS: dict[str, TokenType] = {
     "analyze": TokenType.ANALYZE,
     "explain": TokenType.EXPLAIN,
     "begin": TokenType.BEGIN,
+    "immediate": TokenType.IMMEDIATE,
     "commit": TokenType.COMMIT,
     "rollback": TokenType.ROLLBACK,
     "integer": TokenType.INTEGER_TYPE,

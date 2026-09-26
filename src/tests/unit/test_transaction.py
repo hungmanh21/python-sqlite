@@ -6,15 +6,22 @@ from quilldb.constants import PAGE_SIZE
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
 from quilldb.txn.journal import Journal
+from quilldb.txn.locks import LockManager
 from quilldb.txn.transaction import Transaction
 
 
 def open_txn(pager: Pager, pool: BufferPool, journal: Journal) -> Transaction:
-    """Wire a Transaction into both halves of the hook the way session 4's
-    connect() eventually will: Pager.write_page's assertion reads
-    pager._txn, BufferPool.get_page_for_write reads pool._txn.
+    """Wire a Transaction into both halves of the hook the way
+    will_modify()'s promotion (week6-concurrency.md SS37.2) eventually
+    will: Pager.write_page's assertion reads pager._txn,
+    BufferPool.get_page_for_write reads pool._txn. These tests exercise
+    journal/commit/rollback mechanics directly, not locking or promotion,
+    so they reach past will_modify() and wire an already-promoted
+    Transaction by hand, with a throwaway LockManager standing in for the
+    real one.
     """
-    txn = Transaction(pager, pool, journal)
+    txn = Transaction(pager, pool, LockManager(), txn_id=0)
+    txn._journal = journal
     pager._txn = txn
     pool._txn = txn
     journal.begin(pager.page_count)
