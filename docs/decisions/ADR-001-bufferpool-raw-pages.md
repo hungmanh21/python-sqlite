@@ -10,7 +10,7 @@ Accepted.
 ## Context
 
 
-`docs/theory/04-the-buffer-pool.md` §4.2 argues the pool should cache
+`docs/theory/04-buffer-pool.md` §4.2 argues the pool should cache
 *parsed* page objects rather than raw bytes: in Python, re-running
 `struct.unpack` on every access is real, avoidable cost that a C
 implementation wouldn't pay.

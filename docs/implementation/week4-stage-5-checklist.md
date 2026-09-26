@@ -1,7 +1,7 @@
 # Week 4 — Stage 5 checklist: IndexScan, ANALYZE, EXPLAIN
 
 
-← [Week 4 spec](week-4-mutation-and-indexes.md)
+← [Week 4 spec](week4-mutation-and-indexes.md)
 
 
 Stages 1-4 of the cost-based pipeline (`plan/predicates.py`, `plan/planner.py`,

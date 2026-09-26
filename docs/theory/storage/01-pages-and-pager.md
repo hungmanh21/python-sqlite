@@ -381,7 +381,7 @@ It exists for a different reason than the file header does. The file header answ
 **Don't confuse the two, and notice the naming clash is easy to trip over:** "the header" means something different depending on which chapter you're in. This doc's convention: **file header** for the 100-byte one at the start of the file; **page header** for the 8-or-12-byte one that begins each page's own region.
 
 
-The full field-by-field rationale — why 0 means 65536 at offset 5, why fragments get only one byte, why the type byte must be validated — belongs to the slotted page itself, not to the pager, so it's in [chapter 02 §2.5](02-the-slotted-page.md#25-the-page-header-8-bytes-or-12-and-what-each-one-buys). What matters here, at the pager level, is the shape of the rule — and it is *not* "every page except page 1":
+The full field-by-field rationale — why 0 means 65536 at offset 5, why fragments get only one byte, why the type byte must be validated — belongs to the slotted page itself, not to the pager, so it's in [chapter 02 §2.5](02-slotted-page.md#25-the-page-header-8-bytes-or-12-and-what-each-one-buys). What matters here, at the pager level, is the shape of the rule — and it is *not* "every page except page 1":
 
 
 > **Every page in the file, page 1 included, carries a b-tree page header. On pages 2…N it starts at byte 0. On page 1 it starts at byte 100, because the file header is sitting in front of it.**

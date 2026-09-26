@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 4, Mutation and Indexes
 
 
-← [Index](README.md)  ·  Prev: [Week 3 — SQL](week-3-sql.md)  ·  Next: [Week 5 — Transactions](week-5-transactions.md)
+← [Index](README.md)  ·  Prev: [Week 3 — SQL](week3-sql.md)  ·  Next: [Week 5 — Transactions](week5-transactions.md)
 
 
 ---

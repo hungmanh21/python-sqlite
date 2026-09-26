@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 8, Presentation
 
 
-← [Index](README.md)  ·  Prev: [Week 7 — Query Processing](week-7-query-processing.md)
+← [Index](README.md)  ·  Prev: [Week 7 — Query Processing](week7-query-processing.md)
 
 
 ---

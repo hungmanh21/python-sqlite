@@ -34,9 +34,9 @@ weeks 4–8). Full reasoning for every row lives in the linked chapter; this pag
 | --------------------------------- | ------------------------------------------------------------- | --------------------------------------------------- | ------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Magic + 100-byte header           | all 22 real fields, real offsets                              | same                                                | 🟰             | Built                    | the acceptance test is byte-exact                                                                                                                                                 |
 | Page 1's dual role                | file header + `sqlite_schema` root, b-tree header at byte 100 | same                                                | 🟰             | Built                    | no separate "catalog root" field exists to diverge on — see below                                                                                                                 |
-| Page header size                  | 8 bytes leaf / 12 interior, by page type                      | same                                                | 🟰             | Built                    | [storage/01 §1.6](theory/storage/01-pages-and-the-pager.md), [storage/02 §2.5](theory/storage/02-the-slotted-page.md)                                                             |
+| Page header size                  | 8 bytes leaf / 12 interior, by page type                      | same                                                | 🟰             | Built                    | [storage/01 §1.6](theory/storage/01-pages-and-pager.md), [storage/02 §2.5](theory/storage/02-slotted-page.md)                                                             |
 | Page type bytes                   | 2 / 5 / 10 / 13                                               | same                                                | 🟰             | Built                    | `decodeFlags` accepts only these four                                                                                                                                             |
-| Slotted page layout               | pointers forward, cells backward, two regions meeting         | same                                                | 🟰             | Built                    | [storage/02](theory/storage/02-the-slotted-page.md)                                                                                                                               |
+| Slotted page layout               | pointers forward, cells backward, two regions meeting         | same                                                | 🟰             | Built                    | [storage/02](theory/storage/02-slotted-page.md)                                                                                                                               |
 | **Freeblocks on delete**          | **repack the page**, zero fragmentation always                | chained freeblocks + fragment counter, capped at 60 | 🔀             | Built                    | see below                                                                                                                                                                         |
 | **Freelist structure**            | **one level** (a page is legal, if less efficient)            | two-level trunk/leaf                                | 🔀             | Built, two-level planned | see below                                                                                                                                                                         |
 | Freed page zeroing                | full page zeroed                                              | same                                                | 🟰             | Built                    | stale bytes at offset 4–7 make `sqlite3` report "freelist leaf count too big" — verified by experiment                                                                            |
@@ -56,7 +56,7 @@ weeks 4–8). Full reasoning for every row lives in the linked chapter; this pag
 quilldb doesn't have a "catalog root page" configuration field, and it's tempting to read that as a gap.
 It isn't: SQLite doesn't have one either. Page 1 is *hardcoded* as the schema root — a constant that can't
 be corrupted, versus a stored field that could point at a bad page. Matching this costs one function,
-`page_header_offset()`, and buys the header's simplest possible design. [storage/01 §1.6](theory/storage/01-pages-and-the-pager.md).
+`page_header_offset()`, and buys the header's simplest possible design. [storage/01 §1.6](theory/storage/01-pages-and-pager.md).
 
 
 ### Freeblocks vs. repack-on-delete — different, and it's a real tradeoff, not laziness
@@ -70,7 +70,7 @@ every delete: slide the survivors tight, zero the freeblock and fragment fields.
 **Cost:** O(page size) per delete instead of O(1). **Payoff:** `free_space()` is always one contiguous
 number, fragments can never accumulate, and `delete_cell` is ~15 lines instead of ~80. A page with no
 holes is a perfectly well-formed SQLite page — the fields exist and correctly say "no holes." Right
-tradeoff at quilldb's write volume; wrong one at SQLite's. [storage/02 §2.4](theory/storage/02-the-slotted-page.md).
+tradeoff at quilldb's write volume; wrong one at SQLite's. [storage/02 §2.4](theory/storage/02-slotted-page.md).
 
 
 ### One-level freelist — a documented gap, and an empirically verified one
@@ -80,7 +80,7 @@ A one-level freelist (every freed page linked directly, no trunk/leaf split) is 
 verified by hand-building one and confirming `sqlite3 ... integrity_check` returns `ok`. The two-level
 trunk/leaf design exists purely so freeing and allocating touch ~1/120th as many pages, which is a
 performance property, not a correctness one. quilldb currently builds the simpler one-level list; the
-two-level version is designed in [storage/01 §1.8](theory/storage/01-pages-and-the-pager.md) as the next
+two-level version is designed in [storage/01 §1.8](theory/storage/01-pages-and-pager.md) as the next
 increment, not a rewrite.
 
 
@@ -126,7 +126,7 @@ pathological rather than fixed. [codec/03 §3.5](theory/codec/03-encoding-varint
 | Index key encoding                   | `(indexed cols…, rowid)` as one record             | same                                                        | 🟰       | Planned | rowid is a record **field**, proven by rowids 0/1 costing zero body bytes — [btree/11 §11.4](theory/btree/11-index-b-trees.md) |
 | `UNIQUE` index storage               | byte-identical to non-unique                       | same                                                        | 🟰       | Planned | uniqueness is a comparison rule, not a format difference                                                                       |
 | Index divider keys (interior)        | full untruncated key                               | same                                                        | 🟰       | Planned | no suffix truncation — [btree/11 §11.6](theory/btree/11-index-b-trees.md)                                                      |
-| Buffer pool eviction                 | LRU                                                | LRU-ish, tuned for scans                                    | 🔀       | Built   | [ADR-001](decisions/ADR-001-bufferpool-raw-pages.md), [storage/04](theory/storage/04-the-buffer-pool.md)                       |
+| Buffer pool eviction                 | LRU                                                | LRU-ish, tuned for scans                                    | 🔀       | Built   | [ADR-001](decisions/ADR-001-bufferpool-raw-pages.md), [storage/04](theory/storage/04-buffer-pool.md)                       |
 
 
 ### Two-way split, no merge — different, and it's an implementation gap, not a format divergence
@@ -154,7 +154,7 @@ just without the safety valve.
 
 | Area                      | quilldb                                                  | SQLite                                             | Verdict | Status | Why                                                                                                                                           |
 | ------------------------- | -------------------------------------------------------- | -------------------------------------------------- | ------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| Parser                    | hand-written recursive descent                           | Lemon-generated LALR                               | 🔀       | Built  | [sql/07](theory/sql/07-from-sql-text-to-a-tree.md) — hand-written is more legible for an interview, at the cost of Lemon's ambiguity checking |
+| Parser                    | hand-written recursive descent                           | Lemon-generated LALR                               | 🔀       | Built  | [sql/07](theory/sql/07-from-text-sql-to-a-tree.md) — hand-written is more legible for an interview, at the cost of Lemon's ambiguity checking |
 | `sqlite_schema`           | real 5-column layout at page 1, raw `CREATE` text stored | same                                               | 🟰       | Built  | [catalog/08](theory/catalog/08-the-catalog-and-binding.md)                                                                                    |
 | Schema re-parse on open   | yes, from stored SQL text                                | same                                               | 🟰       | Built  | catalog/08                                                                                                                                    |
 | `NULL` three-valued logic | full SQL semantics                                       | same                                               | 🟰       | Built  | [exec/09](theory/exec/09-iterator-execution.md)                                                                                               |
@@ -179,7 +179,7 @@ just without the safety valve.
 | Hash join / sort-merge join                        | not implemented                                                                      | **not implemented either**                                          | 🟰       | Planned                                  | neither engine has one — [exec/17 §17.3](theory/exec/17-joins.md)                                                         |
 | `ORDER BY` execution                               | **in-memory, documented row limit**                                                  | external merge sort (PMAs, spills to disk)                          | 🔀       | Planned                                  | see below                                                                                                                 |
 | `GROUP BY` execution                               | **hash-based** (Python `dict`)                                                       | **sort-based only** — no hash aggregation                           | 🔀       | Planned                                  | see below                                                                                                                 |
-| Deviation: bare columns in aggregate queries       | **rejected**                                                                         | allowed (documented extension, arbitrary row returned)              | 🔀       | Planned                                  | stricter than the reference; documented, not accidental — [week-7 spec §40](implementation/week-7-query-processing.md)    |
+| Deviation: bare columns in aggregate queries       | **rejected**                                                                         | allowed (documented extension, arbitrary row returned)              | 🔀       | Planned                                  | stricter than the reference; documented, not accidental — [week-7 spec §40](implementation/week7-query-processing.md)    |
 
 
 ### `quill_stat1`, not `sqlite_stat1` — same bytes inside, deliberately different name
@@ -289,7 +289,7 @@ the same isolation level with **table-level strict two-phase locking** instead �
 single process with shared memory can afford a real lock manager where SQLite, coordinating across OS
 processes through the filesystem, cannot. The phantom-read anomaly, which normally needs gap locks or
 MVCC to eliminate, falls out for free at table granularity: a shared lock on the *whole table* blocks any
-insert into the range you read. [txn/15 §15.6](theory/txn/15-isolation-and-anomalies.md), [txn/16 §16.1](theory/txn/16-locking-and-deadlock.md).
+insert into the range you read. [txn/15 §15.6](theory/txn/15-isolation-anomalies.md), [txn/16 §16.1](theory/txn/16-locking-and-deadlock.md).
 
 
 ### Detection vs. avoidance — a genuine algorithmic choice, argued in both directions
@@ -333,5 +333,5 @@ This page is an index. Every "why" above is argued in full — with the empirica
 counterexample, and the "say this out loud" version — in its linked chapter under `docs/theory/`, and the
 signatures/tests to build against are in the matching `docs/implementation/week-N-*.md`. The ADRs in
 `docs/decisions/` are the fullest record for decisions that have one written; not every row above has an
-ADR yet (see [`week-8-presentation.md` §48](implementation/week-8-presentation.md) for the planned list) —
+ADR yet (see [`week8-presentation.md` §48](implementation/week8-presentation.md) for the planned list) —
 until it does, the chapter is the source of truth.

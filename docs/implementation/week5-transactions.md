@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 5, Transactions and Crash Recovery
 
 
-← [Index](README.md)  ·  Prev: [Week 4 — Mutation and Indexes](week-4-mutation-and-indexes.md)  ·  Next: [Week 6 — Concurrency](week-6-concurrency.md)
+← [Index](README.md)  ·  Prev: [Week 4 — Mutation and Indexes](week4-mutation-and-indexes.md)  ·  Next: [Week 6 — Concurrency](week6-concurrency.md)
 
 
 ---

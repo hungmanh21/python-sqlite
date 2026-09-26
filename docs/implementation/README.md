@@ -26,14 +26,14 @@ One per week. Each is self-contained: stubs, tests, and a definition of done.
 
 | Week | Spec | Builds | Theory to read first |
 |---|---|---|---|
-| 1 | [Storage and codec](week-1-storage.md) | `errors`, `constants`, `codec/`, `storage/` | [01, 02](../theory/storage/), [03](../theory/codec/), [04](../theory/storage/04-the-buffer-pool.md) |
-| 2 | [The B+Tree](week-2-btree.md) | `btree/cells`, `btree/btree`, `btree/validate` | [05, 06](../theory/btree/) |
-| 3 | [SQL frontend and executor](week-3-sql.md) ⭐ | `sql/`, `catalog/`, `exec/`, `api/` | [07](../theory/sql/), [08](../theory/catalog/), [09](../theory/exec/) |
-| 4 | [Mutation and indexes](week-4-mutation-and-indexes.md) | `btree/index`, `plan/`, delete/update operators | [10, 11](../theory/btree/), [12](../theory/plan/) |
-| 5 | [Transactions and recovery](week-5-transactions.md) ⭐⭐ | `txn/journal`, `txn/transaction`, `txn/recovery` | [13, 14](../theory/txn/) |
-| 6 | [Concurrency](week-6-concurrency.md) ⭐ | `txn/locks`, thread-safe pool, `Database`/`Connection` | [15, 16](../theory/txn/) |
-| 7 | [Query processing](week-7-query-processing.md) | `exec/join`, `exec/aggregate`, `exec/sort` | [17, 18](../theory/exec/) |
-| 8 | [Presentation](week-8-presentation.md) | README, benchmarks, CI, docs | [19](../theory/benchmarks/) |
+| 1 | [Storage and codec](week1-storage.md) | `errors`, `constants`, `codec/`, `storage/` | [01, 02](../theory/storage/), [03](../theory/codec/), [04](../theory/storage/04-buffer-pool.md) |
+| 2 | [The B+Tree](week2-btree.md) | `btree/cells`, `btree/btree`, `btree/validate` | [05, 06](../theory/btree/) |
+| 3 | [SQL frontend and executor](week3-sql.md) ⭐ | `sql/`, `catalog/`, `exec/`, `api/` | [07](../theory/sql/), [08](../theory/catalog/), [09](../theory/exec/) |
+| 4 | [Mutation and indexes](week4-mutation-and-indexes.md) | `btree/index`, `plan/`, delete/update operators | [10, 11](../theory/btree/), [12](../theory/plan/) |
+| 5 | [Transactions and recovery](week5-transactions.md) ⭐⭐ | `txn/journal`, `txn/transaction`, `txn/recovery` | [13, 14](../theory/txn/) |
+| 6 | [Concurrency](week6-concurrency.md) ⭐ | `txn/locks`, thread-safe pool, `Database`/`Connection` | [15, 16](../theory/txn/) |
+| 7 | [Query processing](week7-query-processing.md) | `exec/join`, `exec/aggregate`, `exec/sort` | [17, 18](../theory/exec/) |
+| 8 | [Presentation](week8-presentation.md) | README, benchmarks, CI, docs | [19](../theory/benchmarks/) |
 
 
 ⭐ marks the weeks that carry the most interview signal. If the schedule slips, these are the last

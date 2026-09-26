@@ -539,7 +539,7 @@ handwritten parser and explicit intermediate trees.
 ## 7.8 What you're building
 
 
-`docs/implementation/week-3-*.md` sessions 1–3:
+`docs/implementation/week3-*.md` sessions 1–3:
 
 
 | File           | Responsibility                  | Boundary it protects                       |

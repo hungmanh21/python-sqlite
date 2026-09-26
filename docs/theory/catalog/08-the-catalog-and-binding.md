@@ -3,7 +3,7 @@
 
 > **Read in week 3 before building `catalog/` and `sql/binder.py`.**
 >
-> **Time:** ~40 minutes. **Prerequisite:** [chapter 07](../sql/07-from-sql-text-to-a-tree.md) for the AST, and [chapter 06](../btree/06-b-tree-mechanics.md) §6.4 for the stable-root invariant.
+> **Time:** ~40 minutes. **Prerequisite:** [chapter 07](../sql/07-from-text-sql-to-a-tree.md) for the AST, and [chapter 06](../btree/06-b-tree-mechanics.md) §6.4 for the stable-root invariant.
 
 
 ---
