@@ -138,6 +138,10 @@ class Pager:
         return self._header.page_count
 
     @property
+    def schema_cookie(self) -> int:
+        return self._header.schema_cookie
+
+    @property
     def path(self) -> Path | None:
         """None for an in-memory database -- Journal takes this straight
         through to its own constructor, which already treats None as

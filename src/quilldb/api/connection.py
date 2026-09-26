@@ -36,17 +36,16 @@ case that leaves an operator open past the call that created it.
 """
 
 
+import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
-from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
-from quilldb.errors import TransactionError, UnsupportedFeatureError
+from quilldb.errors import ThreadingError, TransactionError, UnsupportedFeatureError
 from quilldb.exec.operators import ExplainResult, Operator, build_operator
-from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.sql.binder import (
     BoundAnalyze,
     BoundBegin,
@@ -67,13 +66,11 @@ from quilldb.sql.binder import (
     bind,
 )
 from quilldb.sql.parser import parse
-from quilldb.storage.bufferpool import BufferPool
-from quilldb.storage.pager import Pager
 from quilldb.txn.journal import Journal
-from quilldb.txn.recovery import recover_if_needed
 from quilldb.txn.transaction import Transaction
 
-_MEMORY_PATH = ":memory:"
+if TYPE_CHECKING:
+    from quilldb.api.database import Database
 
 
 
@@ -201,19 +198,48 @@ def _display_name(expression: BoundExpression) -> str:
 
 
 class Connection:
-    """Owns one Pager/BufferPool/Catalog for as long as the database is
-    open. `execute()` is the only entry point that touches them.
+    """ONE per thread. NOT thread-safe -- never share one across threads.
+    `_check_thread()` is what turns that mistake into an immediate
+    `ThreadingError` instead of interleaved cursor state and half-applied
+    transactions that look like a B-tree bug (week6-concurrency.md SS36).
+
+    Owns: the current transaction, open cursors, autocommit state, and the
+    id of the thread that created it. Pager/pool/catalog/lock-manager belong
+    to the shared `Database` and are only referenced here.
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog, stats: StatisticsCatalog) -> None:
-        self.pager = pager
-        self.pool = pool
-        self.catalog = catalog
-        self.stats = stats
+    def __init__(self, db: "Database") -> None:
+        self.db = db
+        self.pager = db.pager
+        self.pool = db.pool
+        self.catalog = db.catalog
+        self.stats = db.stats
+        self._owner_thread = threading.get_ident()
+        self._last_seen_cookie = db.pager.schema_cookie
         self._open_cursor: Cursor | None = None
         self._closed = False
         self._txn: Transaction | None = None  # set only by an EXPLICIT BEGIN -- see _begin()
+
+
+    def _check_thread(self) -> None:
+        """Raise ThreadingError if called from a thread other than the one
+        that created this Connection.
+
+        TODO(human): call this at the top of every public method below
+        (execute, close, transaction, and the pages_read/pages_cached/
+        rows_examined/reset_counters measurement surface). Deciding whether
+        that's N explicit calls or one decorator over the class IS the
+        session-3 exercise -- see week6-concurrency.md SS36's note on why
+        this is "the highest-value ten lines in the week."
+        """
+        if threading.get_ident() != self._owner_thread:
+            raise ThreadingError(
+                f"Connection created in thread {self._owner_thread} used from "
+                f"{threading.get_ident()}. Create one Connection per thread."
+            )
+
+
 
 
     # ---- measurement surface (chapter 19 SS19.2) -------------------------
@@ -227,6 +253,7 @@ class Connection:
     @property
     def pages_read(self) -> int:
         """Buffer-pool misses since the last reset_counters()."""
+        self._check_thread()
         return self.pool.misses
 
 
@@ -235,6 +262,7 @@ class Connection:
         """Buffer-pool hits since the last reset_counters(). These cost no
         I/O and are deliberately NOT part of pages_read.
         """
+        self._check_thread()
         return self.pool.hits
 
 
@@ -244,6 +272,7 @@ class Connection:
         reset_counters() -- rows LOOKED AT, which for a SeqScan is the
         whole table however few rows come back.
         """
+        self._check_thread()
         return self.pool.rows_examined
 
 
@@ -251,6 +280,7 @@ class Connection:
         """Zero the measurement counters, immediately before the statement
         being measured.
         """
+        self._check_thread()
         self.pool.reset_counters()
 
 
@@ -303,6 +333,17 @@ class Connection:
         """Roll back the open explicit transaction. The BoundRollback
         dispatch in execute() calls this directly. Same unwiring reasoning
         as _commit().
+
+        self._txn.rollback() restores page 1 on disk and reloads the
+        pager's in-memory header (its own docstring's steps 5-6), but a
+        CREATE TABLE/CREATE INDEX earlier in this transaction already
+        mutated the shared Catalog's in-memory _tables/_indexes directly,
+        outside any journal -- that mutation is a third stale cache
+        rollback() has no way to know about. Reload it here rather than
+        leaving it to execute()'s lazy schema_cookie check on whatever
+        statement happens to run next: anything that reads self.catalog
+        (or db.catalog, shared by every other connection) before then would
+        see a table that no longer exists on disk.
         """
         if self._txn is None:
             raise TransactionError("no transaction is open")
@@ -310,6 +351,8 @@ class Connection:
         self.pager._txn = None
         self.pool._txn = None
         self._txn = None
+        self.catalog.load()
+        self._last_seen_cookie = self.db.pager.schema_cookie
 
 
     def _run_mutation(self, body: Callable[[], object]) -> None:
@@ -352,6 +395,7 @@ class Connection:
         via _run_mutation's first branch -- this method owns the
         begin/commit/rollback calls directly instead.
         """
+        self._check_thread()
         self._begin()
         try:
             yield
@@ -372,12 +416,21 @@ class Connection:
         execute() closes any still-open result cursor on this connection;
         multiple active cursors arrive with multiple connections.
         """
+        self._check_thread()
         if self._closed:
             raise ValueError("connection is closed")
         if self._open_cursor is not None:
             self._open_cursor.close()
             self._open_cursor = None
 
+        # TODO(human): if self.db.pager.schema_cookie has moved past
+        # self._last_seen_cookie, another Connection's DDL changed the
+        # shared Catalog underneath this one -- reload it
+        # (self.db.catalog.load()) before binding, and update
+        # self._last_seen_cookie. See week6-concurrency.md SS37.4.
+        if self.db.pager.schema_cookie != self._last_seen_cookie:
+            self.catalog.load()
+            self._last_seen_cookie = self.db.pager.schema_cookie
 
         bound = bind(parse(sql), self.catalog, tuple(parameters))
 
@@ -473,6 +526,7 @@ class Connection:
         (Pager.write_page's assertion) and, if the barrier weren't there,
         silently persist uncommitted data.
         """
+        self._check_thread()
         if self._closed:
             return
         if self._txn is not None:
@@ -496,26 +550,15 @@ class Connection:
 
 
 def connect(path: str | Path) -> Connection:
-    """Open an existing database or create a new one.
+    """Open an existing database or create a new one, returning a single
+    Connection bound to the calling thread.
 
-
-    The exact string ":memory:" selects Pager.memory() and never creates a
-    file -- anything else, including a Path spelled ":memory:", is a real
-    path on disk.
+    A thin wrapper over Database (api/database.py), which is where the
+    pager/pool/catalog/lock-manager actually live as of week 6 session 3 --
+    this keeps every earlier week's single-Connection call sites unchanged.
+    A second thread wanting its own Connection on the same file should call
+    `.db.connect()` on one already open, not this function again.
     """
-    if path == _MEMORY_PATH:
-        pager = Pager.memory()
-    else:
-        path = Path(path)
-        pager = Pager.open(path) if path.exists() else Pager.create(path)
+    from quilldb.api.database import open_database
 
-
-    # Recovery completes before the pool exists -- there is no cache to
-    # invalidate because there is no cache yet (week5-transactions.md
-    # SS"Where it goes in connect()").
-    recover_if_needed(pager.path, pager)
-    pool = BufferPool(pager)
-    catalog = Catalog(pager, pool)
-    catalog.load()
-    stats = StatisticsCatalog(pager, pool, catalog)
-    return Connection(pager, pool, catalog, stats)
+    return open_database(path).connect()
