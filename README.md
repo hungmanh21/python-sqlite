@@ -50,6 +50,33 @@ And the half that's easy to leave out — every index is a tax on every write:
 $ python benchmarks/index_lookup.py
 ```
 
+## Concurrency
+
+Table-level strict two-phase locking, one writer at a time, deadlocks detected (not prevented) via
+a wait-for graph — see [`docs/concurrency.md`](docs/concurrency.md) for the isolation level and
+what it permits. Read and write throughput are reported separately because they hit different
+ceilings:
+
+| Threads | Read txn/sec | Write txn/sec |
+|---:|---:|---:|
+| 1 | 4,983 | 45.5 |
+| 2 | 4,455 | 49.6 |
+| 4 | 3,928 | 46.8 |
+| 8 | 3,321 | 48.3 |
+
+**Neither column climbs, for two different reasons.** Writes are flat *structurally*: every write
+transaction takes a global `EXCLUSIVE` lock before touching any table, so exactly one commit is
+ever in flight, and each commit pays for ~4 real `fsync()` calls — more threads submitting writes
+can't raise that ceiling. Reads never queue behind each other (`SHARED` locks coexist), but the
+read column doesn't climb either, because quilldb is pure Python: CPython's GIL runs one thread's
+bytecode at a time, and a read here is pure CPU work with nothing to release the GIL for, so
+threads add scheduling overhead instead of parallelism. The lock manager isn't the read ceiling —
+the interpreter is.
+
+```console
+$ python benchmarks/concurrent.py
+```
+
 ## What works
 
 ```sql

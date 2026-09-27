@@ -87,10 +87,26 @@ detect (chapter 16 §16.5). quilldb's finer granularity makes deadlock *possible
 transactions, crossed order) and that possibility is exactly what buys the extra concurrency, so
 quilldb needs the wait-for graph that SQLite doesn't.
 
-## Open items (filled in as the sessions land)
+## Confirmed (sessions 1–7)
 
-- [ ] FIFO waiter ordering confirmed to prevent writer starvation under sustained read load
-  (chapter 16 §16.5) — `test_waiters_are_fifo_so_nobody_starves`
-- [ ] Deadlock victim policy is "youngest transaction in the cycle" (highest id), confirmed to
-  guarantee the other side of a crossed pair commits
-- [ ] `busy_timeout` documented as a connection attribute, not an `execute()` keyword
+- [x] FIFO waiter ordering prevents writer starvation under sustained read load (chapter 16
+  §16.5): a flood of readers queues behind an already-waiting writer rather than jumping it —
+  `test_waiters_are_fifo_so_nobody_starves`
+- [x] Deadlock victim policy is "youngest transaction in the cycle" (highest id); the other side
+  of a crossed pair is guaranteed to commit — `test_deadlock_is_detected_and_one_side_commits`,
+  `test_deadlock_error_names_the_cycle`
+- [x] `busy_timeout` is a connection attribute (`Connection.busy_timeout`, default 5.0s), not an
+  `execute()` keyword — `api/connection.py`
+- [x] A transaction upgrading its own SHARED hold to EXCLUSIVE, blocked only by an unrelated
+  third-party reader, is not mistaken for a self-deadlock — the wait-for graph walk must exclude
+  a resource's own holder from recursing into itself —
+  `test_upgrade_blocked_by_another_reader_is_not_a_deadlock`
+- [x] Real contention holds the invariant: 8 threads × 10k transfers, sum of balances unchanged,
+  no negative balances, b-trees structurally valid, `sqlite3 PRAGMA integrity_check` reports `ok`
+  — `test_sum_of_balances_never_changes`
+- [x] 20 consecutive runs of the transfer stress test, no flakes — session 7's flake hunt,
+  131s–171s per run, all green
+- [x] `benchmarks/concurrent.py` reports read and write throughput separately: writes are flat
+  because the single-writer lock allows exactly one commit in flight regardless of thread count;
+  reads don't queue (SHARED coexists) but don't scale either, because CPython's GIL — not the
+  lock manager — is the ceiling for CPU-bound work with nothing to release it
