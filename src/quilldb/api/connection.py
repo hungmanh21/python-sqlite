@@ -58,6 +58,7 @@ from quilldb.sql.binder import (
     BoundExpression,
     BoundInsert,
     BoundIsNull,
+    BoundJoinSelect,
     BoundLiteral,
     BoundSelect,
     BoundUnaryOp,
@@ -607,7 +608,7 @@ class Connection:
 
 
         # BEGIN/COMMIT/ROLLBACK returned before binding; SELECT is all that's left.
-        assert isinstance(bound, BoundSelect)
+        assert isinstance(bound, (BoundSelect, BoundJoinSelect))
         operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats, stmt_txn)
         try:
             operator.open()

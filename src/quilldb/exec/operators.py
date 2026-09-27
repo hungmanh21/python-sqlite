@@ -43,17 +43,35 @@ from quilldb.exec.expressions import Row, evaluate, where_passes
 from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.plan.cost import assign_cost
 from quilldb.plan.planner import AccessPath, enumerate_access_paths
-from quilldb.plan.predicates import Predicate, classify_predicate, extract_conjuncts
-from quilldb.plan.search import choose_access_path
-from quilldb.plan.statistics import default_index_stats, default_table_stats, estimate_row_counts
+from quilldb.plan.predicates import (
+    Predicate,
+    classify_predicate,
+    extract_conjuncts,
+    referenced_tables,
+)
+from quilldb.plan.search import (
+    PlanCandidate,
+    choose_access_path,
+    choose_join_plan,
+    enumerate_join_plans,
+)
+from quilldb.plan.statistics import (
+    IndexStats,
+    TableStats,
+    default_index_stats,
+    default_table_stats,
+    estimate_row_counts,
+)
 from quilldb.sql.binder import (
     BoundAssignment,
     BoundBinaryOp,
     BoundDelete,
     BoundExpression,
     BoundInsert,
+    BoundJoinSelect,
     BoundSelect,
     BoundUpdate,
+    resolve_layout,
 )
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
@@ -1048,8 +1066,122 @@ def _residual_filter_expression(
 
 
 
+class _DefaultStats:
+    """The `stats=None` fallback for join planning, matching the single-
+    table path's own convention (see build_operator's `stats` docstring
+    below): every candidate costs against the flat documented default
+    rather than real ANALYZE numbers. Satisfies plan/search.py's StatsSource
+    Protocol structurally -- no inheritance from StatisticsCatalog needed,
+    the same reasoning as sql/binder.py's SchemaSource.
+    """
+
+    def table_stats(self, name: str) -> TableStats:
+        return default_table_stats()
+
+    def index_stats(self, index: IndexSchema) -> IndexStats:
+        return default_index_stats(index, default_table_stats())
+
+
+def _and_all(expressions: list[BoundExpression]) -> BoundExpression | None:
+    if not expressions:
+        return None
+    result = expressions[0]
+    for expression in expressions[1:]:
+        result = BoundBinaryOp(result, "AND", expression)
+    return result
+
+
+def _build_join_operator(
+    statement: BoundJoinSelect,
+    pager: Pager,
+    pool: BufferPool,
+    catalog: Catalog,
+    stats: StatisticsCatalog | None,
+    txn: Transaction | None,
+) -> Operator:
+    """The join equivalent of build_operator()'s single-table plan: pick a
+    PlanCandidate (plan/search.py's enumerate_join_plans/choose_join_plan),
+    then build the same SeqScan/IndexScan/Filter shape per table, glued
+    together with exec/join.py's NestedLoopJoin in the candidate's chosen
+    order.
+
+
+        Project
+        └─ Filter                    # only if `candidate.residual` is non-empty
+           └─ NestedLoopJoin          # one per join step, left-deep
+              ├─ ... (outer side, recursively the same shape)
+              └─ Filter               # only if this table has its OWN residual
+                 └─ SeqScan | IndexScan
+
+
+    Every BoundColumn the binder produced is still (table_ordinal, index) --
+    sql/binder.py's resolve_layout is what turns that into the flat index
+    each operator actually reads, using `offsets`, built up here exactly as
+    NestedLoopJoin will concatenate rows: table_ordinal -> its starting
+    position once every table up to and including it is in hand.
+    """
+    # Deferred: exec/join.py imports Operator from this module at its own
+    # import time, so a module-level import here would cycle.
+    from quilldb.exec.join import NestedLoopJoin
+
+    stats_source = stats if stats is not None else _DefaultStats()
+    candidates = enumerate_join_plans(
+        list(statement.scopes), list(statement.joins), statement.where, catalog, stats_source
+    )
+    candidate: PlanCandidate = choose_join_plan(candidates)
+
+    source: Operator | None = None
+    offsets: dict[int, int] = {}
+    offset = 0
+
+    for position, table_ordinal in enumerate(candidate.order):
+        scope = statement.scopes[table_ordinal]
+        path = candidate.access_paths[position]
+
+        scan: Operator
+        if path.kind == "index_scan":
+            scan = IndexScan(pager, pool, scope.table, path, txn)
+        else:
+            scan = SeqScan(pager, pool, scope.table, txn)
+
+        # Only a residual predicate sourced ENTIRELY from this table can be
+        # checked right after its own scan -- one that also names an
+        # earlier table can't be evaluated until that table's columns are
+        # in hand too, which is exactly what the `else` branch below does
+        # once this step's NestedLoopJoin has produced a combined row.
+        own_residual = [
+            predicate.source
+            for predicate in path.residual
+            if referenced_tables(predicate.source) == {table_ordinal}
+        ]
+        own_filter = _and_all(own_residual)
+        if own_filter is not None:
+            scan = Filter(scan, resolve_layout(own_filter, {table_ordinal: 0}))
+
+        if source is None:
+            source = scan
+        else:
+            match = candidate.match_expressions[position]
+            match_offsets = dict(offsets)
+            match_offsets[table_ordinal] = offset
+            resolved_match = None if match is None else resolve_layout(match, match_offsets)
+            source = NestedLoopJoin(
+                source, scan, resolved_match, len(scope.table.columns), candidate.join_types[position]
+            )
+
+        offsets[table_ordinal] = offset
+        offset += len(scope.table.columns)
+
+    assert source is not None, "a join always has at least two tables, so at least one iteration ran"
+    if candidate.residual is not None:
+        source = Filter(source, resolve_layout(candidate.residual, offsets))
+
+    expressions = tuple(resolve_layout(expression, offsets) for expression in statement.expressions)
+    return Project(source, expressions)
+
+
 def build_operator(
-    statement: BoundSelect | BoundInsert | BoundDelete | BoundUpdate,
+    statement: BoundSelect | BoundJoinSelect | BoundInsert | BoundDelete | BoundUpdate,
     pager: Pager,
     pool: BufferPool,
     catalog: Catalog,
@@ -1100,6 +1232,10 @@ def build_operator(
     -- for INSERT, DELETE, and UPDATE alike, and now also which indexes are
     available to seek for SELECT.
     """
+    if isinstance(statement, BoundJoinSelect):
+        return _build_join_operator(statement, pager, pool, catalog, stats, txn)
+
+
     if isinstance(statement, BoundInsert):
         indexes = catalog.indexes_for(statement.table.name)
         return Insert(pager, pool, statement, indexes, txn)
