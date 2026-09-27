@@ -165,6 +165,50 @@ def encode_stat1_row(stats: IndexStats) -> str:
     return " ".join(str(n) for n in (stats.row_count, *stats.rows_per_prefix))
 
 
+def index_ndv(index_stats: IndexStats) -> int:
+    """The leading column's distinct-value count, derived rather than
+    stored: `quill_stat1` gives rows-per-value directly, not value counts,
+    so `NDV = row_count / rows_per_prefix[0]` (week7-query-processing.md
+    §43's "Join ordering"). Clamped to at least 1 for the same reason every
+    other stage-2/3 count is -- a column can't have fewer than one distinct
+    value among its rows.
+
+    Called only when the join column actually LEADS some index on that
+    table -- callers decide "known vs. unknown" by whether such an index
+    exists, real ANALYZE stats or the documented default alike (see
+    estimate_equijoin_rows's docstring for why a defaulted index still
+    counts as "known").
+    """
+    return max(1, index_stats.row_count // index_stats.rows_per_prefix[0])
+
+
+def estimate_equijoin_rows(
+    left_rows: int, right_rows: int, left_ndv: int | None, right_ndv: int | None
+) -> int:
+    """Estimate the row count of `R JOIN S ON R.a = S.b`, from each side's
+    OWN row count (not yet joined to anything) and each side's NDV for the
+    join column (index_ndv() above), or None when that column doesn't lead
+    any index on its table (week7-query-processing.md §43).
+
+
+    Both known -- Selinger's 1979 selectivity for `column1 = column2`,
+    `1/MAX(ICARD1, ICARD2)` (cited, not invented):
+
+
+        join_rows ~= |R| x |S| / max(NDV(R.a), NDV(S.b))
+
+
+    TODO(human): define the fallback for the other two cases -- exactly one
+    side's NDV known, and neither known. Add the constant(s) this needs
+    (alongside _DEFAULT_ROWS_PER_VALUE above), and pick a rule for each:
+    what should a join's estimated cardinality be when the optimizer has
+    only one distinct-value count to go on, or none at all?
+    """
+    if left_ndv is not None and right_ndv is not None:
+        return max(1, (left_rows * right_rows) // max(left_ndv, right_ndv))
+    raise NotImplementedError  # TODO(human)
+
+
 def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats: TableStats) -> AccessPath:
     """Fill in `rows_fetched` and `est_rows` (chapter 12 §12.6 stage 2).
 

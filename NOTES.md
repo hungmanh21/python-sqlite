@@ -455,3 +455,40 @@ distinction is week7-query-processing.md §40's `resolve_layout`, session 1's jo
   whenever `path.seek_terms` is empty, index or not. *Lesson: a helper's "N-1" indexing math is
   only as safe as its caller's promise that N is never 0 — and a new caller is exactly how that
   promise gets broken without either side's code changing.*
+
+### B7-2 ★ A LEFT JOIN's own ON condition leaked into the final WHERE filter
+- **Symptom:** `SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id` over a
+  user with no orders returned nothing for that user, instead of `(name, NULL)` — caught by a smoke
+  test before any pytest test existed for it.
+- **Assumed:** `enumerate_join_plans` (`plan/search.py`) pools every WHERE- and ON-conjunct into one
+  list and tracks which ones get consumed by some join step's access path or match expression;
+  whatever's left over becomes the final top-level residual `Filter`, applied after the whole join
+  — which is correct for a WHERE conjunct, but a LEFT JOIN's own `ON` conjunct was never being
+  marked "consumed" by that bookkeeping in the non-reorderable (has-a-LEFT-JOIN) branch, because
+  that branch deliberately uses `joins[position-1].on` directly rather than routing ON through the
+  same cost-based classification WHERE conjuncts go through.
+- **Actually:** an unconsumed conjunct falls straight into the final residual `Filter` — so
+  `u.id = o.user_id` got re-evaluated a SECOND time, after `NestedLoopJoin` had already NULL-extended
+  the unmatched row. `id = NULL` is `NULL`, not `TRUE`, and `where_passes` rejects `NULL` — exactly
+  chapter 17 §17.8's trap, self-inflicted by the planner rather than by a user's WHERE clause.
+- **Fix:** every conjunct sourced from a join's own `ON` is pre-marked "consumed" before the
+  per-step loop runs, in the has-a-LEFT-JOIN branch only (an all-INNER chain still lets ON conjuncts
+  compete for cost-based placement same as WHERE, which is safe with no LEFT edge in the chain).
+  *Lesson: "whatever's left over must be a real residual" is only true if every consumer marks its
+  conjuncts used, including the one consumer (`joins[k].on`, used verbatim) that doesn't go through
+  the shared classification path.*
+
+### B7-3 An ANALYZE'd empty indexed table divided by its own zero row count
+- **Symptom:** `ZeroDivisionError` from `assign_cost` (`plan/cost.py`) on `SELECT * FROM t WHERE
+  id = 5` against a real, `ANALYZE`'d, genuinely empty table with an index on `id` — no join
+  involved; found while testing a LEFT JOIN over an empty inner table, which hits the identical
+  single-table code path once the inner side is planned.
+- **Assumed:** `stats.row_count` (an index's real, ANALYZE'd row count) is always positive by the
+  time `leaf_pages_touched = ceil(stats.leaf_pages * path.rows_fetched / stats.row_count)` runs,
+  because every existing test built its fixture tables with at least one row before ANALYZE.
+- **Actually:** a table can be ANALYZE'd with zero rows (nothing stops it), giving `row_count == 0`
+  and dividing by it. A "fraction of zero leaf pages" was never a case the formula's author had
+  reason to consider before a query planned an index scan over a table that turned out empty.
+- **Fix:** `row_count == 0` short-circuits to `leaf_pages_touched = 1` — the same floor the general
+  formula already clamps to, not a different cost shape. *Lesson: a `stats.field` that's usually a
+  divisor is a divide-by-zero waiting for the one fixture nobody happened to write yet.*

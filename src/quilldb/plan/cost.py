@@ -117,7 +117,15 @@ def assign_cost(path: AccessPath, stats: IndexStats | None, table_stats: TableSt
         startup = 0.0
     else:
         assert stats is not None, "index_scan requires stats -- only seq_scan costs off table_stats alone"
-        leaf_pages_touched = max(1, math.ceil(stats.leaf_pages * path.rows_fetched / stats.row_count))
+        # A real ANALYZE of a genuinely empty table/index gives row_count=0,
+        # which the ratio below can't divide by -- and there is nothing to
+        # touch a fraction OF, so 1 (the same floor every other zero-row
+        # case in this formula already clamps to) is the right answer, not
+        # a special case that changes the shape of the cost.
+        if stats.row_count == 0:
+            leaf_pages_touched = 1
+        else:
+            leaf_pages_touched = max(1, math.ceil(stats.leaf_pages * path.rows_fetched / stats.row_count))
         cost = (
             SEQ_PAGE_COST * (leaf_pages_touched - 1)
             + path.rows_fetched * (RANDOM_PAGE_COST * table_stats.height)
