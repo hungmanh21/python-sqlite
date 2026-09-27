@@ -27,8 +27,16 @@ it, checkable against `txn/locks.py` and `txn/transaction.py`.
   oversight: see "Why a single writer" below.
 - **Deadlocks are detected, not prevented.** A wait-for graph is checked whenever a transaction blocks;
   a cycle aborts the youngest transaction in it with `DeadlockError`, and the survivor is guaranteed to
-  commit. A `busy_timeout` is a backstop for waits the graph doesn't model, not a substitute for
-  detection (chapter 16 §16.4).
+  commit. That holds whichever member of the cycle closes it: if the transaction that completes the
+  cycle isn't the youngest, it marks the victim and wakes it (NOTES.md B6-5), rather than leaving the
+  victim asleep until its own timeout. A `busy_timeout` is a backstop for waits the graph doesn't model,
+  not a substitute for detection (chapter 16 §16.4).
+- **A deadlock victim inside `BEGIN` must `ROLLBACK`.** Only the failing statement is abandoned; the
+  transaction keeps its locks until the caller rolls it back, and the survivor waits until then. In
+  autocommit mode the statement's own transaction is rolled back automatically.
+- **Schema changes are serializable too.** Every statement takes `"__schema__"` before it binds —
+  `SHARED` normally, `EXCLUSIVE` for `CREATE TABLE`/`CREATE INDEX` — so no connection can bind against,
+  plan against, or reload the catalog from an uncommitted DDL (NOTES.md B6-7).
 
 ## What it permits
 
@@ -45,6 +53,27 @@ it, checkable against `txn/locks.py` and `txn/transaction.py`.
   way this document's guarantees would otherwise be void.
 - **Multi-process access is undefined.** There is no `fcntl`, no advisory file locking. A second
   process opening the same file is a documented limitation, not a supported degraded mode.
+
+## Lock order
+
+Every transaction acquires locks in one fixed order, and that order is what keeps the wait-for graph
+small enough for the youngest-victim rule to be sound:
+
+```
+"__schema__"  →  "__writer__"  →  tables
+```
+
+- **`"__schema__"`**: `SHARED` for every statement except `BEGIN`/`COMMIT`/`ROLLBACK`, taken before
+  binding; `EXCLUSIVE` for DDL. An explicit transaction holds it to `COMMIT` (strict 2PL), an autocommit
+  `SELECT` until its cursor is drained or closed, so DDL waits for open result sets — the same rule
+  SQLite enforces with `SQLITE_LOCKED` on a schema change under an active statement.
+- **DDL takes `"__schema__"` `EXCLUSIVE` *before* `"__writer__"`.** The other order would deadlock every
+  DDL against every concurrent writer: the DDL holding `"__writer__"` waits for readers' `SHARED`
+  `"__schema__"`, while any of those readers that wants to write waits for `"__writer__"`.
+- **`BEGIN IMMEDIATE`** takes `"__schema__"` `SHARED` and then `"__writer__"`, for the same reason.
+- **A transaction's rollback point is taken when it first acquires `"__writer__"`, not at `BEGIN`.**
+  Holding `"__writer__"` is what stops `page_count` moving; a snapshot taken any earlier misses pages
+  other writers committed in between, and rolling back can't undo writes to them (NOTES.md B6-2).
 
 ## Why table granularity
 
@@ -104,6 +133,13 @@ quilldb needs the wait-for graph that SQLite doesn't.
 - [x] Real contention holds the invariant: 8 threads × 10k transfers, sum of balances unchanged,
   no negative balances, b-trees structurally valid, `sqlite3 PRAGMA integrity_check` reports `ok`
   — `test_sum_of_balances_never_changes`
+- [x] Week 6 review regressions, each failing before its fix — `test_week6_regressions.py`:
+  rollback undoes writes to pages committed after a deferred `BEGIN` (B6-2); a rollback with an open
+  cursor releases every lock (B6-3); closing one `Connection` leaves its siblings usable and the last
+  close closes the file (B6-4); a cycle closed by the *older* transaction still aborts the youngest,
+  promptly (B6-5); a queue head that times out wakes the waiters behind it (B6-6); uncommitted DDL is
+  invisible to other connections (B6-7); `ANALYZE` waits for the current writer (B6-8); `immediate` is
+  not a reserved word (B6-9)
 - [x] 20 consecutive runs of the transfer stress test, no flakes — session 7's flake hunt,
   131s–171s per run, all green
 - [x] `benchmarks/concurrent.py` reports read and write throughput separately: writes are flat
