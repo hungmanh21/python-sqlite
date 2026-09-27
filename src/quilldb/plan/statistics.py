@@ -182,6 +182,21 @@ def index_ndv(index_stats: IndexStats) -> int:
     return max(1, index_stats.row_count // index_stats.rows_per_prefix[0])
 
 
+def _assumed_ndv(rows: int, ndv: int | None) -> int:
+    """An unknown side's NDV, assumed rather than measured: the same
+    "1 distinct value per _DEFAULT_ROWS_PER_VALUE rows" story
+    default_index_stats() already tells for a single unanalyzed index,
+    reused here so a missing NDV degrades the join formula gracefully
+    instead of switching to an unrelated one. Deriving it FROM `rows`
+    (rather than reusing _DEFAULT_ROWS_PER_VALUE as the join divisor
+    directly) matters: a flat constant divisor would make the estimate
+    grow quadratically with table size (`rows^2 / 10`), while an assumed
+    NDV that scales with `rows` keeps it closer to linear, the same shape
+    the both-known case already has.
+    """
+    return ndv if ndv is not None else max(1, rows // _DEFAULT_ROWS_PER_VALUE)
+
+
 def estimate_equijoin_rows(
     left_rows: int, right_rows: int, left_ndv: int | None, right_ndv: int | None
 ) -> int:
@@ -191,22 +206,21 @@ def estimate_equijoin_rows(
     any index on its table (week7-query-processing.md §43).
 
 
-    Both known -- Selinger's 1979 selectivity for `column1 = column2`,
+    Selinger's 1979 selectivity for `column1 = column2`,
     `1/MAX(ICARD1, ICARD2)` (cited, not invented):
 
 
         join_rows ~= |R| x |S| / max(NDV(R.a), NDV(S.b))
 
 
-    TODO(human): define the fallback for the other two cases -- exactly one
-    side's NDV known, and neither known. Add the constant(s) this needs
-    (alongside _DEFAULT_ROWS_PER_VALUE above), and pick a rule for each:
-    what should a join's estimated cardinality be when the optimizer has
-    only one distinct-value count to go on, or none at all?
+    Both known: NDV(R.a) and NDV(S.b) are used directly. Exactly one known,
+    or neither: the missing side's NDV is ASSUMED via _assumed_ndv() rather
+    than dropped from the formula, so all three cases share one calculation
+    and degrade gracefully into each other instead of being three unrelated
+    rules.
     """
-    if left_ndv is not None and right_ndv is not None:
-        return max(1, (left_rows * right_rows) // max(left_ndv, right_ndv))
-    raise NotImplementedError  # TODO(human)
+    max_ndv = max(_assumed_ndv(left_rows, left_ndv), _assumed_ndv(right_rows, right_ndv))
+    return max(1, (left_rows * right_rows) // max_ndv)
 
 
 def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats: TableStats) -> AccessPath:
