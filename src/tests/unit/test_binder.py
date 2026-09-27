@@ -16,6 +16,7 @@ import pytest
 
 from quilldb.catalog.schema import ColumnSchema, TableSchema
 from quilldb.errors import (
+    AmbiguousColumnError,
     ColumnCountError,
     ColumnNotFoundError,
     ParameterCountError,
@@ -33,11 +34,13 @@ from quilldb.sql.binder import (
     BoundDelete,
     BoundInsert,
     BoundIsNull,
+    BoundJoinSelect,
     BoundLiteral,
     BoundSelect,
     BoundUnaryOp,
     BoundUpdate,
     bind,
+    resolve_layout,
 )
 from quilldb.sql.parser import parse
 
@@ -63,6 +66,18 @@ _TYPES = TableSchema(
     ),
     root_page=3,
     sql="CREATE TABLE types (i INTEGER, r REAL, t TEXT, b BLOB)",
+)
+
+
+_ORDERS = TableSchema(
+    "orders",
+    (
+        ColumnSchema("id", DataType.INTEGER),
+        ColumnSchema("user_id", DataType.INTEGER),
+        ColumnSchema("total", DataType.INTEGER),
+    ),
+    root_page=4,
+    sql="CREATE TABLE orders (id INTEGER, user_id INTEGER, total INTEGER)",
 )
 
 
@@ -653,3 +668,128 @@ def test_update_substitutes_parameters_across_set_and_where() -> None:
     assert isinstance(bound, BoundUpdate)
     assert bound.assignments == (BoundAssignment(2, BoundLiteral(37)),)
     assert bound.where == BoundBinaryOp(BoundColumn(0, "id", DataType.INTEGER), "=", BoundLiteral(1))
+
+
+# =====================================================================
+# SELECT with JOIN: scopes, qualified names, ambiguity
+# (week7-query-processing.md session 1)
+# =====================================================================
+
+
+_JOIN_CATALOG = _FakeCatalog(_USERS, _ORDERS)
+
+
+def test_a_comma_join_produces_a_scope_per_table_in_from_order() -> None:
+    bound = _bind("SELECT * FROM users, orders", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert [s.table.name for s in bound.scopes] == ["users", "orders"]
+    assert [s.ordinal for s in bound.scopes] == [0, 1]
+    assert [s.alias for s in bound.scopes] == ["users", "orders"]
+
+
+def test_a_comma_join_has_no_on_condition() -> None:
+    bound = _bind("SELECT * FROM users, orders", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert len(bound.joins) == 1
+    assert bound.joins[0].join_type == "INNER"
+    assert bound.joins[0].on is None
+
+
+def test_inner_join_on_binds_the_condition_against_both_scopes() -> None:
+    bound = _bind(
+        "SELECT * FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.joins[0].join_type == "INNER"
+    assert bound.joins[0].on == BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        "=",
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_left_join_is_recorded_as_such() -> None:
+    bound = _bind(
+        "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.joins[0].join_type == "LEFT"
+
+
+def test_aliases_are_the_scope_key_not_the_table_name() -> None:
+    bound = _bind(
+        "SELECT u.id, o.total FROM users u JOIN orders o ON u.id = o.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert [s.alias for s in bound.scopes] == ["u", "o"]
+    assert bound.expressions == (
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_select_star_across_a_join_expands_every_table_in_from_order() -> None:
+    bound = _bind("SELECT * FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.expressions == (
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(1, "name", DataType.TEXT, table_ordinal=0),
+        BoundColumn(2, "age", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=1),
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+        BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_an_unqualified_name_present_in_only_one_scope_still_resolves() -> None:
+    bound = _bind(
+        "SELECT total FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.expressions == (BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),)
+
+
+def test_an_unqualified_name_in_two_scopes_is_ambiguous() -> None:
+    # Both users and orders have an `id` column -- bare `id` must not
+    # silently pick one (AmbiguousColumnError's docstring).
+    with pytest.raises(AmbiguousColumnError):
+        _bind("SELECT id FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG)
+
+
+def test_a_qualifier_naming_no_scope_raises_column_not_found() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind(
+            "SELECT ghost.id FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+        )
+
+
+def test_a_qualified_name_absent_from_its_table_raises_column_not_found() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind(
+            "SELECT users.total FROM users JOIN orders ON users.id = orders.user_id",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+# =====================================================================
+# resolve_layout: rewriting (table_ordinal, index) to a flat row index
+# =====================================================================
+
+
+def test_resolve_layout_offsets_each_table_ordinal() -> None:
+    expr = BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        "=",
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+    )
+    # users has 3 columns (0, 1, 2), so orders starts at flat offset 3.
+    flat = resolve_layout(expr, {0: 0, 1: 3})
+    assert flat == BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER),
+        "=",
+        BoundColumn(4, "user_id", DataType.INTEGER),
+    )
+
+
+def test_resolve_layout_leaves_literals_alone() -> None:
+    assert resolve_layout(BoundLiteral(5), {0: 0}) == BoundLiteral(5)

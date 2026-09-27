@@ -32,7 +32,9 @@ from typing import Protocol
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
+    AmbiguousColumnError,
     ColumnCountError,
+    ColumnNotFoundError,
     ParameterCountError,
     TypeMismatchError,
     UnsupportedFeatureError,
@@ -89,6 +91,21 @@ class BoundColumn:
     index: int
     name: str
     data_type: DataType
+    table_ordinal: int = 0
+    """Which table in the FROM clause this column came from -- 0 for every
+    single-table query (the only kind that existed before week 7), and the
+    table's position in `Select.joins`-plus-the-base-table for a join.
+
+    Defaulting to 0 is what keeps every pre-week-7 call site (single-table
+    SELECT/DELETE/UPDATE, and every test that builds a BoundColumn by hand)
+    working unchanged: they never had a second table to distinguish, so
+    they never have to spell this field out.
+
+    `index` is meaningful only *within* that table's own row until
+    resolve_layout() rewrites it to a flat offset for a chosen join order --
+    see the module-level resolve_layout() docstring for why that has to be
+    a separate pass rather than something the binder computes up front.
+    """
 
 
 
@@ -168,6 +185,52 @@ class BoundSelect:
     where: BoundExpression | None
 
 
+
+
+@dataclass(frozen=True)
+class TableScope:
+    """One table visible to name resolution inside a joined SELECT: its
+    position in the FROM clause, the name column references key on (the
+    alias if the query gave one, else the table name itself), and its
+    schema.
+
+    A plain list[TableScope] rather than a dict keyed by alias: aliases
+    aren't required to be unique here (real SQL rejects `FROM t, t`, this
+    binder doesn't yet), and resolve_column needs to walk every scope
+    anyway to detect ambiguity, not just do one dict lookup.
+    """
+
+    ordinal: int
+    alias: str
+    table: TableSchema
+
+
+@dataclass(frozen=True)
+class BoundJoin:
+    join_type: str  # "INNER" | "LEFT"
+    table_ordinal: int
+    on: "BoundExpression | None"
+    """None only for a comma join (JoinClause.on was None) -- an inner join
+    with no condition, same as real SQL.
+    """
+
+
+@dataclass(frozen=True)
+class BoundJoinSelect:
+    """A SELECT with at least one JOIN or comma join.
+
+    Deliberately a separate type from BoundSelect rather than BoundSelect
+    growing an optional `joins` field: NestedLoopJoin (exec/join.py) doesn't
+    exist until session 2, so nothing downstream can execute this yet.
+    Keeping it a distinct type means a single-table SELECT's bind path -- and
+    everything the week 3-6 executor and planner already do with it -- is
+    untouched by this session, instead of silently gaining an unused field.
+    """
+
+    scopes: tuple[TableScope, ...]
+    joins: tuple[BoundJoin, ...]
+    expressions: tuple[BoundExpression, ...]
+    where: BoundExpression | None
 
 
 @dataclass(frozen=True)
@@ -256,6 +319,7 @@ type BoundStatement = (
     | BoundCreateIndex
     | BoundInsert
     | BoundSelect
+    | BoundJoinSelect
     | BoundDelete
     | BoundUpdate
     | BoundAnalyze
@@ -266,6 +330,39 @@ type BoundStatement = (
 )
 
 
+def resolve_layout(expr: BoundExpression, offsets: dict[int, int]) -> BoundExpression:
+    """Rewrite every (table_ordinal, column) reference in `expr` to a flat
+    row index, for the join order the planner actually chose.
+
+    `offsets[table_ordinal]` is where that table's columns start in the
+    concatenated row a NestedLoopJoin produces; `expr` came out of
+    bind_join_select with `index` still meaning "position within its own
+    table's row" (table_ordinal names which table). This can't happen at
+    bind time -- the planner (week7-query-processing.md §43) may reorder the
+    joined tables *after* binding to get a cheaper plan, so the binder
+    cannot yet know which offset any given table will land at.
+
+    One rewrite pass handles every intermediate layout a multi-table plan
+    produces; a canonical layout chosen up front doesn't, because an ON
+    predicate evaluated after only some tables are assembled sees a row
+    with just those tables in it, at whatever offsets *that* partial plan
+    uses.
+    """
+    if isinstance(expr, BoundColumn):
+        return BoundColumn(offsets[expr.table_ordinal] + expr.index, expr.name, expr.data_type)
+
+    if isinstance(expr, BoundUnaryOp):
+        return BoundUnaryOp(expr.operator, resolve_layout(expr.operand, offsets))
+
+    if isinstance(expr, BoundBinaryOp):
+        return BoundBinaryOp(
+            resolve_layout(expr.left, offsets), expr.operator, resolve_layout(expr.right, offsets)
+        )
+
+    if isinstance(expr, BoundIsNull):
+        return BoundIsNull(resolve_layout(expr.operand, offsets), expr.negated)
+
+    return expr  # BoundLiteral: nothing to rewrite
 
 
 def bind(
@@ -285,7 +382,10 @@ def bind(
         every parameter has been substituted.
     Raises:
         TableNotFoundError: propagated from catalog.get_table().
-        ColumnNotFoundError: propagated from TableSchema.column_index().
+        ColumnNotFoundError: propagated from TableSchema.column_index(), or
+            from resolve_column() for a joined SELECT.
+        AmbiguousColumnError: a joined SELECT's unqualified column name
+            matches more than one table in scope.
         ColumnCountError: an INSERT supplied a different number of values
             than the table has columns.
         ParameterCountError: the statement's `?` count and len(parameters)
@@ -309,7 +409,7 @@ def bind(
     elif isinstance(statement, Insert):
         bound = binder.bind_insert(statement)
     elif isinstance(statement, Select):
-        bound = binder.bind_select(statement)
+        bound = binder.bind_join_select(statement) if statement.joins else binder.bind_select(statement)
     elif isinstance(statement, Delete):
         bound = binder.bind_delete(statement)
     elif isinstance(statement, Update):
@@ -317,6 +417,8 @@ def bind(
     elif isinstance(statement, Analyze):
         bound = BoundAnalyze(statement)
     elif isinstance(statement, Explain):
+        if statement.statement.joins:
+            raise UnsupportedFeatureError("EXPLAIN of a joined SELECT is not supported yet")
         bound = BoundExplain(binder.bind_select(statement.statement), statement.analyze)
     elif isinstance(statement, Begin):
         bound = BoundBegin(statement)
@@ -365,7 +467,14 @@ class _Binder:
 
 
     def bind_select(self, statement: Select) -> BoundSelect:
-        table = self.catalog.get_table(statement.table)
+        """The single-table path, unchanged since week 3. A qualifier on a
+        column reference (`t.id` rather than `id`) is not checked against
+        `statement.table`'s alias here -- with exactly one table in scope
+        there's nothing for it to disambiguate, so it's accepted the same as
+        the bare name. bind_join_select's resolve_column is where a
+        qualifier actually has to mean something.
+        """
+        table = self.catalog.get_table(statement.table.name)
 
 
         if statement.expressions is None:
@@ -382,6 +491,121 @@ class _Binder:
         where = None if statement.where is None else self._expression(statement.where, table)
         return BoundSelect(table, expressions, where)
 
+
+    def bind_join_select(self, statement: Select) -> BoundJoinSelect:
+        """The multi-table path: at least one JOIN or comma join.
+
+        Every column reference resolves through `resolve_column` against
+        `scopes` rather than through a single TableSchema.column_index() --
+        the whole reason TableScope/BoundColumn.table_ordinal exist. The ON
+        expression of a later join is bound against every *earlier* scope
+        plus its own table, matching what a real join actually has in hand
+        when it evaluates that condition: by the time join k runs, tables
+        0..k are already assembled into one row, and it's only checking
+        that its own new table fits.
+        """
+        scopes = self._build_scopes(statement)
+
+        joins = []
+        for join, scope in zip(statement.joins, scopes[1:], strict=True):
+            visible = scopes[: scope.ordinal + 1]
+            on = None if join.on is None else self._join_expression(join.on, visible)
+            joins.append(BoundJoin(join.join_type, scope.ordinal, on))
+
+        if statement.expressions is None:
+            expressions: tuple[BoundExpression, ...] = tuple(
+                BoundColumn(index, column.name, column.data_type, scope.ordinal)
+                for scope in scopes
+                for index, column in enumerate(scope.table.columns)
+            )
+        else:
+            expressions = tuple(self._join_expression(e, scopes) for e in statement.expressions)
+
+        where = None if statement.where is None else self._join_expression(statement.where, scopes)
+        return BoundJoinSelect(tuple(scopes), tuple(joins), expressions, where)
+
+    def _build_scopes(self, statement: Select) -> list[TableScope]:
+        refs = (statement.table, *(join.table for join in statement.joins))
+        return [
+            TableScope(ordinal, ref.alias or ref.name, self.catalog.get_table(ref.name))
+            for ordinal, ref in enumerate(refs)
+        ]
+
+    def _join_expression(self, expression: Expression, scopes: list[TableScope]) -> BoundExpression:
+        """`_expression`'s twin for the multi-table case: same tree shape,
+        the only difference is how a bare Column resolves -- through
+        `resolve_column` against every scope in play instead of a single
+        table's column_index().
+        """
+        if isinstance(expression, Literal):
+            return BoundLiteral(expression.value)
+
+        if isinstance(expression, Parameter):
+            return BoundLiteral(self._parameter(expression.index))
+
+        if isinstance(expression, Column):
+            return self.resolve_column(expression.name, expression.table, scopes)
+
+        if isinstance(expression, UnaryOp):
+            return BoundUnaryOp(expression.operator, self._join_expression(expression.operand, scopes))
+
+        if isinstance(expression, BinaryOp):
+            return BoundBinaryOp(
+                self._join_expression(expression.left, scopes),
+                expression.operator,
+                self._join_expression(expression.right, scopes),
+            )
+
+        if isinstance(expression, IsNull):
+            return BoundIsNull(self._join_expression(expression.operand, scopes), expression.negated)
+
+        raise UnsupportedFeatureError(f"cannot bind a {type(expression).__name__} expression")
+
+    def resolve_column(self, name: str, qualifier: str | None, scopes: list[TableScope]) -> BoundColumn:
+        """Resolve a (possibly qualified) column reference against the
+        tables in scope.
+
+        `u.id`  -> qualifier="u": find the scope whose alias/name is "u"
+                   (case-insensitively, matching TableSchema.column_index's
+                   own convention), then look up "id" only in that table.
+        `id`    -> qualifier=None: search every scope. Exactly one table may
+                   have a column named "id" -- more than one is an error,
+                   not a silent pick of the first match. Silently picking
+                   one is how a join returns a plausible-looking wrong
+                   answer instead of failing loudly (week7-query-processing.md
+                   §40, and errors.AmbiguousColumnError's docstring).
+
+        Raises:
+            ColumnNotFoundError: qualifier names no scope, or the resolved
+                table(s) have no such column.
+            AmbiguousColumnError: an unqualified name matches columns in
+                more than one scope.
+        """
+        if qualifier is not None:
+            folded = qualifier.casefold()
+            scope = next((s for s in scopes if s.alias.casefold() == folded), None)
+            if scope is None:
+                raise ColumnNotFoundError(f"no such table: {qualifier!r}")
+            index = scope.table.column_index(name)  # raises ColumnNotFoundError
+            column = scope.table.columns[index]
+            return BoundColumn(index, column.name, column.data_type, scope.ordinal)
+
+        matches: list[tuple[TableScope, int]] = []
+        for scope in scopes:
+            try:
+                matches.append((scope, scope.table.column_index(name)))
+            except ColumnNotFoundError:
+                continue
+
+        if not matches:
+            raise ColumnNotFoundError(f"no such column: {name!r}")
+        if len(matches) > 1:
+            tables = ", ".join(scope.alias for scope, _ in matches)
+            raise AmbiguousColumnError(f"column {name!r} is ambiguous: present in {tables}")
+
+        scope, index = matches[0]
+        column = scope.table.columns[index]
+        return BoundColumn(index, column.name, column.data_type, scope.ordinal)
 
     def bind_delete(self, statement: Delete) -> BoundDelete:
         table = self.catalog.get_table(statement.table)

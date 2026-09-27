@@ -1,15 +1,18 @@
-"""Parser tests for the Week 3 SQL subset.
+"""Parser tests for the Week 3 SQL subset, plus week 7's FROM-clause grammar.
 
 Scoped to CREATE TABLE and the statement-level machinery it exercises
 (trailing-token/semicolon handling, unsupported-statement detection) --
-INSERT, SELECT, and the Pratt expression parser land in a follow-up pass,
-so their tests belong in that pass, not here.
+INSERT, SELECT's expression list, and the Pratt expression parser are
+exercised through sql/binder.py's tests instead, since a bound tree is
+easier to assert on than a raw AST. The FROM-clause grammar (JOIN/ON,
+comma joins, aliases, qualified names) is pure syntax with nothing to
+bind yet, so it's tested directly against the AST here.
 """
 
 import pytest
 
 from quilldb.errors import SQLSyntaxError
-from quilldb.sql.ast import ColumnDef, CreateTable, DataType
+from quilldb.sql.ast import Column, ColumnDef, CreateTable, DataType, JoinClause, Select, TableRef
 from quilldb.sql.parser import parse
 
 
@@ -122,3 +125,102 @@ def test_syntax_error_includes_a_position() -> None:
     with pytest.raises(SQLSyntaxError) as exc_info:
         parse("CREATE TABLE t (id INTEGER, id TEXT)")
     assert str(exc_info.value)
+
+
+# =====================================================================
+# FROM clause: comma joins, JOIN ... ON, aliases, qualified names
+# (week7-query-processing.md session 1)
+# =====================================================================
+
+
+def test_a_bare_select_has_no_joins() -> None:
+    statement = parse("SELECT * FROM users")
+    assert isinstance(statement, Select)
+    assert statement.table == TableRef("users")
+    assert statement.joins == ()
+
+
+def test_a_comma_join_is_an_inner_join_with_no_on() -> None:
+    statement = parse("SELECT * FROM users, orders")
+    assert isinstance(statement, Select)
+    assert statement.table == TableRef("users")
+    assert statement.joins == (JoinClause("INNER", TableRef("orders"), on=None),)
+
+
+def test_two_comma_joins_chain_in_order() -> None:
+    statement = parse("SELECT * FROM a, b, c")
+    assert isinstance(statement, Select)
+    assert statement.joins == (
+        JoinClause("INNER", TableRef("b"), on=None),
+        JoinClause("INNER", TableRef("c"), on=None),
+    )
+
+
+def test_join_on_requires_and_captures_the_condition() -> None:
+    statement = parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
+    assert isinstance(statement, Select)
+    assert len(statement.joins) == 1
+    join = statement.joins[0]
+    assert join.join_type == "INNER"
+    assert join.table == TableRef("orders")
+    assert join.on is not None
+
+
+def test_inner_join_keyword_is_equivalent_to_bare_join() -> None:
+    statement = parse("SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id")
+    assert isinstance(statement, Select)
+    assert statement.joins[0].join_type == "INNER"
+
+
+def test_left_join_is_recorded_as_left() -> None:
+    statement = parse("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id")
+    assert isinstance(statement, Select)
+    assert statement.joins[0].join_type == "LEFT"
+
+
+def test_left_outer_join_is_the_same_as_left_join() -> None:
+    statement = parse("SELECT * FROM users LEFT OUTER JOIN orders ON users.id = orders.user_id")
+    assert isinstance(statement, Select)
+    assert statement.joins[0].join_type == "LEFT"
+
+
+def test_join_without_on_raises() -> None:
+    with pytest.raises(SQLSyntaxError):
+        parse("SELECT * FROM users JOIN orders")
+
+
+def test_table_alias_with_as() -> None:
+    statement = parse("SELECT * FROM users AS u")
+    assert isinstance(statement, Select)
+    assert statement.table == TableRef("users", "u")
+
+
+def test_table_alias_without_as() -> None:
+    statement = parse("SELECT * FROM users u")
+    assert isinstance(statement, Select)
+    assert statement.table == TableRef("users", "u")
+
+
+def test_joined_table_may_also_carry_an_alias() -> None:
+    statement = parse("SELECT * FROM users u JOIN orders o ON u.id = o.user_id")
+    assert isinstance(statement, Select)
+    assert statement.table == TableRef("users", "u")
+    assert statement.joins[0].table == TableRef("orders", "o")
+
+
+def test_qualified_column_name_captures_its_table_prefix() -> None:
+    statement = parse("SELECT u.id FROM users u")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (Column("id", table="u"),)
+
+
+def test_bare_column_name_has_no_table_prefix() -> None:
+    statement = parse("SELECT id FROM users")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (Column("id"),)
+
+
+def test_where_still_parses_after_a_join() -> None:
+    statement = parse("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 10")
+    assert isinstance(statement, Select)
+    assert statement.where is not None

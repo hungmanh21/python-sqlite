@@ -26,11 +26,13 @@ from quilldb.sql.ast import (
     Expression,
     Insert,
     IsNull,
+    JoinClause,
     Literal,
     Parameter,
     Rollback,
     Select,
     Statement,
+    TableRef,
     UnaryOp,
     Update,
 )
@@ -245,7 +247,7 @@ class Parser:
 
 
         self._expect(TokenType.FROM, "expected FROM")
-        table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        table, joins = self._from_clause()
 
 
         where: Expression | None = None
@@ -254,7 +256,68 @@ class Parser:
             where = self._expression()
 
 
-        return Select(expressions, table, where)
+        return Select(expressions, table, joins, where)
+
+
+    def _from_clause(self) -> tuple[TableRef, tuple[JoinClause, ...]]:
+        """The first table, then zero or more comma joins and/or `JOIN ...
+        ON` steps, in the order they appear -- that order is `table_ordinal`
+        in the binder (sql/binder.py's TableScope), so it isn't just parsed
+        and discarded.
+        """
+        first = self._table_ref()
+
+
+        joins: list[JoinClause] = []
+        while True:
+            if self._peek().type is TokenType.COMMA:
+                self._advance()
+                joins.append(JoinClause("INNER", self._table_ref(), on=None))
+                continue
+
+
+            join_type = self._join_type()
+            if join_type is None:
+                break
+            table = self._table_ref()
+            self._expect(TokenType.ON, "expected ON after JOIN")
+            on = self._expression()
+            joins.append(JoinClause(join_type, table, on))
+
+
+        return first, tuple(joins)
+
+
+    def _join_type(self) -> str | None:
+        token = self._peek()
+        if token.type is TokenType.JOIN:
+            self._advance()
+            return "INNER"
+        if token.type is TokenType.INNER:
+            self._advance()
+            self._expect(TokenType.JOIN, "expected JOIN after INNER")
+            return "INNER"
+        if token.type is TokenType.LEFT:
+            self._advance()
+            if self._peek().type is TokenType.OUTER:
+                self._advance()
+            self._expect(TokenType.JOIN, "expected JOIN after LEFT [OUTER]")
+            return "LEFT"
+        return None
+
+
+    def _table_ref(self) -> TableRef:
+        name = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        alias: str | None = None
+        if self._peek().type is TokenType.AS:
+            self._advance()
+            alias = self._expect(TokenType.IDENTIFIER, "expected an alias after AS").lexeme
+        elif self._peek().type is TokenType.IDENTIFIER:
+            # Bare alias, no AS -- legal in SQL ("FROM orders o"), and
+            # unambiguous here only because JOIN/ON/WHERE/comma are their
+            # own reserved token types, not IDENTIFIER (session 0, B6-9).
+            alias = self._advance().lexeme
+        return TableRef(name, alias)
 
 
     def _delete(self) -> Delete:
@@ -419,6 +482,10 @@ class Parser:
 
         if token.type is TokenType.IDENTIFIER:
             self._advance()
+            if self._peek().type is TokenType.DOT:
+                self._advance()
+                column_name = self._expect(TokenType.IDENTIFIER, "expected a column name after '.'").lexeme
+                return Column(column_name, table=token.lexeme)
             return Column(token.lexeme)
 
 

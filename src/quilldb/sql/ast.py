@@ -35,6 +35,12 @@ class Literal:
 @dataclass(frozen=True)
 class Column:
     name: str
+    table: str | None = None
+    """The raw qualifier before the dot in `u.id` -- an alias or a table
+    name, whichever the query wrote. Unresolved: deciding which scope it
+    names is the binder's job (sql/binder.py's resolve_column), exactly
+    like `name` itself is an unresolved column reference.
+    """
 
 
 @dataclass(frozen=True)
@@ -89,13 +95,43 @@ class Insert:
 
 
 @dataclass(frozen=True)
+class TableRef:
+    """One table named in a FROM/JOIN clause, alias and all.
+
+    `alias` is None when the query didn't give one -- the binder then keys
+    that table's scope on `name` itself, so `FROM orders o` and `FROM
+    orders` both produce a scope, just under a different key.
+    """
+
+    name: str
+    alias: str | None = None
+
+
+@dataclass(frozen=True)
+class JoinClause:
+    """One `JOIN ... ON ...` or comma-join step, chained onto the table
+    before it in `Select.joins`.
+
+    A comma join (`FROM a, b`) parses to `JoinClause("INNER", b, on=None)`:
+    it's an inner join with no ON condition, which is exactly what a comma
+    join means -- any filtering it implies lives in WHERE, same as real SQL.
+    `on` is only ever None for that case; `JOIN ... ON` always supplies one.
+    """
+
+    join_type: str  # "INNER" | "LEFT"
+    table: TableRef
+    on: "Expression | None" = None
+
+
+@dataclass(frozen=True)
 class Select:
     expressions: tuple[Expression, ...] | None
     """None means `SELECT *`; expanding that into one Column per table
     column is the binder's job, since the parser has no catalog to expand
     it against.
     """
-    table: str
+    table: TableRef
+    joins: tuple[JoinClause, ...] = ()
     where: Expression | None = None
 
 
