@@ -112,6 +112,18 @@ A: read x -> 50        ← same query, same transaction, different answer
 Sounds harmless until the transaction is `SELECT balance` … *validate* … `SELECT balance` … *act*. Any
 check-then-act across two reads is broken by this.
 
+**Why this is an anomaly, not just "data changed":** a transaction's whole deal is that it gets to
+*pretend it's the only thing running* (§15.2 makes this precise). If you read a value at the top of a
+function and read it again lower down, "pretend you're alone" means those two reads must agree — nobody
+else could have touched the row while you were the only one there. When they disagree, the pretense
+breaks silently: your later code is now built on a number (the first read) that quietly stopped being
+true, and nothing told it.
+
+> **ELI5:** You check your bank balance on your phone, put the phone down for ten seconds, pick it back up
+> and check again — same balance, right? Not if someone else can spend your money in those ten seconds and
+> your app just… shows the new number without saying "hey, this changed since you last looked." That's a
+> non-repeatable read: the same question, asked twice, silently gets two different true answers.
+
 
 ### Phantom read — the same *query* returns different rows
 
@@ -122,6 +134,17 @@ A: SELECT count(*) FROM acct WHERE balance > 100   -> 5
 A: SELECT count(*) FROM acct WHERE balance > 100   -> 6      ← a row appeared
 ```
 
+
+**Why this is an anomaly:** same idea as a non-repeatable read, but for a whole *set* of rows instead of
+one. `SELECT count(*) WHERE balance > 100` is a question about the entire table. If you were truly running
+alone, asking it twice would always get the same answer — nobody else could have inserted a matching row
+in between. When the count changes, a row you never read, and couldn't have locked because it didn't
+exist yet, still managed to falsify your earlier answer.
+
+> **ELI5:** You count the empty seats in a waiting room, step out for a minute, come back and count again
+> — same number, right? Not if someone can sneak a new chair in while you're gone. You never "missed"
+> counting that chair — it wasn't there to count — but your two counts still disagree, and you had no way
+> to prevent it because you can't reserve a chair that doesn't exist yet.
 
 **Why this is genuinely harder than a non-repeatable read, and worth understanding:** to prevent a
 non-repeatable read you lock the rows you read — there are finitely many and you know which. To prevent a
@@ -141,6 +164,14 @@ system fixes and the first one it documents as permitted.
 ## 15.2 What isolation actually means
 
 
+> **ELI5:** Two chefs share one kitchen. You don't care whether they were literally chopping vegetables at
+> the exact same second — you only care that the finished meal looks like something you'd get if one chef
+> had cooked start-to-finish, and *then* the other did (in either order). If the meal doesn't match *either*
+> "one chef, then the other" story, something went wrong in how they shared the kitchen. Serializable just
+> means: whatever actually happened, the *result* has to match one of those take-turns stories — it doesn't
+> matter which one, and it doesn't matter that they were secretly interleaved.
+
+
 The definition is stricter and simpler than most explanations make it:
 
 
@@ -151,13 +182,17 @@ The definition is stricter and simpler than most explanations make it:
 Three things people get wrong about that:
 
 
-1. **"Some" order, not the order they started in.** If A and B run concurrently and the result matches
-   "all of B, then all of A," that is a correct serializable execution even if A started first. The
-   system is not obliged to preserve arrival order — only to be *equivalent to* some order.
-2. **It's a property of the outcome, not of the schedule.** Two transactions can interleave freely, and
-   as long as no interleaving is *observable* in the result, it's serializable.
-3. **It says nothing about which order you get.** Both serial orders are correct. If your application
-   needs a specific one, that's sequencing, and isolation won't give it to you.
+1. **"Some" order, not the order they started in.** (Chef B can "go first" in the story even if chef A
+   physically started chopping first — the kitchen doesn't owe you arrival order.) If A and B run
+   concurrently and the result matches "all of B, then all of A," that is a correct serializable execution
+   even if A started first. The system is not obliged to preserve arrival order — only to be *equivalent
+   to* some order.
+2. **It's a property of the outcome, not of the schedule.** (Judge the finished meal, not the choreography
+   of who touched the stove when.) Two transactions can interleave freely, and as long as no interleaving
+   is *observable* in the result, it's serializable.
+3. **It says nothing about which order you get.** (Both "A then B" and "B then A" are acceptable meals —
+   the kitchen picks, not you.) Both serial orders are correct. If your application needs a specific one,
+   that's sequencing, and isolation won't give it to you.
 
 
 Serializability is the gold standard because it lets you reason about a transaction **as if it ran
@@ -170,6 +205,14 @@ being false.
 
 
 ## 15.3 The isolation levels, and why the ladder is a bit of a fraud
+
+
+> **ELI5:** Think of the four levels as four different promises a restaurant can make about your food, from
+> weakest to strongest: "we won't serve you raw chicken" (read committed), up to "your meal will be exactly
+> what you'd get if you were the only customer in the building" (serializable). Each rung up the ladder
+> forbids one more specific bad thing from happening. The catch, covered below, is that restaurants
+> (database engines) don't all agree on what "medium-rare" (e.g. "repeatable read") means — so the *name*
+> of the promise is less useful than asking directly "what exactly won't happen to my order?"
 
 
 ANSI SQL defines four levels, defined by *which anomalies they permit*:
@@ -187,18 +230,20 @@ ANSI SQL defines four levels, defined by *which anomalies they permit*:
 memorized the table:
 
 
-**1. Defining a guarantee by a list of forbidden phenomena is a weak definition.** The list was derived
-from the anomalies that lock-based implementations happened to exhibit, so it describes *implementation
-artifacts* rather than a coherent property. The famous 1995 critique by Berenson et al. showed the
-definitions are ambiguous and that they omit anomalies that real systems have — including **write skew**
-(§15.5), which none of the four levels names.
+**1. Defining a guarantee by a list of forbidden phenomena is a weak definition.** (Plainly: the table is a
+list of *known* bugs, not a definition of "correct." A list of known bugs can always be missing one.) The
+list was derived from the anomalies that lock-based implementations happened to exhibit, so it describes
+*implementation artifacts* rather than a coherent property. The famous 1995 critique by Berenson et al.
+showed the definitions are ambiguous and that they omit anomalies that real systems have — including
+**write skew** (§15.5), which none of the four levels names.
 
 
-**2. The level names don't mean the same thing across engines.** PostgreSQL's "repeatable read" is
-actually snapshot isolation. Oracle's "serializable" is snapshot isolation. MySQL's default is repeatable
-read implemented with gap locks that prevent some phantoms but not all. **So "we use repeatable read" is
-not a portable statement about behaviour**, which is a genuinely useful thing to know when you're
-debugging an application that moved databases.
+**2. The level names don't mean the same thing across engines.** (Plainly: "repeatable read" is not one
+thing — ask "what does *your* database's repeatable read actually forbid?" instead of trusting the label.)
+PostgreSQL's "repeatable read" is actually snapshot isolation. Oracle's "serializable" is snapshot
+isolation. MySQL's default is repeatable read implemented with gap locks that prevent some phantoms but
+not all. **So "we use repeatable read" is not a portable statement about behaviour**, which is a genuinely
+useful thing to know when you're debugging an application that moved databases.
 
 
 The practical upshot for you: **name the anomalies your system permits, not the level.** A sentence like
@@ -223,6 +268,17 @@ Note the scare quotes around "serializable" — they're SQLite's, not mine. And 
 validation protocol, not multi-version timestamps. **It just doesn't let two writers run at once.** If
 writes never interleave, no write-write anomaly can exist, so serializability is achieved by removing the
 concurrency rather than by managing it.
+
+
+**"Single writer" undersells the mechanism — don't let it fool you (it's an easy misread, see §15.6's note
+on the same phrase).** "Only one writer at a time" by itself would stop write-write anomalies (lost update)
+but says nothing about a *reader's* two queries disagreeing — a non-repeatable read or a phantom needs a
+writer to sneak a commit in between two reads of the *same* still-open read transaction, and "one writer at
+a time" doesn't forbid that on its own. What actually forbids it: rollback-journal mode requires a writer
+to hold an **EXCLUSIVE** lock on the whole file to commit, and EXCLUSIVE conflicts with the **SHARED** lock
+any open reader is still holding. So a writer's commit has to wait for every active reader to finish, not
+just for other writers to finish. That's the reader-blocks-writer half of the story that "actually
+serializing the writes" doesn't say out loud.
 
 
 That's a legitimate engineering answer and it's worth saying admiringly rather than dismissively: the
@@ -348,6 +404,48 @@ resulting guarantee, and the reasoning is worth following because it's a pleasan
 - Shared (read) and exclusive (write) locks, **at table granularity**.
 - Both held **until commit** — strict 2PL, no early release.
 - One writer at a time overall.
+
+
+**"Single writer" is shorthand, and it's worth being precise about which half of the lock table is doing
+which job**, because "single writer" on its own only explains write-write conflicts:
+
+
+| holder ＼ requester | Shared | Exclusive |
+|---|---|---|
+| Shared | ✅ compatible | ❌ blocks |
+| Exclusive | ❌ blocks | ❌ blocks |
+
+- **Exclusive vs exclusive** (two writers) is the "single writer" part — it prevents lost updates / dirty
+  writes. This is the half the name talks about.
+- **Shared vs exclusive** (a reader vs a writer) is a *different* conflict, and it's the one that actually
+  prevents non-repeatable reads and phantoms: your read transaction takes a shared lock on a table and
+  holds it until *you* commit, so any other transaction that wants to `INSERT`/`UPDATE`/`DELETE` that table
+  needs the exclusive lock — which conflicts with your still-open shared lock — and has to wait for you,
+  not the other way around. Nothing can change under a query you're still holding open.
+
+Concretely: `A: BEGIN; SELECT ...` takes a shared lock on `acct` and keeps it. `B: BEGIN; UPDATE acct ...`
+needs the exclusive lock, conflicts with A's shared lock, and blocks — not because B is "the second
+writer" (there may be no other writer at all), but because A's *read* is in the way. B unblocks only once
+A commits or rolls back. That's what makes the guarantee hold even though, from B's point of view, it was
+never fighting over a write at all.
+
+
+> **Only two lock modes, not SQLite's five — why not RESERVED and PENDING too?** Because those two exist
+> to solve problems specific to coordinating *separate OS processes* through filesystem byte-range locks
+> (chapter 16 §16.5), and quilldb doesn't have that problem. RESERVED lets a writer start preparing its
+> journal while readers keep reading, without a second writer sneaking in — a "dibs" signal needed because
+> SQLite has no real wait queue. quilldb's `LockManager.acquire` (`src/quilldb/txn/locks.py`) just requests
+> `EXCLUSIVE` directly and blocks on a condition variable if it can't have it yet — no separate "I intend to
+> write" phase to model. PENDING exists purely to stop writer starvation: it's a one-way turnstile that lets
+> existing readers finish but refuses *new* ones once a writer is waiting. quilldb gets the same
+> no-starvation guarantee for free from a **FIFO waiter queue** (`LockEntry.waiters` in `locks.py`) — a
+> request arriving after a waiting writer just queues behind it, no extra state needed. And SQLite's
+> RESERVED-is-unique-at-a-time rule also prevents *lock-upgrade deadlock* (two readers both trying to
+> become the writer at once); quilldb sidesteps that differently, via the global `"__writer__"` lock
+> (`docs/concurrency.md`, "Why a single writer") — only one transaction is ever a writer at all, so there's
+> never a second contender to race against. In short: RESERVED/PENDING are workarounds for a coordination
+> medium (advisory filesystem locks, no shared memory, no real wait queue) that a single-process engine
+> with a real lock manager and a wait-for graph simply doesn't need.
 
 
 **That is serializable, genuinely, and the phantom row is why.** Holding a shared lock on the *whole
