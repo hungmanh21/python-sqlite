@@ -32,6 +32,7 @@ from typing import Protocol
 from quilldb.catalog.schema import TableSchema
 from quilldb.codec.record import Value
 from quilldb.errors import (
+    AggregateError,
     AmbiguousColumnError,
     ColumnCountError,
     ColumnNotFoundError,
@@ -51,6 +52,7 @@ from quilldb.sql.ast import (
     Delete,
     Explain,
     Expression,
+    FunctionCall,
     Insert,
     IsNull,
     Literal,
@@ -61,6 +63,14 @@ from quilldb.sql.ast import (
     UnaryOp,
     Update,
 )
+
+# The set of function names bind_aggregate_select recognizes as aggregates.
+# Deliberately NOT imported from exec/aggregate.py's AGGREGATES dict (minus
+# "count_star", which is never a source-level name -- COUNT(*) reaches it
+# through FunctionCall.star, not through a function named "count_star"):
+# sql/ sits below exec/ in the layering (CLAUDE.md's architecture table),
+# so binder.py cannot depend on the executor package without inverting it.
+_AGGREGATE_FUNCTIONS = frozenset({"count", "sum", "avg", "min", "max"})
 
 
 class SchemaSource(Protocol):
@@ -234,6 +244,36 @@ class BoundJoinSelect:
 
 
 @dataclass(frozen=True)
+class BoundAggregate:
+    """One aggregate call from a SELECT list: which fold to run
+    (exec/aggregate.py's AGGREGATES key) and the already-bound expression
+    to feed it each row, or None only for `count_star` -- COUNT(*) counts
+    rows, not values, so it has nothing to evaluate() per row.
+    """
+
+    func: str  # "count_star" | "count" | "sum" | "avg" | "min" | "max"
+    arg: BoundExpression | None
+
+
+@dataclass(frozen=True)
+class BoundAggregateSelect:
+    """A SELECT whose entire select list is aggregate calls, with no
+    GROUP BY (session 4 adds grouping keys and mixed aggregate/plain
+    expressions). Deliberately a separate type from BoundSelect, for the
+    same reason BoundJoinSelect is one: a BoundAggregate cannot be
+    evaluate()d per row the way every BoundExpression can -- it needs the
+    whole stream of rows reaching it, not one row at a time -- so it isn't
+    a BoundExpression, and folding it into BoundSelect.expressions would
+    make every existing evaluate()/resolve_layout() caller handle a shape
+    it fundamentally can't.
+    """
+
+    table: TableSchema
+    aggregates: tuple[BoundAggregate, ...]
+    where: BoundExpression | None
+
+
+@dataclass(frozen=True)
 class BoundDelete:
     table: TableSchema
     where: BoundExpression | None
@@ -320,6 +360,7 @@ type BoundStatement = (
     | BoundInsert
     | BoundSelect
     | BoundJoinSelect
+    | BoundAggregateSelect
     | BoundDelete
     | BoundUpdate
     | BoundAnalyze
@@ -365,6 +406,37 @@ def resolve_layout(expr: BoundExpression, offsets: dict[int, int]) -> BoundExpre
     return expr  # BoundLiteral: nothing to rewrite
 
 
+def _select_has_aggregate(statement: Select) -> bool:
+    """True when at least one top-level select-list expression is a call
+    to a known aggregate function -- what routes a Select to
+    bind_aggregate_select() instead of the plain single-table bind_select().
+
+    Only checks the TOP level: `SUM(a) + 1` (an aggregate nested inside a
+    larger expression) is not detected here and falls through to
+    bind_select(), where a bare FunctionCall node has no handler and raises
+    UnsupportedFeatureError -- not yet supported, and a session-3 scope cut
+    rather than a silent wrong answer.
+    """
+    if statement.expressions is None:
+        return False  # SELECT * can never be an aggregate select
+    return any(
+        isinstance(e, FunctionCall) and e.name.casefold() in _AGGREGATE_FUNCTIONS
+        for e in statement.expressions
+    )
+
+
+def _describe(expression: Expression) -> str:
+    """A short, human-readable label for an unbound AST expression, for
+    AggregateError's message -- runs before any name resolution, so this
+    can't reuse api/connection.py's _display_name (built for BoundExpression).
+    """
+    if isinstance(expression, Column):
+        return f"{expression.table}.{expression.name}" if expression.table else expression.name
+    if isinstance(expression, FunctionCall):
+        return f"{expression.name}(*)" if expression.star else f"{expression.name}(...)"
+    return type(expression).__name__
+
+
 def bind(
     statement: Statement,
     catalog: SchemaSource,
@@ -386,6 +458,11 @@ def bind(
             from resolve_column() for a joined SELECT.
         AmbiguousColumnError: a joined SELECT's unqualified column name
             matches more than one table in scope.
+        AggregateError: an aggregate SELECT's list contains something other
+            than an aggregate call (bind_aggregate_select -- no GROUP BY
+            exists yet for it to be functionally determined by instead), or
+            an aggregate call is malformed (COUNT(*)-only star usage on a
+            non-COUNT function, wrong argument count).
         ColumnCountError: an INSERT supplied a different number of values
             than the table has columns.
         ParameterCountError: the statement's `?` count and len(parameters)
@@ -409,7 +486,12 @@ def bind(
     elif isinstance(statement, Insert):
         bound = binder.bind_insert(statement)
     elif isinstance(statement, Select):
-        bound = binder.bind_join_select(statement) if statement.joins else binder.bind_select(statement)
+        if statement.joins:
+            bound = binder.bind_join_select(statement)
+        elif _select_has_aggregate(statement):
+            bound = binder.bind_aggregate_select(statement)
+        else:
+            bound = binder.bind_select(statement)
     elif isinstance(statement, Delete):
         bound = binder.bind_delete(statement)
     elif isinstance(statement, Update):
@@ -606,6 +688,43 @@ class _Binder:
         scope, index = matches[0]
         column = scope.table.columns[index]
         return BoundColumn(index, column.name, column.data_type, scope.ordinal)
+
+    def bind_aggregate_select(self, statement: Select) -> BoundAggregateSelect:
+        """The no-GROUP-BY aggregate path: every SELECT-list expression must
+        be an aggregate call.
+
+        With no GROUP BY there is no key for a plain column to be
+        FUNCTIONALLY DETERMINED by (§40's validate_aggregates rule, which
+        session 4 generalizes once GROUP BY keys exist) -- so with zero
+        keys, that rule collapses to exactly this: nothing but an aggregate
+        call is legal in the select list. `SELECT id, COUNT(*) FROM t`
+        fails here for the same reason it would fail validate_aggregates
+        later, just checked earlier because there's nothing later yet.
+        """
+        assert statement.expressions is not None, "_select_has_aggregate already ruled out SELECT *"
+
+        table = self.catalog.get_table(statement.table.name)
+        aggregates = tuple(self._bind_aggregate_item(e, table) for e in statement.expressions)
+        where = None if statement.where is None else self._expression(statement.where, table)
+        return BoundAggregateSelect(table, aggregates, where)
+
+    def _bind_aggregate_item(self, expression: Expression, table: TableSchema) -> BoundAggregate:
+        if not isinstance(expression, FunctionCall) or expression.name.casefold() not in _AGGREGATE_FUNCTIONS:
+            raise AggregateError(
+                f"'{_describe(expression)}' is neither an aggregate function nor part of a GROUP BY"
+            )
+        return self._bind_aggregate_call(expression, table)
+
+    def _bind_aggregate_call(self, call: FunctionCall, table: TableSchema) -> BoundAggregate:
+        name = call.name.casefold()
+        if call.star:
+            if name != "count":
+                raise AggregateError(f"{call.name.upper()}(*) is only valid for COUNT")
+            return BoundAggregate("count_star", None)
+
+        if len(call.args) != 1:
+            raise AggregateError(f"{call.name.upper()} takes exactly one argument")
+        return BoundAggregate(name, self._expression(call.args[0], table))
 
     def bind_delete(self, statement: Delete) -> BoundDelete:
         table = self.catalog.get_table(statement.table)

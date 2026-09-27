@@ -12,7 +12,16 @@ bind yet, so it's tested directly against the AST here.
 import pytest
 
 from quilldb.errors import SQLSyntaxError
-from quilldb.sql.ast import Column, ColumnDef, CreateTable, DataType, JoinClause, Select, TableRef
+from quilldb.sql.ast import (
+    Column,
+    ColumnDef,
+    CreateTable,
+    DataType,
+    FunctionCall,
+    JoinClause,
+    Select,
+    TableRef,
+)
 from quilldb.sql.parser import parse
 
 
@@ -224,3 +233,52 @@ def test_where_still_parses_after_a_join() -> None:
     statement = parse("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.total > 10")
     assert isinstance(statement, Select)
     assert statement.where is not None
+
+
+# =====================================================================
+# FunctionCall (week 7 session 3, §42): syntax only -- whether "count" is
+# a function quilldb knows, and whether its arguments make sense, is
+# sql/binder.py's job (see test_binder.py's aggregate section).
+# =====================================================================
+
+
+def test_count_star_is_a_function_call_with_the_star_flag() -> None:
+    statement = parse("SELECT COUNT(*) FROM t")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (FunctionCall("COUNT", (), star=True),)
+
+
+def test_function_call_with_one_argument() -> None:
+    statement = parse("SELECT SUM(total) FROM t")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (FunctionCall("SUM", (Column("total"),)),)
+
+
+def test_function_call_name_is_not_case_normalized_by_the_parser() -> None:
+    # Case-folding "count" vs "COUNT" is the binder's job (matching how a
+    # bare Column's name isn't folded here either) -- the parser just
+    # records exactly what the query wrote.
+    statement = parse("SELECT count(*) FROM t")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (FunctionCall("count", (), star=True),)
+
+
+def test_function_call_multiple_arguments() -> None:
+    statement = parse("SELECT FOO(a, b) FROM t")
+    assert isinstance(statement, Select)
+    assert statement.expressions == (FunctionCall("FOO", (Column("a"), Column("b"))),)
+
+
+def test_function_call_argument_can_be_an_expression() -> None:
+    statement = parse("SELECT SUM(a + 1) FROM t")
+    assert isinstance(statement, Select)
+    assert statement.expressions is not None
+    call = statement.expressions[0]
+    assert isinstance(call, FunctionCall)
+    assert call.name == "SUM"
+    assert len(call.args) == 1
+
+
+def test_function_call_missing_close_paren_raises() -> None:
+    with pytest.raises(SQLSyntaxError):
+        parse("SELECT COUNT(* FROM t")

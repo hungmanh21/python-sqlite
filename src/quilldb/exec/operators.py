@@ -63,6 +63,7 @@ from quilldb.plan.statistics import (
     estimate_row_counts,
 )
 from quilldb.sql.binder import (
+    BoundAggregateSelect,
     BoundAssignment,
     BoundBinaryOp,
     BoundDelete,
@@ -1180,8 +1181,72 @@ def _build_join_operator(
     return Project(source, expressions)
 
 
+def _build_single_table_source(
+    table: TableSchema,
+    where: BoundExpression | None,
+    pager: Pager,
+    pool: BufferPool,
+    catalog: Catalog,
+    stats: StatisticsCatalog | None,
+    txn: Transaction | None,
+) -> Operator:
+    """The cost-based SeqScan/IndexScan (+ Filter) pipeline shared by a
+    plain SELECT and a no-GROUP-BY aggregate SELECT alike -- WHERE
+    placement and access-path choice don't depend on what sits on top of
+    this (a Project or a HashAggregate), only on `table` and `where`.
+    Factored out of build_operator()'s single-table branch so
+    _build_aggregate_operator() doesn't duplicate stages 1-4 of the
+    cost-based pipeline.
+    """
+    indexes = catalog.indexes_for(table.name)
+    predicates, non_sargable = _extract_predicates(where)
+
+    table_stats = stats.table_stats(table.name) if stats is not None else default_table_stats()
+    candidates = enumerate_access_paths(table, list(indexes), predicates)
+    costed_candidates = []
+    for candidate in candidates:
+        if candidate.index is None:
+            index_stats = None
+        elif stats is not None:
+            index_stats = stats.index_stats(candidate.index)
+        else:
+            index_stats = default_index_stats(candidate.index, table_stats)
+        candidate = estimate_row_counts(candidate, index_stats, table_stats)
+        candidate = assign_cost(candidate, index_stats, table_stats)
+        costed_candidates.append(candidate)
+    path = choose_access_path(costed_candidates)
+
+    source: Operator
+    if path.kind == "index_scan":
+        source = IndexScan(pager, pool, table, path, txn)
+    else:
+        source = SeqScan(pager, pool, table, txn)
+
+    filter_expression = _residual_filter_expression(non_sargable, path.residual)
+    if filter_expression is not None:
+        source = Filter(source, filter_expression)
+    return source
+
+
+def _build_aggregate_operator(
+    statement: BoundAggregateSelect,
+    pager: Pager,
+    pool: BufferPool,
+    catalog: Catalog,
+    stats: StatisticsCatalog | None,
+    txn: Transaction | None,
+) -> Operator:
+    # Deferred: exec/aggregate.py imports Operator from this module at its
+    # own import time, so a module-level import here would cycle -- same
+    # reasoning as _build_join_operator's deferred NestedLoopJoin import.
+    from quilldb.exec.aggregate import HashAggregate
+
+    source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
+    return HashAggregate(source, statement.aggregates)
+
+
 def build_operator(
-    statement: BoundSelect | BoundJoinSelect | BoundInsert | BoundDelete | BoundUpdate,
+    statement: BoundSelect | BoundJoinSelect | BoundAggregateSelect | BoundInsert | BoundDelete | BoundUpdate,
     pager: Pager,
     pool: BufferPool,
     catalog: Catalog,
@@ -1236,6 +1301,10 @@ def build_operator(
         return _build_join_operator(statement, pager, pool, catalog, stats, txn)
 
 
+    if isinstance(statement, BoundAggregateSelect):
+        return _build_aggregate_operator(statement, pager, pool, catalog, stats, txn)
+
+
     if isinstance(statement, BoundInsert):
         indexes = catalog.indexes_for(statement.table.name)
         return Insert(pager, pool, statement, indexes, txn)
@@ -1251,34 +1320,5 @@ def build_operator(
         return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes, txn)
 
 
-    indexes = catalog.indexes_for(statement.table.name)
-    predicates, non_sargable = _extract_predicates(statement.where)
-
-
-    table_stats = stats.table_stats(statement.table.name) if stats is not None else default_table_stats()
-    candidates = enumerate_access_paths(statement.table, list(indexes), predicates)
-    costed_candidates = []
-    for candidate in candidates:
-        if candidate.index is None:
-            index_stats = None
-        elif stats is not None:
-            index_stats = stats.index_stats(candidate.index)
-        else:
-            index_stats = default_index_stats(candidate.index, table_stats)
-        candidate = estimate_row_counts(candidate, index_stats, table_stats)
-        candidate = assign_cost(candidate, index_stats, table_stats)
-        costed_candidates.append(candidate)
-    path = choose_access_path(costed_candidates)
-
-
-    source: Operator
-    if path.kind == "index_scan":
-        source = IndexScan(pager, pool, statement.table, path, txn)
-    else:
-        source = SeqScan(pager, pool, statement.table, txn)
-
-
-    filter_expression = _residual_filter_expression(non_sargable, path.residual)
-    if filter_expression is not None:
-        source = Filter(source, filter_expression)
+    source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
     return Project(source, statement.expressions)

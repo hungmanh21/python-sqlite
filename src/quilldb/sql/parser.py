@@ -24,6 +24,7 @@ from quilldb.sql.ast import (
     Delete,
     Explain,
     Expression,
+    FunctionCall,
     Insert,
     IsNull,
     JoinClause,
@@ -482,6 +483,8 @@ class Parser:
 
         if token.type is TokenType.IDENTIFIER:
             self._advance()
+            if self._peek().type is TokenType.LEFT_PAREN:
+                return self._function_call(token.lexeme)
             if self._peek().type is TokenType.DOT:
                 self._advance()
                 column_name = self._expect(TokenType.IDENTIFIER, "expected a column name after '.'").lexeme
@@ -504,6 +507,35 @@ class Parser:
 
 
         raise SQLSyntaxError(f"expected an expression, found {token.lexeme!r} at position {token.position}")
+
+
+    def _function_call(self, name: str) -> FunctionCall:
+        """`name(` was just consumed up to (not including) the `(` -- called
+        from _atom() the moment an identifier is immediately followed by
+        `LEFT_PAREN`, which is unambiguous here: no other atom starts that
+        way (a parenthesized expression, `_atom`'s own LEFT_PAREN case,
+        never has an IDENTIFIER directly in front of it).
+
+        `COUNT(*)` is the one special form: `*` alone is not a general
+        expression (see FunctionCall.star's docstring), so it's checked for
+        explicitly before falling into ordinary comma-separated argument
+        parsing. Whether `*` is actually valid for THIS function name is
+        the binder's call, not the parser's -- same "syntax now, meaning
+        later" split as an unresolved Column.
+        """
+        self._expect(TokenType.LEFT_PAREN, "expected '(' after function name")
+
+        if self._peek().type is TokenType.STAR:
+            self._advance()
+            self._expect(TokenType.RIGHT_PAREN, "expected ')' after '*'")
+            return FunctionCall(name, (), star=True)
+
+        args = [self._expression()]
+        while self._peek().type is TokenType.COMMA:
+            self._advance()
+            args.append(self._expression())
+        self._expect(TokenType.RIGHT_PAREN, "expected ')' to close a function call")
+        return FunctionCall(name, tuple(args))
 
 
     def _peek(self) -> Token:

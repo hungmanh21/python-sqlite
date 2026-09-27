@@ -164,6 +164,13 @@ class AggregateError(SQLError):
     was used somewhere SQL doesn't allow one (e.g. inside WHERE)."""
 
 
+class IntegerOverflowError(SQLError):
+    """SUM() overflowed the 64-bit integer range with every input seen so
+    far an INTEGER. Unlike `+` (exec/expressions.py's _fit_int64), which
+    silently promotes a too-large result to REAL, SUM raises instead --
+    verified against sqlite3 (week7-query-processing.md §42)."""
+
+
 class SortLimitExceededError(SQLError):
     """ORDER BY would sort more rows than quilldb keeps in memory for an
     in-memory Sort. A documented limitation, not a crash: the message

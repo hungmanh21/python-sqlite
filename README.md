@@ -153,6 +153,21 @@ Feature gaps and format fidelity are different claims. Missing features are gaps
 touches on-disk bytes has to match the real format exactly, because a real SQLite binary reads
 it back.
 
+## Deviations from SQLite
+
+Not gaps — implemented, tested, and intentionally stricter than the reference, each in the same
+direction (refuse rather than silently coerce or guess):
+
+| quilldb | Real SQLite | Why |
+|---|---|---|
+| `INSERT INTO t VALUES ('42')` into an `INTEGER` column raises `TypeMismatchError` | Casts `'42'` to `42` (type affinity) | Coercing text into a number silently turns garbage input into a plausible-looking value instead of an error (`sql/binder.py`'s `_coerce_to_declared_type`) |
+| `1 + 'a'` raises `TypeMismatchError` | `1` (text casts to `0`) | Same reasoning, for expressions instead of storage (`exec/expressions.py`) |
+| `WHERE '1'` treats all text as false | Treats `'1'` as true | Implementing SQLite's numeric-string affinity for `WHERE` but not elsewhere would be an inconsistent half-measure (`exec/expressions.py`) |
+| `SELECT id, COUNT(*) FROM t` (no `GROUP BY`) raises `AggregateError` | Returns `COUNT(*)` alongside an arbitrary row's `id` | A bare column with no `GROUP BY` key to be functionally determined by is ambiguous the moment the table has more than one row — silently picking one row's value is how a query returns a plausible wrong answer (`sql/binder.py`'s `bind_aggregate_select`, week7-query-processing.md §40) |
+
+A differential test that disagrees with sqlite3 on one of these rows is expected behavior, not a
+bug — that's what distinguishes a documented deviation from an undocumented one.
+
 ## Documentation
 
 | Doc | Answers |

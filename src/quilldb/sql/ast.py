@@ -79,7 +79,26 @@ class IsNull:
     negated: bool = False
 
 
-type Expression = Literal | Column | Parameter | UnaryOp | BinaryOp | IsNull
+@dataclass(frozen=True)
+class FunctionCall:
+    """`COUNT(*)`, `SUM(total)`, ... -- syntax only, same policy as every
+    other node here: whether `name` is a function quilldb actually knows,
+    and whether the argument count/shape makes sense for it, is the
+    binder's job (sql/binder.py's _bind_aggregate_call), not the parser's.
+
+    `star` is True only for `COUNT(*)`: `*` is not a value-producing
+    expression the way every other argument is (there is no AST node for
+    a bare `*` outside a SELECT list), so it is recorded as its own flag
+    with `args` left empty, rather than inventing a Star() expression
+    node used nowhere else.
+    """
+
+    name: str
+    args: tuple["Expression", ...] = ()
+    star: bool = False
+
+
+type Expression = Literal | Column | Parameter | UnaryOp | BinaryOp | IsNull | FunctionCall
 
 
 @dataclass(frozen=True)

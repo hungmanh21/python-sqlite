@@ -16,6 +16,7 @@ import pytest
 
 from quilldb.catalog.schema import ColumnSchema, TableSchema
 from quilldb.errors import (
+    AggregateError,
     AmbiguousColumnError,
     ColumnCountError,
     ColumnNotFoundError,
@@ -26,6 +27,8 @@ from quilldb.errors import (
 )
 from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
+    BoundAggregate,
+    BoundAggregateSelect,
     BoundAssignment,
     BoundBinaryOp,
     BoundColumn,
@@ -793,3 +796,63 @@ def test_resolve_layout_offsets_each_table_ordinal() -> None:
 
 def test_resolve_layout_leaves_literals_alone() -> None:
     assert resolve_layout(BoundLiteral(5), {0: 0}) == BoundLiteral(5)
+
+
+# =====================================================================
+# bind_aggregate_select (week 7 session 3, §42): a SELECT list of nothing
+# but aggregate calls, no GROUP BY yet (session 4).
+# =====================================================================
+
+_ORDERS_CATALOG = _FakeCatalog(_ORDERS)
+
+
+def test_count_star_binds_to_count_star_with_no_arg() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders"), _ORDERS_CATALOG)
+    assert bound == BoundAggregateSelect(_ORDERS, (BoundAggregate("count_star", None),), None)
+
+
+def test_aggregate_call_arg_is_bound_against_the_table() -> None:
+    bound = bind(parse("SELECT SUM(total) FROM orders"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.aggregates == (BoundAggregate("sum", BoundColumn(2, "total", DataType.INTEGER)),)
+
+
+def test_aggregate_function_name_is_case_insensitive() -> None:
+    bound = bind(parse("SELECT count(*) FROM orders"), _ORDERS_CATALOG)
+    assert bound == BoundAggregateSelect(_ORDERS, (BoundAggregate("count_star", None),), None)
+
+
+def test_multiple_aggregates_bind_in_select_list_order() -> None:
+    bound = bind(parse("SELECT COUNT(*), MIN(total), MAX(total) FROM orders"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert [agg.func for agg in bound.aggregates] == ["count_star", "min", "max"]
+
+
+def test_aggregate_select_where_is_bound_like_a_plain_select() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders WHERE total > 10"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.where is not None
+
+
+def test_bare_column_alongside_an_aggregate_with_no_group_by_raises() -> None:
+    # There is no GROUP BY key for `id` to be functionally determined by
+    # (week7-query-processing.md §40's validate_aggregates rule, specialized
+    # to zero keys) -- session 4 is what lets a query name GROUP BY keys
+    # here instead.
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT id, COUNT(*) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_star_argument_is_only_valid_for_count() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT SUM(*) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_aggregate_call_with_wrong_arity_raises() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT COUNT(id, total) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_unknown_function_name_raises_unsupported_feature() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        bind(parse("SELECT UPPER(total) FROM orders"), _ORDERS_CATALOG)
