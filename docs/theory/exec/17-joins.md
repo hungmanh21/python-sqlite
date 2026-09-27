@@ -376,8 +376,9 @@ why the planner exists.
 ## 17.7 Join *order* matters more than join *algorithm*
 
 
-Three tables, and the algorithm is fixed as index nested loop. There are still 12 left-deep orderings, and
-they are not close:
+Three tables, and the algorithm is fixed as index nested loop. There are still 3! = 6 left-deep
+orderings (12 if the inner side may itself be a join, `A ⋈ (B ⋈ C)`, which left-deep search excludes),
+and they are not close:
 
 
 ```
