@@ -5,7 +5,7 @@
 > table is one of the four things in this project that a stranger actually reads.
 >
 > **Time:** ~25 minutes. **Prerequisites:** [chapter 00](../foundations/00-foundations.md) (why storage is
-> slow), [chapter 04](../storage/04-the-buffer-pool.md) (the cache that will fool you).
+> slow), [chapter 04](../storage/04-buffer-pool.md) (the cache that will fool you).
 
 
 ---

@@ -36,23 +36,21 @@ case that leaves an operator open past the call that created it.
 """
 
 
+import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
-from quilldb.catalog.catalog import Catalog
 from quilldb.codec.record import Value
-from quilldb.errors import TransactionError, UnsupportedFeatureError
+from quilldb.errors import ThreadingError, TransactionError, UnsupportedFeatureError
 from quilldb.exec.operators import ExplainResult, Operator, build_operator
-from quilldb.plan.analyze import StatisticsCatalog
+from quilldb.sql.ast import Begin, Commit, CreateIndex, CreateTable, Rollback
 from quilldb.sql.binder import (
     BoundAnalyze,
-    BoundBegin,
     BoundBinaryOp,
     BoundColumn,
-    BoundCommit,
     BoundCreateIndex,
     BoundCreateTable,
     BoundDelete,
@@ -61,19 +59,16 @@ from quilldb.sql.binder import (
     BoundInsert,
     BoundIsNull,
     BoundLiteral,
-    BoundRollback,
+    BoundSelect,
     BoundUnaryOp,
     BoundUpdate,
     bind,
 )
 from quilldb.sql.parser import parse
-from quilldb.storage.bufferpool import BufferPool
-from quilldb.storage.pager import Pager
-from quilldb.txn.journal import Journal
-from quilldb.txn.recovery import recover_if_needed
 from quilldb.txn.transaction import Transaction
 
-_MEMORY_PATH = ":memory:"
+if TYPE_CHECKING:
+    from quilldb.api.database import Database
 
 
 
@@ -90,11 +85,24 @@ class Cursor:
         operator: Operator | None,
         description: tuple[tuple[str, ...], ...] | None,
         rowcount: int,
+        *,
+        implicit_txn: Transaction | None = None,
     ) -> None:
         self._operator = operator
         self._description = description
         self._rowcount = rowcount
         self._closed = False
+        # Set only for an autocommit SELECT (SS38: "autocommit still gets a
+        # transaction, for the locks, not the journal"). Its SHARED lock
+        # must outlive execute()'s return -- the operator streams lazily --
+        # so it's released here, whenever this cursor's stream actually
+        # ends, rather than by whoever called execute().
+        self._implicit_txn = implicit_txn
+
+    def _finish_implicit_txn(self) -> None:
+        if self._implicit_txn is not None:
+            self._implicit_txn.commit()
+            self._implicit_txn = None
 
 
     @property
@@ -143,12 +151,14 @@ class Cursor:
         except Exception:
             self._operator = None
             self._closed = True
+            self._finish_implicit_txn()
             raise
         if row is None:
             # Nothing left to stream: release the pins now rather than
             # waiting for an explicit close() that may never come.
             self._operator.close()
             self._operator = None
+            self._finish_implicit_txn()
         return row
 
 
@@ -175,6 +185,7 @@ class Cursor:
         if self._operator is not None:
             self._operator.close()
             self._operator = None
+        self._finish_implicit_txn()
         self._closed = True
 
 
@@ -201,19 +212,45 @@ def _display_name(expression: BoundExpression) -> str:
 
 
 class Connection:
-    """Owns one Pager/BufferPool/Catalog for as long as the database is
-    open. `execute()` is the only entry point that touches them.
+    """ONE per thread. NOT thread-safe -- never share one across threads.
+    `_check_thread()` is what turns that mistake into an immediate
+    `ThreadingError` instead of interleaved cursor state and half-applied
+    transactions that look like a B-tree bug (week6-concurrency.md SS36).
+
+    Owns: the current transaction, open cursors, autocommit state, and the
+    id of the thread that created it. Pager/pool/catalog/lock-manager belong
+    to the shared `Database` and are only referenced here.
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, catalog: Catalog, stats: StatisticsCatalog) -> None:
-        self.pager = pager
-        self.pool = pool
-        self.catalog = catalog
-        self.stats = stats
+    def __init__(self, db: "Database") -> None:
+        self.db = db
+        self.pager = db.pager
+        self.pool = db.pool
+        self.catalog = db.catalog
+        self.stats = db.stats
+        self._owner_thread = threading.get_ident()
+        self._last_seen_cookie = db.pager.schema_cookie
         self._open_cursor: Cursor | None = None
         self._closed = False
         self._txn: Transaction | None = None  # set only by an EXPLICIT BEGIN -- see _begin()
+        self.busy_timeout: float = 5.0  # connection attribute, not an execute() kwarg (SS38)
+
+
+    def _check_thread(self) -> None:
+        """Raise ThreadingError if called from a thread other than the one
+        that created this Connection.
+
+        Called at the top of every public method (week6-concurrency.md
+        SS36).
+        """
+        if threading.get_ident() != self._owner_thread:
+            raise ThreadingError(
+                f"Connection created in thread {self._owner_thread} used from "
+                f"{threading.get_ident()}. Create one Connection per thread."
+            )
+
+
 
 
     # ---- measurement surface (chapter 19 SS19.2) -------------------------
@@ -227,6 +264,7 @@ class Connection:
     @property
     def pages_read(self) -> int:
         """Buffer-pool misses since the last reset_counters()."""
+        self._check_thread()
         return self.pool.misses
 
 
@@ -235,6 +273,7 @@ class Connection:
         """Buffer-pool hits since the last reset_counters(). These cost no
         I/O and are deliberately NOT part of pages_read.
         """
+        self._check_thread()
         return self.pool.hits
 
 
@@ -244,6 +283,7 @@ class Connection:
         reset_counters() -- rows LOOKED AT, which for a SeqScan is the
         whole table however few rows come back.
         """
+        self._check_thread()
         return self.pool.rows_examined
 
 
@@ -251,87 +291,121 @@ class Connection:
         """Zero the measurement counters, immediately before the statement
         being measured.
         """
+        self._check_thread()
         self.pool.reset_counters()
 
 
     # ---- transactions (week 5, session 4) ---------------------------
     #
-    # self._txn is set ONLY by an explicit BEGIN and cleared ONLY by the
-    # matching COMMIT/ROLLBACK -- an implicit (autocommit) transaction is
-    # begun and finished entirely inside _run_mutation() and never touches
-    # this attribute, so there is nothing here to distinguish "no
-    # transaction" from "mid-autocommit": from self._txn's point of view
-    # they're the same state, None.
+    # self._txn is set by an explicit BEGIN and cleared by the matching
+    # COMMIT/ROLLBACK -- and, for the length of one statement only, by
+    # _run_mutation() while an autocommit write runs, so the statement body
+    # reaches its transaction the same way in both modes.
 
-
-    def _begin(self) -> None:
-        """Open an explicit transaction. The BoundBegin dispatch in
+    def _begin(self, *, immediate: bool = False) -> None:
+        """Open an explicit transaction. The Begin dispatch in
         execute() calls this directly.
 
-        Constructs the Journal and Transaction, calls journal.begin(), and
-        wires the hook onto both self.pager._txn and self.pool._txn last --
-        so a half-constructed Transaction is never visible through the hook
-        if something above it raises.
+        Constructs a Transaction and, by default, nothing else -- it starts
+        read-only (week6-concurrency.md SS37.2): no Journal, no
+        pager._txn/pool._txn. Its first real write promotes it lazily,
+        inside will_modify().
+
+        `immediate=True` (BEGIN IMMEDIATE) claims the global writer lock
+        right here instead of leaving that to the first write -- see
+        Transaction.lock_immediate().
         """
         if self._txn is not None:
             raise TransactionError("a transaction is already open")
-        journal = Journal(self.pager.path)
-        txn = Transaction(self.pager, self.pool, journal)
-        journal.begin(self.pager.page_count)
-        self.pager._txn = txn
-        self.pool._txn = txn
-        self._txn = txn
+        txn_id = self.db.next_txn_id()
+        self._txn = Transaction(
+            self.pager, self.pool, self.db.lock_manager, txn_id, timeout=self.busy_timeout
+        )
+        if immediate:
+            self._txn.lock_immediate()
 
 
     def _commit(self) -> None:
-        """Commit the open explicit transaction. The BoundCommit dispatch in
-        execute() calls this directly.
-
-        Unwiring the hook afterward is not optional: self._txn.commit()
-        deletes the journal, so a write that slipped through the hook after
-        this point would try to append to a file that no longer exists.
-        """
-        if self._txn is None:
-            raise TransactionError("no transaction is open")
-        self._txn.commit()
-        self.pager._txn = None
-        self.pool._txn = None
-        self._txn = None
+        """Commit the open transaction. The Commit dispatch in execute()
+        calls this directly."""
+        self._end_txn(commit=True)
 
 
     def _rollback(self) -> None:
-        """Roll back the open explicit transaction. The BoundRollback
-        dispatch in execute() calls this directly. Same unwiring reasoning
-        as _commit().
+        """Roll back the open transaction. The Rollback dispatch in
+        execute() calls this directly."""
+        self._end_txn(commit=False)
+
+
+    def _end_txn(self, *, commit: bool) -> None:
+        """The shared body of _commit()/_rollback(). Order matters at every
+        step:
+
+          1. Close this connection's open cursor. Its operator holds pins,
+             possibly on pages this transaction dirtied, and rollback's
+             pool.clear() refuses to drop a pinned page -- raising AFTER the
+             journal is already deleted, with every lock still held
+             (NOTES.md B6-3). A result set can't outlive its transaction
+             anyway: strict 2PL is about to drop the locks it reads under.
+          2. commit()/rollback() the transaction, but keep its locks.
+          3. Unwire the pager/pool hook. Still holding "__writer__", nobody
+             else can have claimed the hook yet -- the old version released
+             first and had to guard against another writer claiming it in
+             the gap (week6-concurrency.md SS38). The `is txn` guards stay
+             as a belt-and-braces check.
+          4. Rollback only, and only if this transaction changed the schema
+             (it holds "__schema__" EXCLUSIVE): a CREATE TABLE/CREATE INDEX
+             mutated the shared Catalog's in-memory maps directly, outside
+             any journal, and rollback() has no way to know. Reload it now,
+             while no other connection can bind (they all wait on
+             "__schema__"), rather than leaving stale tables visible.
+          5. Release every lock.
+
+        If step 2 raises, self._txn stays set: the caller still has an open
+        transaction and can ROLLBACK it.
         """
         if self._txn is None:
             raise TransactionError("no transaction is open")
-        self._txn.rollback()
-        self.pager._txn = None
-        self.pool._txn = None
+        txn: Transaction = self._txn
+        if self._open_cursor is not None:
+            self._open_cursor.close()
+            self._open_cursor = None
+        if commit:
+            txn.commit(release=False)
+        else:
+            txn.rollback(release=False)
+        if self.pager._txn is txn:
+            self.pager._txn = None
+        if self.pool._txn is txn:
+            self.pool._txn = None
         self._txn = None
+        if not commit and txn.holds_schema_write:
+            self.catalog.load()
+            self._last_seen_cookie = self.db.pager.schema_cookie
+        txn.release_locks()
 
 
-    def _run_mutation(self, body: Callable[[], object]) -> None:
-        """Run `body` (a CREATE TABLE / CREATE INDEX / INSERT / DELETE /
-        UPDATE's actual work) under a transaction, autocommitting if the
-        caller didn't open one explicitly.
+    def _run_mutation(self, body: Callable[[], object], implicit: Transaction | None) -> None:
+        """Run `body` (a CREATE TABLE / CREATE INDEX / ANALYZE / INSERT /
+        DELETE / UPDATE's actual work) under a transaction, autocommitting
+        if the caller didn't open one explicitly.
 
-        If self._txn is already set, an explicit transaction is open: body's
-        writes ride along it, and COMMIT/ROLLBACK is the caller's job, not
-        this method's. Otherwise this statement gets its own implicit
-        transaction -- begin, run body, commit on success or roll back and
-        re-raise on any exception.
+        `implicit` is the statement transaction execute() already created
+        (and took "__schema__" with) because no explicit transaction was
+        open. None means self._txn is the caller's explicit transaction:
+        body's writes ride along it, and COMMIT/ROLLBACK is the caller's
+        job. Otherwise this statement is its own transaction -- run body,
+        commit on success or roll back and re-raise on any exception.
 
         This is the one place that decides "does this statement get its own
         transaction, or ride an existing one" -- every mutating call site in
         execute() goes through it instead of deciding for itself, the same
         reason get_page_for_write is the one place that decides write intent.
         """
-        if self._txn is not None:
+        if implicit is None:
             body()
             return
-        self._begin()
+        self._txn = implicit
         try:
             body()
         except BaseException:
@@ -340,6 +414,25 @@ class Connection:
         else:
             self._commit()
 
+
+    def _statement_txn(self) -> tuple[Transaction, bool]:
+        """The transaction a statement locks through: the open explicit
+        one, or a fresh implicit one this statement alone uses (SS38:
+        "autocommit still gets a transaction -- for the locks, not the
+        journal"). Cheap now that a Transaction starts read-only and only
+        promotes to a real Journal on its first write (SS37.2) -- a pure
+        read never reaches that promotion at all.
+
+        Second element is True when the statement, not an explicit
+        COMMIT/ROLLBACK, owns finishing it.
+        """
+        if self._txn is not None:
+            return self._txn, False
+        txn_id = self.db.next_txn_id()
+        return (
+            Transaction(self.pager, self.pool, self.db.lock_manager, txn_id, timeout=self.busy_timeout),
+            True,
+        )
 
     @contextmanager
     def transaction(self) -> Generator[None]:
@@ -352,6 +445,7 @@ class Connection:
         via _run_mutation's first branch -- this method owns the
         begin/commit/rollback calls directly instead.
         """
+        self._check_thread()
         self._begin()
         try:
             yield
@@ -372,51 +466,103 @@ class Connection:
         execute() closes any still-open result cursor on this connection;
         multiple active cursors arrive with multiple connections.
         """
+        self._check_thread()
         if self._closed:
             raise ValueError("connection is closed")
         if self._open_cursor is not None:
             self._open_cursor.close()
             self._open_cursor = None
 
+        statement = parse(sql)
 
-        bound = bind(parse(sql), self.catalog, tuple(parameters))
-
-
-        if isinstance(bound, BoundBegin):
-            self._begin()
+        if isinstance(statement, Begin):
+            self._begin(immediate=statement.immediate)
             return Cursor(None, None, 0)
 
-
-        if isinstance(bound, BoundCommit):
+        if isinstance(statement, Commit):
             self._commit()
             return Cursor(None, None, 0)
 
-
-        if isinstance(bound, BoundRollback):
+        if isinstance(statement, Rollback):
             self._rollback()
             return Cursor(None, None, 0)
 
+        # Every other statement locks "__schema__" BEFORE reading the
+        # catalog: EXCLUSIVE if it's about to change the schema, SHARED
+        # otherwise (NOTES.md B6-7). Holding it SHARED means no DDL can be
+        # half-applied to page 1 or the shared Catalog while this statement
+        # reloads or binds against them, and none can commit underneath it
+        # before it finishes (an explicit transaction keeps it until COMMIT,
+        # strict 2PL; an autocommit SELECT until its cursor is drained).
+        stmt_txn, owns_txn = self._statement_txn()
+        implicit = stmt_txn if owns_txn else None
+        try:
+            if isinstance(statement, (CreateTable, CreateIndex)):
+                stmt_txn.lock_schema_write()
+            else:
+                stmt_txn.lock_schema_read()
+            # Another Connection's committed DDL moved the cookie: resync
+            # the shared Catalog before binding (week6-concurrency.md SS37.4).
+            if self.db.pager.schema_cookie != self._last_seen_cookie:
+                self.catalog.load()
+                self._last_seen_cookie = self.db.pager.schema_cookie
+            bound = bind(statement, self.catalog, tuple(parameters))
+        except BaseException:
+            if owns_txn:
+                stmt_txn.rollback()
+            raise
+
 
         if isinstance(bound, BoundCreateTable):
-            self._run_mutation(lambda: self.catalog.create_table(bound.statement, sql))
+            # CREATE TABLE writes a new sqlite_schema row into page 1, which
+            # always exists (page_id 1 <= any transaction's page_count_before)
+            # -- an EXISTING page, so it needs the same lock_for_write() that
+            # promotes this transaction to journalling (SS37.2) that
+            # Insert/Delete/Update get from inside their own open(). Nothing
+            # analogous to an operator's open() exists for DDL, so the call
+            # goes here instead, locking the table's own (not-yet-existing)
+            # name -- a second CREATE TABLE of the same name from another
+            # connection correctly queues behind this one.
+            def _run_create_table() -> None:
+                assert self._txn is not None
+                self._txn.lock_for_write(bound.statement.name)
+                self.catalog.create_table(bound.statement, sql)
+            self._run_mutation(_run_create_table, implicit)
             return Cursor(None, None, 0)
 
 
         if isinstance(bound, BoundCreateIndex):
-            self._run_mutation(lambda: self.catalog.create_index(bound.statement, sql))
+            def _run_create_index() -> None:
+                assert self._txn is not None
+                self._txn.lock_for_write(bound.statement.table)
+                self.catalog.create_index(bound.statement, sql)
+            self._run_mutation(_run_create_index, implicit)
             return Cursor(None, None, 0)
 
 
         if isinstance(bound, BoundAnalyze):
-            self.stats.analyze(bound.statement.target)
+            # ANALYZE writes quill_stat1 rows, so it is a writer like any
+            # other: run outside every transaction, its dirty pages were
+            # journalled into whichever OTHER transaction owned the pool
+            # hook at that moment, or written with no journal at all
+            # (NOTES.md B6-8). It also reads every table it measures.
+            def _run_analyze() -> None:
+                assert self._txn is not None
+                target = bound.statement.target
+                self._txn.lock_for_write(self.stats.table_name)
+                names = [target] if target is not None else [t.name for t in self.catalog.list_tables()]
+                for name in names:
+                    self._txn.lock_for_read(name)
+                self.stats.analyze(target)
+            self._run_mutation(_run_analyze, implicit)
             return Cursor(None, None, 0)
 
 
         if isinstance(bound, BoundInsert):
             def _run_insert() -> None:
-                with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                with build_operator(bound, self.pager, self.pool, self.catalog, txn=self._txn) as operator:
                     operator.next()
-            self._run_mutation(_run_insert)
+            self._run_mutation(_run_insert, implicit)
             return Cursor(None, None, 1)
 
 
@@ -425,30 +571,34 @@ class Connection:
 
             def _run_delete_or_update() -> None:
                 nonlocal rows_affected
-                with build_operator(bound, self.pager, self.pool, self.catalog) as operator:
+                with build_operator(bound, self.pager, self.pool, self.catalog, txn=self._txn) as operator:
                     operator.next()
                     rows_affected = operator.rows_affected
-            self._run_mutation(_run_delete_or_update)
+            self._run_mutation(_run_delete_or_update, implicit)
             return Cursor(None, None, rows_affected)
 
 
         if isinstance(bound, BoundExplain):
-            plan = build_operator(bound.select, self.pager, self.pool, self.catalog, self.stats)
-            text = plan.explain(verbose=True)
-            if bound.analyze:
-                # Drain for real, discarding rows -- EXPLAIN ANALYZE trades
-                # "free to run" for "the numbers are measured, not guessed",
-                # the same tradeoff chapter 12 makes for pages_read.
-                started = time.perf_counter()
-                actual_rows = 0
-                plan.open()
-                try:
-                    while plan.next() is not None:
-                        actual_rows += 1
-                finally:
-                    plan.close()
-                elapsed = time.perf_counter() - started
-                text += f"\nactual_rows={actual_rows} elapsed={elapsed:.6f}s"
+            try:
+                plan = build_operator(bound.select, self.pager, self.pool, self.catalog, self.stats, stmt_txn)
+                text = plan.explain(verbose=True)
+                if bound.analyze:
+                    # Drain for real, discarding rows -- EXPLAIN ANALYZE trades
+                    # "free to run" for "the numbers are measured, not guessed",
+                    # the same tradeoff chapter 12 makes for pages_read.
+                    started = time.perf_counter()
+                    actual_rows = 0
+                    plan.open()
+                    try:
+                        while plan.next() is not None:
+                            actual_rows += 1
+                    finally:
+                        plan.close()
+                    elapsed = time.perf_counter() - started
+                    text += f"\nactual_rows={actual_rows} elapsed={elapsed:.6f}s"
+            finally:
+                if owns_txn:
+                    stmt_txn.commit()
             result = ExplainResult((text,))
             result.open()
             cursor = Cursor(result, (("QUERY PLAN",),), -1)
@@ -456,23 +606,37 @@ class Connection:
             return cursor
 
 
-        operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats)
-        operator.open()
+        # BEGIN/COMMIT/ROLLBACK returned before binding; SELECT is all that's left.
+        assert isinstance(bound, BoundSelect)
+        operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats, stmt_txn)
+        try:
+            operator.open()
+        except BaseException:
+            if owns_txn:
+                stmt_txn.rollback()
+            raise
         description = tuple((_display_name(e),) for e in bound.expressions)
-        cursor = Cursor(operator, description, -1)
+        cursor = Cursor(operator, description, -1, implicit_txn=stmt_txn if owns_txn else None)
         self._open_cursor = cursor
         return cursor
 
 
     def close(self) -> None:
-        """Flush every dirty page and close the file. Idempotent.
+        """Roll back any open transaction, close any open cursor, and hand
+        this connection back to its Database. Idempotent.
 
         An explicit transaction still open at this point never committed,
         so it never happened -- close() rolls it back rather than flushing
         its dirty pages, which would both violate the write barrier
         (Pager.write_page's assertion) and, if the barrier weren't there,
         silently persist uncommitted data.
+
+        The pager and pool belong to the Database, shared with every other
+        Connection it handed out: closing them here broke every sibling
+        connection (NOTES.md B6-4). Database closes the file itself once
+        its LAST open connection closes.
         """
+        self._check_thread()
         if self._closed:
             return
         if self._txn is not None:
@@ -480,9 +644,8 @@ class Connection:
         if self._open_cursor is not None:
             self._open_cursor.close()
             self._open_cursor = None
-        self.pool.flush_all()
-        self.pager.close()
         self._closed = True
+        self.db._connection_closed()
 
 
     def __enter__(self) -> Self:
@@ -496,26 +659,15 @@ class Connection:
 
 
 def connect(path: str | Path) -> Connection:
-    """Open an existing database or create a new one.
+    """Open an existing database or create a new one, returning a single
+    Connection bound to the calling thread.
 
-
-    The exact string ":memory:" selects Pager.memory() and never creates a
-    file -- anything else, including a Path spelled ":memory:", is a real
-    path on disk.
+    A thin wrapper over Database (api/database.py), which is where the
+    pager/pool/catalog/lock-manager actually live as of week 6 session 3 --
+    this keeps every earlier week's single-Connection call sites unchanged.
+    A second thread wanting its own Connection on the same file should call
+    `.db.connect()` on one already open, not this function again.
     """
-    if path == _MEMORY_PATH:
-        pager = Pager.memory()
-    else:
-        path = Path(path)
-        pager = Pager.open(path) if path.exists() else Pager.create(path)
+    from quilldb.api.database import open_database
 
-
-    # Recovery completes before the pool exists -- there is no cache to
-    # invalidate because there is no cache yet (week5-transactions.md
-    # SS"Where it goes in connect()").
-    recover_if_needed(pager.path, pager)
-    pool = BufferPool(pager)
-    catalog = Catalog(pager, pool)
-    catalog.load()
-    stats = StatisticsCatalog(pager, pool, catalog)
-    return Connection(pager, pool, catalog, stats)
+    return open_database(path).connect()

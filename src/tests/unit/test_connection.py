@@ -997,8 +997,51 @@ def test_begin_rollback_on_memory_db_touches_no_filesystem(tmp_path: Path) -> No
     db.execute("INSERT INTO users VALUES (?, ?, ?)", (1, "ada", 36))
     db.execute("ROLLBACK")
     assert db.execute("SELECT * FROM users").fetchall() == []
-    db.close()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_rollback_updates_the_catalog_immediately_not_just_on_next_execute() -> None:
+    """Regression: Catalog.create_table() mutates the shared _tables dict
+    synchronously, at statement time -- not at commit time -- so a ROLLBACK
+    must resync it right away. Before the fix, _rollback() left the phantom
+    table visible to anything reading db.catalog directly (not just through
+    another execute()) until schema_cookie drift happened to trigger a lazy
+    reload on some later statement.
+    """
+    db = quilldb.connect(":memory:")
+    db.execute("BEGIN")
+    db.execute("CREATE TABLE foo (id INTEGER)")
+    assert "foo" in {t.name for t in db.catalog.list_tables()}
+
+    db.execute("ROLLBACK")
+    assert "foo" not in {t.name for t in db.catalog.list_tables()}
+    db.close()
+
+
+def test_rollback_does_not_corrupt_the_bootstrap_stats_table(tmp_path: Path) -> None:
+    """Regression: quill_stat1 is bootstrapped by StatisticsCatalog.__init__
+    calling catalog.create_table() directly in open_database(), outside any
+    transaction -- which bumps the pager's in-memory header (page_count,
+    schema_cookie) without writing it into page 1's bytes the way
+    Transaction.commit() does. Left unsynced, the first real transaction's
+    will_modify(1) would journal that stale header as "original", and
+    rolling back would restore it -- corrupting or losing quill_stat1,
+    which was never part of this transaction at all.
+    """
+    path = tmp_path / "t.db"
+    db = quilldb.connect(path)
+    db.execute("BEGIN")
+    db.execute("CREATE TABLE foo (id INTEGER)")
+    db.execute("ROLLBACK")
+    assert {t.name for t in db.catalog.list_tables()} == {"quill_stat1"}
+    db.close()
+
+    import subprocess
+
+    result = subprocess.run(
+        ["sqlite3", str(path), "PRAGMA integrity_check;"], capture_output=True, text=True, check=False
+    )
+    assert result.stdout.strip() == "ok"
 
 
 def test_transaction_context_manager_commits_on_clean_exit() -> None:

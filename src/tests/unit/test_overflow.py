@@ -154,8 +154,8 @@ def test_read_detects_a_cycle(pager, pool) -> None:
     the hand-built-fixture technique from §6.2 -- this can't be produced by
     write_overflow_chain itself, only by a corrupt file.
     """
-    page_a = pager.allocate_page()
-    page_b = pager.allocate_page()
+    page_a = pager._allocate_page()
+    page_b = pager._allocate_page()
 
 
     buf_a = pool.get_page(page_a)

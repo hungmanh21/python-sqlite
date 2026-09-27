@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 2, The B+Tree
 
 
-← [Index](README.md)  ·  Prev: [Week 1](week-1-storage.md)  ·  Next: [Week 3 — SQL](week-3-sql.md)
+← [Index](README.md)  ·  Prev: [Week 1](week1-storage.md)  ·  Next: [Week 3 — SQL](week3-sql.md)
 
 
 ---

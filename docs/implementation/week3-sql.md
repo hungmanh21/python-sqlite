@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 3, SQL Frontend and Executor
 
 
-← [Index](README.md)  ·  Prev: [Week 2](week-2-btree.md)  ·  Next: [Week 4 — Mutation and Indexes](week-4-mutation-and-indexes.md)
+← [Index](README.md)  ·  Prev: [Week 2](week2-btree.md)  ·  Next: [Week 4 — Mutation and Indexes](week4-mutation-and-indexes.md)
 
 
 ---

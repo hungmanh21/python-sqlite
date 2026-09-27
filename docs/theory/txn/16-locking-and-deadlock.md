@@ -3,7 +3,7 @@
 
 > **Read during week 6, before you write `txn/locks.py`.**
 >
-> **Time:** ~50 minutes. **Prerequisite:** [chapter 15](15-isolation-and-anomalies.md) — you need to know
+> **Time:** ~50 minutes. **Prerequisite:** [chapter 15](15-isolation-anomalies.md) — you need to know
 > what you're guaranteeing before you build the machinery that guarantees it.
 
 

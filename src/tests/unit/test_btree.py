@@ -40,7 +40,7 @@ def _leaf_cell(rowid: int) -> bytes:
 
 
 def _write_page(pager: Pager, pool: BufferPool, body: PageBody) -> int:
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     with pool.pinned(page_id, dirty=True) as raw:
         raw[:] = serialize_page(body)
     return page_id
@@ -293,7 +293,7 @@ def test_insert_releases_leaf_pin_when_overflow_write_fails(pager, pool, monkeyp
 
     # This fetch needs to evict the target leaf. It can only do so if insert()
     # released the leaf pin while propagating the overflow-write exception.
-    other_page = pager.allocate_page()
+    other_page = pager._allocate_page()
     with small_pool.pinned(other_page):
         pass
 
@@ -361,7 +361,7 @@ def test_delete_empty_leaf_unlinks_it_from_a_parent_with_three_children(pager, p
 
     assert [(decode_interior_table_cell(cell)) for cell in root.cells] == [(leaf_lo, 5)]
     assert root.right_child == leaf_hi
-    assert pager.allocate_page() == leaf_mid
+    assert pager._allocate_page() == leaf_mid
     validate_btree(pager, pool, bt.root)
 
 
@@ -400,7 +400,7 @@ def test_delete_from_one_of_two_root_children_leaves_a_single_child_root(pager, 
     assert root_body.page_type is PageType.INTERIOR_TABLE
     assert root_body.cells == []
     assert root_body.right_child == right
-    assert pager.allocate_page() == left
+    assert pager._allocate_page() == left
     validate_btree(pager, pool, root)
 
 

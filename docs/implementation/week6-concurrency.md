@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 6, Multi-Threaded Concurrency
 
 
-← [Index](README.md)  ·  Prev: [Week 5 — Transactions](week-5-transactions.md)  ·  Next: [Week 7 — Query Processing](week-7-query-processing.md)
+← [Index](README.md)  ·  Prev: [Week 5 — Transactions](week5-transactions.md)  ·  Next: [Week 7 — Query Processing](week7-query-processing.md)
 
 
 ---
@@ -10,7 +10,7 @@
 # Week 6 Spec — Locks, Threads, and Deadlock Detection ⭐
 
 
-> **Read [chapter 15](../theory/txn/15-isolation-and-anomalies.md) before you write any code this week**
+> **Read [chapter 15](../theory/txn/15-isolation-anomalies.md) before you write any code this week**
 > and [chapter 16](../theory/txn/16-locking-and-deadlock.md) before `locks.py`. Week 6 is the other week
 > where the first hour's decisions are structural: the `Database`/`Connection` boundary and "release locks
 > only at commit" are both things you cannot retrofit cleanly.
@@ -33,11 +33,22 @@ read-committed — is a bad time to find out.
 
 
 ```python
-db = quilldb.connect("app.db")          # a Database, thread-safe, shared
+db = quilldb.Database("app.db")         # ONE per file, thread-safe, shared
 
 
 with ThreadPoolExecutor(8) as pool:     # a Connection per thread, NOT shared
     pool.map(worker, [db.connect() for _ in range(8)])
+```
+
+
+**`connect()` does not change its return type.** `quilldb.connect(path)` still hands back a
+`Connection` — now one bound to a private `Database` that it owns and closes. Making it return a
+`Database` would break `__init__.py`'s `__all__`, every test in `src/tests/unit/test_connection.py`,
+and the differential harness, in exchange for nothing: `Database` is a new name, not a replacement one.
+
+
+```python
+conn = quilldb.connect("app.db")        # unchanged: a Connection, on a private Database
 ```
 
 
@@ -77,11 +88,20 @@ are worth restating because they're the two things easiest to break: locks are a
 src/quilldb/
 ├── txn/
 │   ├── locks.py            NEW — LockMode, LockManager, wait-for graph
-│   └── transaction.py      + acquire locks during execution, release at commit
+│   ├── transaction.py      + acquire locks during execution, release at commit
+│   └── journal.py          + ownership moves to Database — one -journal per file (§37.3)
 ├── api/
-│   ├── database.py         NEW — Database: pager, pool, lock manager, catalog
-│   └── connection.py       Connection: per-thread txn state and cursors
-├── storage/bufferpool.py   + latching, pin counts under lock, safe eviction
+│   ├── database.py         NEW — Database: pager, pool, lock manager, catalog, txn ids
+│   └── connection.py       Connection: per-thread txn state, cursors, _check_thread
+├── storage/
+│   ├── pager.py            + thread-safe page I/O, ONE allocate_page (§37.1, §37.3)
+│   └── bufferpool.py       + latching, pins under lock, safe eviction, narrowed clear()
+├── catalog/catalog.py      + re-load() when the schema cookie moved (§37.4)
+├── sql/
+│   ├── tokenizer.py        + IMMEDIATE keyword
+│   ├── parser.py           + BEGIN IMMEDIATE
+│   ├── ast.py              + Begin.immediate
+│   └── binder.py           + BoundBegin.immediate
 └── errors.py               + DeadlockError, LockTimeoutError, ThreadingError
 
 
@@ -89,12 +109,19 @@ src/tests/concurrency/      NEW
 ├── test_lock_manager.py
 ├── test_deadlock.py
 ├── test_transfer_stress.py     ← the deliverable
+├── test_pager_thread_safety.py
 └── test_pool_thread_safety.py
 
 
 benchmarks/concurrent.py        throughput vs thread count, for the README
 docs/concurrency.md             the isolation level and what it permits
+pyproject.toml                  + pytest-timeout (dev group), testpaths fix
 ```
+
+
+The four storage/catalog files are the ones the roadmap does not list, and §37 is why they are here.
+Week 5 left `pager`, `bufferpool`, `journal`, and `catalog` wired as though one thread existed —
+because one did.
 
 
 ---
@@ -396,15 +423,149 @@ silently adopts another tree's page. `integrity_check` will catch it — as "pag
 which is a good demonstration of why you keep running it.
 
 
+⚠️ There are currently **two** `allocate_page()` implementations, on `Pager` and on `BufferPool`, both
+writing `header.freelist_trunk` directly. Latching one leaves the race live in the other — see §37.3,
+which resolves it before this table's first row means anything.
+
+
 The catalog cache is the one that produces the weirdest bug reports. Bump the schema cookie on every DDL
-statement and have each `Connection` re-read the catalog when it changes; you already built the cookie in
-week 3 for exactly this purpose, and week 6 is where it stops being decoration.
+statement and have each `Connection` re-read the catalog when it changes.
+
+Be precise about what week 3 actually left you, though: `create_table()` and `create_index()` *write* the
+cookie, and **nothing anywhere reads it.** The read side — one `Catalog` on the `Database`, a
+`_last_seen_cookie` per `Connection`, a re-`load()` when it moved — is new code this week, not decoration
+being switched on. §37.4 sizes it.
 
 
 ---
 
 
-## 37. Thread-safe buffer pool
+## 37. Thread-safe storage — the pager first, then the pool
+
+
+Week 5 left five pieces of storage state that are correct for one thread and wrong for two. All five
+become reachable the moment a `Database` is shared, and none of them are in the roadmap as written.
+Do them before the stress test, not after: a stress test that runs on top of these bugs does not fail
+loudly, it fails one run in fifteen and looks like a B-tree bug.
+
+
+### 37.1 `Pager` is the least thread-safe object in the tree
+
+
+`read_page()` and `write_page()` are `self._file.seek(offset)` followed by a read or a write, on ONE
+shared file handle. Two threads interleaving between the seek and the read means thread A receives the
+page thread B asked for.
+
+
+The GIL does not save you. `seek` and `read` are two separate calls and the interpreter may switch
+between them; the GIL prevents data races, not race conditions (chapter 16 §16.7).
+
+
+```python
+# storage/pager.py
+    def read_page(self, page_id: int) -> bytearray:
+        """Stateless, offset-carrying I/O: os.pread performs the seek and the
+        read as one syscall, so there is no window between them to interleave
+        in — and no shared cursor for a second thread to move."""
+        return bytearray(os.pread(self._fd, PAGE_SIZE, (page_id - 1) * PAGE_SIZE))
+```
+
+
+⚠️ `Pager.memory()` is backed by `io.BytesIO`, which has no `pread`. The in-memory path needs a plain
+`threading.Lock` around seek-then-read instead, so this is two implementations, not one. Do not let
+`:memory:` go untested here — most of the unit suite runs on it.
+
+
+### 37.2 `pool._txn` / `pager._txn` is ONE slot
+
+
+`Connection._begin()` does `self.pager._txn = txn; self.pool._txn = txn`. That single hook drives both
+`will_modify()`'s journalling and `write_page()`'s barrier assertion. With N connections on one shared
+pool it is a global variable holding per-transaction state.
+
+
+It is sound — but only because `__writer__` is exclusive, so at most one writer exists at a time. The
+integrity of the journal is therefore a *consequence of the lock manager*, which is worth saying out
+loud rather than rediscovering at 2am. Two rules follow:
+
+
+- **A read-only transaction must never touch the hook.** §38's "autocommit still gets a transaction" is
+  about *locks*, not journalling. A `SELECT`'s implicit transaction takes SHARED and releases at commit;
+  it never writes, so it must not construct a `Journal` and must not assign `pool._txn`. If it does, it
+  clobbers a concurrent writer's hook and the barrier assertion starts passing when it should fire —
+  the assertion that is your last line of defence against the one unrecoverable ordering bug.
+- **Rename it while you are there.** `Database._writer_txn`, set and cleared under the writer lock, says
+  what it is. `pool._txn` reads like per-connection state and is not.
+
+
+### 37.3 There are TWO `allocate_page()` implementations
+
+
+`Pager.allocate_page()` and `BufferPool.allocate_page()` both mutate `pager._header.freelist_trunk`
+directly. Latch one and you ship the race in the other — and the DoD test below only exercises whichever
+one the operators happen to call.
+
+
+**Pick one before you latch anything.** `BufferPool.allocate_page()` is the one the tree actually uses
+(it has to seed a cache entry for the new page), so make `Pager.allocate_page()` private or delete it.
+The header fields involved — `freelist_trunk`, `freelist_count`, `page_count` — then have exactly one
+writer and one latch covers all three.
+
+
+`Journal` has the same shape of problem in miniature: it is constructed per-`Connection` from the
+database path, so N connections name one `-journal` file. Also sound only under `__writer__`. Move its
+ownership to `Database` and the soundness stops being a coincidence.
+
+
+### 37.4 The schema cookie is written but never read
+
+
+The roadmap says you built the cookie in week 3 "for exactly this purpose." Half true:
+`create_table()` and `create_index()` call `pager.bump_schema_cookie()`, and **nothing in the tree ever
+reads it.** `Catalog` caches `_tables`/`_indexes` in memory, and there is one `Catalog` per `connect()`
+today, so no invalidation has ever been needed.
+
+
+Week 6 builds the whole read side: one `Catalog` owned by the `Database`, a `_last_seen_cookie` per
+`Connection`, and a re-`load()` at the top of `execute()` when it moved. That is roughly forty lines and
+it is a session-3 concern (it is a `Database`-ownership question), not a freebie — which also means
+"cut the catalog-cache invalidation" is a bigger cut than it sounds like.
+
+
+### 37.5 Rollback's `pool.clear()` is a global operation on shared state
+
+
+`Transaction.rollback()` ends with `pool.clear()`, which drops every entry "dirty or clean, pinned or
+not". That is correct and necessary for week 5's single thread, because replay rewrote the file
+underneath the cache. With concurrent readers it detaches frames another thread is holding a live
+`bytearray` reference to: that thread keeps reading a buffer the pool has forgotten about, and the next
+`get_page()` hands out a second copy of the same page.
+
+
+Table-level 2PL does not cover this. Locks are per table; pins are per page, and *every* transaction
+touches page 1.
+
+
+| Option | How | Cost |
+|---|---|---|
+| Wait it out | rollback blocks until every pin count reaches 0 | a reader that never finishes blocks rollback forever, and no lock orders this wait |
+| Lock everyone out | the writer also takes EXCLUSIVE on a `"__schema__"` resource across the rollback | correct, but serializes rollback against all readers, including on tables it never touched |
+| **Narrow the blast radius** | `clear()` takes the set of pages replay actually restored and drops only those | needs `Transaction._journalled`, which already exists |
+
+
+**Recommendation: narrow it.** `Transaction` already tracks exactly which pages it journalled, and those
+plus page 1 are the only pages replay changed — every other cached page is still a faithful copy of the
+file. `clear(pages: set[int] | None = None)`, with `None` keeping today's wholesale behaviour for
+recovery, is a small change and it is the only one of the three that does not trade a correctness bug
+for a liveness bug.
+
+
+Pages above `page_count_before` are the exception worth naming: `truncate()` erased them, so they must
+leave the cache too, pinned or not. A reader cannot legitimately hold one — those pages did not exist
+when it started — so `discard()`ing them is safe, and asserting their pin count is 0 is a good tripwire.
+
+
+### 37.6 And then the pool itself
 
 
 ```python
@@ -439,26 +600,40 @@ class BufferPool:
 
 
 ```python
+def test_concurrent_reads_never_return_the_wrong_page(db):
+    """§37.1, and the cheapest test of the week. 8 threads each read a
+    DIFFERENT known page in a tight loop; every read must return the page it
+    asked for. Fails reliably on seek-then-read, passes on pread. Run it
+    against :memory: too — that path takes the latch, not pread."""
+
+
 def test_a_pinned_page_is_never_evicted_under_contention(db):
     """A cursor holds a pinned page while 7 threads thrash the pool. The pinned
     page's contents must be unchanged and its frame must be the same frame."""
 
 
-
-
 def test_concurrent_allocate_never_returns_the_same_page_twice(db):
     """The freelist race. 8 threads x 200 allocations; assert 1600 DISTINCT
     page numbers. This test is short, and it is the one that catches the bug
-    that would otherwise show up as mysterious tree corruption a week later."""
+    that would otherwise show up as mysterious tree corruption a week later.
+
+    Assert first that there is only ONE allocate_page() left to test (§37.3):
+    latching the pool's copy while the pager's copy survives means this passes
+    and the database still corrupts."""
     got = run_concurrent_allocations(db, threads=8, per_thread=200)
     assert len(set(got)) == len(got) == 1600
 
 
+def test_rollback_does_not_drop_a_readers_pinned_page(db):
+    """§37.5. Thread A holds a pinned page of table `t1` while thread B rolls
+    back a transaction that only touched `t2`. A's page must still be in the
+    pool afterwards — same frame, same contents."""
 
 
 def test_ddl_in_one_thread_is_visible_to_another(db):
     """Thread A creates an index; thread B must not keep planning against a
-    stale catalog. Checks the schema cookie path."""
+    stale catalog. Checks the schema cookie path — which is NEW code, not a
+    wiring job: nothing read the cookie before this week (§37.4)."""
 ```
 
 
@@ -490,9 +665,14 @@ lock should already be held. `SeqScan.open()` and `IndexScan.open()` take SHARED
 data belonging to that table, and locking them separately invents a second lock order for no benefit.
 
 
-**Autocommit still gets a transaction.** A bare `SELECT` opens an implicit transaction, takes SHARED, runs,
-commits, releases. Skipping the lock for "just a read" is how you get a read that observes a writer's
-half-applied page.
+**Autocommit still gets a transaction — for the locks, not for the journal.** A bare `SELECT` opens an
+implicit transaction, takes SHARED, runs, commits, releases. Skipping the lock for "just a read" is how
+you get a read that observes a writer's half-applied page.
+
+
+But a read-only transaction must NOT construct a `Journal` or assign `pool._txn` (§37.2): there is
+nothing to undo, and that hook has one slot which belongs to the writer. Make read-only the default and
+promote to a journalling transaction on the first `lock_for_write()`.
 
 
 ```python
@@ -503,11 +683,18 @@ def test_locks_are_held_until_commit_not_released_early(db):
     c.execute("BEGIN")
     c.execute("SELECT * FROM users").fetchall()     # takes SHARED
     other = db.connect()
+    other.busy_timeout = 0.2
     with pytest.raises((LockTimeoutError, DeadlockError)):
-        other.execute("UPDATE users SET age=1", timeout=0.2)   # must be blocked
+        other.execute("UPDATE users SET age=1")     # must be blocked
     c.execute("COMMIT")
-    other.execute("UPDATE users SET age=1")          # now fine
+    other.busy_timeout = 5.0
+    other.execute("UPDATE users SET age=1")         # now fine
 ```
+
+
+The timeout is a **connection attribute, not an `execute()` keyword.** `execute(sql, parameters)` is the
+DB-API shape week 3 committed to and `parameters` is positional #2, so a `timeout=` keyword there would
+be both a wart and a hazard. `sqlite3` spells it `busy_timeout` for the same reason.
 
 
 ---
@@ -520,6 +707,22 @@ def test_locks_are_held_until_commit_not_released_early(db):
 # tests/concurrency/test_transfer_stress.py
 
 
+def sum_balances(db) -> int:
+    """A Python-side fold, NOT `SELECT SUM(balance)`. Aggregates are week 7 —
+    there is no SUM or COUNT in the tokenizer yet, and writing this helper as
+    SQL turns the week's headline deliverable into a week-7 dependency.
+
+    Call it between phases, or take __writer__, so the fold sees one snapshot.
+    """
+    conn = db.connect()
+    try:
+        return sum(row[0] for row in conn.execute("SELECT balance FROM accounts"))
+    finally:
+        conn.close()
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(120)
 def test_sum_of_balances_never_changes(tmp_path):
     """THE deliverable. 8 threads, 10k transfers between random accounts.
 
@@ -555,8 +758,8 @@ def test_sum_of_balances_never_changes(tmp_path):
     assert sqlite3_integrity_check(tmp_path / "t.db") == "ok"
 
 
-
-
+@pytest.mark.slow
+@pytest.mark.timeout(600)
 @pytest.mark.parametrize("run", range(20))
 def test_stress_is_not_flaky(tmp_path, run):
     """A concurrency test that passed once has told you almost nothing."""
@@ -572,6 +775,15 @@ a recorded thread schedule is the difference between "it failed in CI once" and 
 `pytest-timeout`, or a watchdog thread that dumps all stack traces and aborts. The failure mode you're
 testing for includes "the process never finishes," and a test suite that hangs in CI is worse than one that
 fails.
+
+
+
+**The hang guard needs a dependency and a marker, neither of which exists yet.** `pytest-timeout` is
+not in `pyproject.toml` — add it to the `dev` group. And `addopts = "-m 'not slow'"` is already in
+force, so an unmarked 20×-parametrized stress test would run on every bare `pytest`; mark both stress
+tests `slow` and run them deliberately. While you are in that file, `testpaths = ["tests"]` has never
+matched this repo's `src/tests/` layout (pytest falls back to recursive discovery and warns) — adding
+`src/tests/concurrency/` is the moment to fix it to `["src/tests"]`.
 
 
 ```python
@@ -599,11 +811,16 @@ fails.
 |---|---|---|
 | 1 | `docs/concurrency.md`, errors, `LockManager` skeleton: compatibility, acquire/release, per-resource conditions | shared coexist, exclusive excludes, release wakes waiters |
 | 2 | Wait-for graph, cycle detection, youngest-victim policy, `__writer__` lock | a crossed pair produces exactly one victim and one commit |
-| 3 | `Database` / `Connection` split, `_check_thread`, transaction-id counter | using a `Connection` cross-thread raises `ThreadingError` |
-| 4 | Buffer-pool latching, pins under lock, no-steal eviction, the freelist race | 8×200 concurrent allocations yield 1600 distinct pages |
-| 5 | 2PL wiring in operator `open()`, autocommit locking, `BEGIN IMMEDIATE` | locks-held-until-commit test is green |
+| 3 | `Database`/`Connection` split, `_check_thread`, txn-id counter, `Catalog` + `Journal` ownership moved to `Database`, the schema-cookie read path (§37.4) | cross-thread `Connection` raises `ThreadingError`; DDL in one thread is visible in another |
+| 4 | **Storage safety: `pread`/`pwrite` + the `BytesIO` latch (§37.1), one surviving `allocate_page` (§37.3)**, then pool latching, pins under lock, no-steal eviction | 8 threads reading 8 pages never cross; 8×200 allocations yield 1600 distinct pages |
+| 5 | 2PL wiring in operator `open()`, read-only vs journalling transactions (§37.2), narrowed `clear()` (§37.5), `BEGIN IMMEDIATE` | locks-held-until-commit is green; rollback doesn't drop a reader's pinned page |
 | 6 | `busy_timeout`, FIFO waiters, the transfer stress test | sum of balances holds over 10k transfers |
 | 7 | 20× flake hunt, `benchmarks/concurrent.py`, finish `docs/concurrency.md` | stress test green 20 runs in a row; the table is in the README |
+
+
+**Session 4 grew.** It used to be "latch the pool"; it is now "make storage thread-safe, of which the
+pool is the last third." Sessions 3 and 5 each absorbed one §37 item too. That is the honest cost of the
+five things week 5 left single-threaded, and it is better paid here than during session 7's flake hunt.
 
 
 **Session 7 is not padding.** A concurrency bug that appears one run in fifteen will appear during a demo.
@@ -627,14 +844,26 @@ Budget the whole session for running the stress test repeatedly and fixing what 
 - [ ] `LockTimeoutError` and `DeadlockError` are distinct, and no genuine cycle produces the former
 - [ ] The single-writer `__writer__` lock removes lock upgrades entirely
 - [ ] `Connection` used from the wrong thread raises `ThreadingError` immediately
+- [ ] `quilldb.connect()` still returns a `Connection`; week 5's tests and the differential harness pass
+      unchanged
+- [ ] Page I/O is atomic per call: `os.pread`/`os.pwrite` on the disk path, a latch on the `:memory:`
+      `BytesIO` path — and both are tested
+- [ ] 8 threads reading 8 known pages in a loop never receive a page they did not ask for
+- [ ] Exactly ONE `allocate_page()` implementation remains; the other is deleted or made private
 - [ ] 8×200 concurrent `allocate_page()` calls return 1600 distinct pages (the freelist race)
+- [ ] A read-only transaction never constructs a `Journal` and never assigns the writer hook
+- [ ] `Journal` and `Catalog` are owned by `Database`, not constructed per-`Connection`
+- [ ] Rollback does not evict a concurrent reader's pinned page from a table it never touched
 - [ ] A pinned page is never evicted under pool contention
 - [ ] The buffer-pool latch is **never** held across disk I/O
-- [ ] DDL in one thread invalidates the other threads' catalog cache via the schema cookie
+- [ ] DDL in one thread invalidates the other threads' catalog cache via the schema cookie — and note the
+      cookie's **read side is new code this week**, not existing wiring
 - [ ] Transfer stress test: 8 threads × 10k transfers, sum unchanged, no negative balances, trees valid
+- [ ] `sum_balances` is a Python-side fold, not `SELECT SUM(...)` — aggregates are week 7
 - [ ] `integrity_check` is `ok` after the full stress run
 - [ ] The stress test passes **20 consecutive runs** with no flakes
-- [ ] Every concurrency test runs under a hang guard that fails rather than blocking CI
+- [ ] Every concurrency test runs under a hang guard that fails rather than blocking CI: `pytest-timeout`
+      in the dev group, stress tests marked `slow`
 - [ ] `benchmarks/concurrent.py` reports read and write throughput separately, with the GIL and
       single-writer ceilings stated plainly
 - [ ] The multi-process limitation is documented as out of scope, not left implied
@@ -642,5 +871,11 @@ Budget the whole session for running the stress test repeatedly and fixing what 
 
 
 **If the week runs short, cut in this order:** the benchmark table, then `BEGIN IMMEDIATE`, then the
-catalog-cache invalidation (single-threaded DDL is a documentable limitation). **Never cut** the transfer
-stress test, the deadlock test's "the other side commits" assertion, or the 20× flake hunt.
+catalog-cache invalidation (single-threaded DDL is a documentable limitation — but see §37.4: that is
+now a real ~40-line cut rather than a one-liner, so decide it at the start of session 3 instead of
+discovering it in session 7). **Never cut** §37.1's page-I/O fix, the transfer stress test, the deadlock
+test's "the other side commits" assertion, or the 20× flake hunt.
+
+
+Nothing in §37.1–37.5 is optional. They are the difference between a stress test that proves something
+and a stress test that passes because eight threads happened not to interleave.

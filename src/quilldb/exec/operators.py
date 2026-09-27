@@ -57,6 +57,7 @@ from quilldb.sql.binder import (
 )
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
+from quilldb.txn.transaction import Transaction
 
 
 class Operator(ABC):
@@ -127,15 +128,24 @@ class SeqScan(Operator):
     """Stream decoded records from a table's TableCursor in rowid order."""
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, table: TableSchema) -> None:
+    def __init__(
+        self, pager: Pager, pool: BufferPool, table: TableSchema, txn: Transaction | None = None
+    ) -> None:
         self.pager = pager
         self.pool = pool
         self.table = table
+        self.txn = txn
         self._cursor: TableCursor | None = None
         self._positioned = False
 
 
     def open(self) -> None:
+        # SHARED on the table before either cursor touches a page (SS38) --
+        # txn is None only for tests that build this operator directly,
+        # bypassing Connection/locking entirely (build_operator's own
+        # `stats=None` default follows the same convention).
+        if self.txn is not None:
+            self.txn.lock_for_read(self.table.name)
         self.close()  # re-opening resets rather than leaking the old cursor
         cursor = TableCursor(self.pager, self.pool, self.table.root_page)
         cursor.first()
@@ -240,11 +250,19 @@ class IndexScan(Operator):
     """
 
 
-    def __init__(self, pager: Pager, pool: BufferPool, table: TableSchema, path: AccessPath) -> None:
+    def __init__(
+        self,
+        pager: Pager,
+        pool: BufferPool,
+        table: TableSchema,
+        path: AccessPath,
+        txn: Transaction | None = None,
+    ) -> None:
         self.pager = pager
         self.pool = pool
         self.table = table
         self.path = path
+        self.txn = txn
         self._rowids: Iterator[int] | None = None
         self._cursor: TableCursor | None = None
 
@@ -296,6 +314,11 @@ class IndexScan(Operator):
         matching how SeqScan.open() builds its cursor. Re-opening must reset
         rather than leak, same rule as SeqScan.open().
         """
+        # SHARED on the TABLE, not the index -- the index is derived data
+        # belonging to the table, and locking them separately would invent
+        # a second lock order for no benefit (week6-concurrency.md SS38).
+        if self.txn is not None:
+            self.txn.lock_for_read(self.table.name)
         index = self.path.index
         self.close()  # re-opening resets rather than leaking the old cursor
         if not index:
@@ -546,15 +569,19 @@ class Insert(Operator):
         pool: BufferPool,
         statement: BoundInsert,
         indexes: Sequence[IndexSchema] = (),
+        txn: Transaction | None = None,
     ) -> None:
         self.pager = pager
         self.pool = pool
         self.statement = statement
         self.indexes = indexes
+        self.txn = txn
         self._attempted = False
 
 
     def open(self) -> None:
+        if self.txn is not None:
+            self.txn.lock_for_write(self.statement.table.name)
         self._attempted = False
 
 
@@ -672,16 +699,20 @@ class Delete(Operator):
         table: TableSchema,
         predicate: BoundExpression | None,
         indexes: Sequence[IndexSchema] = (),
+        txn: Transaction | None = None,
     ) -> None:
         self.pager = pager
         self.pool = pool
         self.table = table
         self.predicate = predicate
         self.indexes = indexes
+        self.txn = txn
         self._attempted = False
 
 
     def open(self) -> None:
+        if self.txn is not None:
+            self.txn.lock_for_write(self.table.name)
         self._attempted = False
         self.rows_affected = 0
 
@@ -740,6 +771,7 @@ class Update(Operator):
         assignments: tuple[BoundAssignment, ...],
         predicate: BoundExpression | None,
         indexes: Sequence[IndexSchema] = (),
+        txn: Transaction | None = None,
     ) -> None:
         self.pager = pager
         self.pool = pool
@@ -747,10 +779,13 @@ class Update(Operator):
         self.assignments = assignments
         self.predicate = predicate
         self.indexes = indexes
+        self.txn = txn
         self._attempted = False
 
 
     def open(self) -> None:
+        if self.txn is not None:
+            self.txn.lock_for_write(self.table.name)
         self._attempted = False
         self.rows_affected = 0
 
@@ -993,6 +1028,7 @@ def build_operator(
     pool: BufferPool,
     catalog: Catalog,
     stats: StatisticsCatalog | None = None,
+    txn: Transaction | None = None,
 ) -> Operator:
     """Translate a bound statement into an executable operator tree.
 
@@ -1019,6 +1055,12 @@ def build_operator(
     Catalog-backed StatisticsCatalog of their own, exactly the isolation
     those tests were written under before ANALYZE existed.
 
+    `txn=None` (the default) follows the same convention for locking
+    (week6-concurrency.md SS38): SeqScan/IndexScan/Insert/Delete/Update
+    only call lock_for_read()/lock_for_write() when a real Transaction is
+    supplied, so every pre-week-6 test calling build_operator() directly
+    keeps working unlocked.
+
 
     `Filter` is built ONLY from what the chosen path doesn't already
     guarantee -- the seek_terms a chosen IndexScan consumes are satisfied
@@ -1034,17 +1076,17 @@ def build_operator(
     """
     if isinstance(statement, BoundInsert):
         indexes = catalog.indexes_for(statement.table.name)
-        return Insert(pager, pool, statement, indexes)
+        return Insert(pager, pool, statement, indexes, txn)
 
 
     if isinstance(statement, BoundDelete):
         indexes = catalog.indexes_for(statement.table.name)
-        return Delete(pager, pool, statement.table, statement.where, indexes)
+        return Delete(pager, pool, statement.table, statement.where, indexes, txn)
 
 
     if isinstance(statement, BoundUpdate):
         indexes = catalog.indexes_for(statement.table.name)
-        return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes)
+        return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes, txn)
 
 
     indexes = catalog.indexes_for(statement.table.name)
@@ -1069,9 +1111,9 @@ def build_operator(
 
     source: Operator
     if path.kind == "index_scan":
-        source = IndexScan(pager, pool, statement.table, path)
+        source = IndexScan(pager, pool, statement.table, path, txn)
     else:
-        source = SeqScan(pager, pool, statement.table)
+        source = SeqScan(pager, pool, statement.table, txn)
 
 
     filter_expression = _residual_filter_expression(non_sargable, path.residual)

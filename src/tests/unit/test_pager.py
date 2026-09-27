@@ -56,7 +56,7 @@ def test_bump_schema_cookie_increments_and_persists(tmp_path) -> None:
 
 def test_write_then_read_is_faithful(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     payload = bytearray(PAGE_SIZE)
     payload[:5] = b"hello"
     pager.write_page(page_id, payload)
@@ -152,7 +152,7 @@ def test_read_page_past_physical_eof_reads_as_zeros(tmp_path) -> None:
 
 def test_header_bytes_is_the_live_header_serialized(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
-    pager.allocate_page()
+    pager._allocate_page()
     assert pager.header_bytes() == pager._header.to_bytes()
     pager.close()
 
@@ -164,7 +164,7 @@ def test_reload_header_resyncs_in_memory_state_from_disk(tmp_path) -> None:
     """
     path = tmp_path / "test.db"
     pager = Pager.create(path)
-    pager.allocate_page()
+    pager._allocate_page()
     pager.bump_schema_cookie()
     pager.close()  # persists page_count=2, schema_cookie=1
 
@@ -182,7 +182,7 @@ def test_reload_header_resyncs_in_memory_state_from_disk(tmp_path) -> None:
 def test_allocate_extends_file_when_freelist_empty(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
     assert pager.page_count == 1
-    new_id = pager.allocate_page()
+    new_id = pager._allocate_page()
     assert new_id == 2
     assert pager.page_count == 2
     pager.close()
@@ -190,10 +190,10 @@ def test_allocate_extends_file_when_freelist_empty(tmp_path) -> None:
 
 def test_free_then_allocate_reuses_page(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
-    page_id = pager.allocate_page()
-    pager.free_page(page_id)
+    page_id = pager._allocate_page()
+    pager._free_page(page_id)
 
-    reused = pager.allocate_page()
+    reused = pager._allocate_page()
     assert reused == page_id
     assert pager.page_count == 2  # reuse must not grow the file again
     pager.close()
@@ -203,26 +203,26 @@ def test_free_schema_root_page_rejected(tmp_path) -> None:
     """Page 1 holds the file header and the schema b-tree. It can never be freed."""
     pager = Pager.create(tmp_path / "test.db")
     with pytest.raises(ValueError):
-        pager.free_page(1)
+        pager._free_page(1)
     pager.close()
 
 
 def test_free_out_of_range_rejected(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
     with pytest.raises(PageOutOfRangeError):
-        pager.free_page(99)
+        pager._free_page(99)
     pager.close()
 
 
 def test_freelist_persists_across_reopen(tmp_path) -> None:
     path = tmp_path / "test.db"
     pager = Pager.create(path)
-    page_id = pager.allocate_page()
-    pager.free_page(page_id)
+    page_id = pager._allocate_page()
+    pager._free_page(page_id)
     pager.close()
 
     reopened = Pager.open(path)
-    reused = reopened.allocate_page()
+    reused = reopened._allocate_page()
     assert reused == page_id
     reopened.close()
 
@@ -242,12 +242,12 @@ def test_freed_pages_are_fully_zeroed(tmp_path) -> None:
     path = tmp_path / "test.db"
     pager = Pager.create(path)
 
-    pages = [pager.allocate_page() for _ in range(4)]
+    pages = [pager._allocate_page() for _ in range(4)]
     for page_id in pages:                      # dirty them like real rows would
         payload = bytearray(b"\xab" * PAGE_SIZE)
         pager.write_page(page_id, payload)
     for page_id in pages:
-        pager.free_page(page_id)
+        pager._free_page(page_id)
     pager.sync()
 
     for page_id in pages:
@@ -288,9 +288,9 @@ def test_write_page_barrier_assertion_fires_before_barrier_passed(tmp_path) -> N
 def test_truncate_shrinks_file_and_updates_page_count(tmp_path) -> None:
     path = tmp_path / "test.db"
     pager = Pager.create(path)
-    pager.allocate_page()
-    pager.allocate_page()
-    pager.allocate_page()
+    pager._allocate_page()
+    pager._allocate_page()
+    pager._allocate_page()
     assert pager.page_count == 4
 
     pager.truncate(2)
@@ -303,8 +303,8 @@ def test_truncate_shrinks_file_and_updates_page_count(tmp_path) -> None:
 
 def test_truncate_makes_pages_beyond_the_new_count_unreadable(tmp_path) -> None:
     pager = Pager.create(tmp_path / "test.db")
-    pager.allocate_page()
-    pager.allocate_page()
+    pager._allocate_page()
+    pager._allocate_page()
 
     pager.truncate(1)
 

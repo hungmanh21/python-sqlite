@@ -481,5 +481,5 @@ point, a C implementation written by other people confirms your file is structur
 ---
 
 
-**Next:** [15 — Isolation and the anomalies](15-isolation-and-anomalies.md) — what actually goes wrong
+**Next:** [15 — Isolation and the anomalies](15-isolation-anomalies.md) — what actually goes wrong
 when two transactions overlap, before you write a single lock.

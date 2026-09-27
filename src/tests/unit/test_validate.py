@@ -56,7 +56,7 @@ def _leaf_cell(rowid: int) -> bytes:
 
 
 def _write_page(pager: Pager, pool: BufferPool, body: PageBody) -> int:
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     with pool.pinned(page_id, dirty=True) as raw:
         raw[:] = serialize_page(body)
     return page_id
@@ -231,8 +231,8 @@ def test_wrong_page_type_raises(pager, pool) -> None:
 
 def test_overflow_cycle_is_detected(pager, pool) -> None:
     """A spilled cell whose overflow chain loops back on itself."""
-    page_a = pager.allocate_page()
-    page_b = pager.allocate_page()
+    page_a = pager._allocate_page()
+    page_b = pager._allocate_page()
     with pool.pinned(page_a, dirty=True) as raw_a:
         raw_a[0:4] = page_b.to_bytes(4, "big")
     with pool.pinned(page_b, dirty=True) as raw_b:

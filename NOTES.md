@@ -246,3 +246,179 @@ where the *assumption* was the interesting part.
   anything else — an uncommitted transaction never happened, so `close()` undoes it rather than
   flushing it. *Lesson: "the caller will always clean up first" is a claim about callers, not
   about the type system — it needs an explicit check exactly where it's cheapest to add one.*
+
+---
+
+## Week 6 — locks, threads, and deadlock detection
+
+### B6-1 ★ Two bugs wearing one flaky test — a clock quirk hiding a real missed-wakeup
+- **Symptom:** `test_waiters_are_fifo_so_nobody_starves` failed intermittently (roughly half the
+  runs), with a queued reader apparently granted while a writer was still ahead of it in line —
+  but the four other session-1 tests (including `test_exclusive_excludes`, which blocks the exact
+  same way) never once failed across hundreds of runs.
+- **Assumed (round 1):** a blocked `LockManager.acquire()` reader "unexpectedly granted" meant the
+  compatibility/FIFO check in `acquire()` had a real ordering bug — the natural read, since that's
+  the only code that decides who gets granted.
+- **Actually (round 1):** it wasn't the FIFO check. Isolated with a bare `threading.Condition` and
+  zero `LockManager` code: one thread blocked in `cond.wait(timeout=5.0)`, a second thread only
+  doing `with cond: pass` in a tight loop (no `notify()` anywhere) — and the waiter woke up
+  **early**, reporting a timeout after ~3.4 real seconds. Heavy contention on a `Condition`'s
+  underlying lock from other threads can make `wait(timeout=...)` return before the requested time
+  elapses on this environment (WSL2's virtualized clock under load is the leading suspect, not
+  proven). The FIFO test was the only one of the five hammering the *same* condition from six
+  threads at once — enough concurrent lock traffic to trigger it; the two-thread
+  `test_exclusive_excludes` never generated enough contention to.
+- **Fix (round 1):** hardened `acquire()`'s wait loop to never trust `wait()`'s return value as the
+  timeout signal by itself — it now always re-derives "did I actually time out" from
+  `deadline - time.monotonic()` at the top of the next loop iteration, so a spurious early wakeup
+  just costs one extra loop instead of a false `LockTimeoutError`. Then rewrote the test to stop
+  racing a short (0.1s) `acquire()` timeout against wall-clock threading, using `timeout=None` on
+  the blocking calls instead (a `None` timeout can't expire early — it's purely notify-driven) and
+  proving order by polling `LockManager`'s own internal `waiters`/`holders` state, the way other
+  tests in this repo already reach into `pager._header`.
+- **Assumed (round 2):** with the clock dependency gone, the test would be clean.
+- **Actually (round 2):** a *different*, genuine bug immediately surfaced, because `timeout=None`
+  removed the thing that had been silently working around it: readers 3 through 7 queued correctly
+  behind the writer, the writer was correctly granted first — and then only reader 3 ever woke up.
+  Readers 4-7 hung forever. `acquire()` only called `entry.condition.notify_all()` from
+  `release_all()`. When N transactions queue behind each other with no `release_all()` in between,
+  the one `notify_all()` that wakes the queue lets only the front waiter (whoever's `grantable()`
+  is now `True`) through; nobody notifies the *next* waiter that removing that front entry changed
+  what's grantable for them. They go back to sleep waiting for a notification that never comes.
+  This was real and present the whole time — the original test's *short timeouts* had been quietly
+  masking it, since each reader's own timeout loop re-polled `grantable()` on its own schedule
+  regardless of whether anyone notified it.
+- **Fix (round 2):** every successful grant inside `acquire()` — not just `release_all()` — now
+  calls `entry.condition.notify_all()` before returning, so leaving the front of the queue always
+  gives the next waiter a chance to recheck. *Lesson: a flaky concurrency test can be two bugs deep.
+  The first fix (stop trusting a wobbly clock) was necessary but made the test's own masking effect
+  disappear too, which is what exposed the second, real bug. Don't stop investigating just because
+  the first plausible cause checks out — especially not for concurrency code, where a "fix" that
+  only changes the odds of triggering a bug (rather than removing the mechanism) can look identical
+  to a real fix for a long time.*
+
+### Week 6 review — found after the suite was green
+
+B6-2 through B6-9 all came out of a review pass over the finished week, with every test already
+passing. Each has a repro in `src/tests/concurrency/test_week6_regressions.py`, and each of those
+tests was confirmed to **fail** against the pre-fix source before being trusted to pass after it.
+
+### B6-2 ★ A rolled-back row that `integrity_check` called `ok`
+- **Symptom:** connection `c2` ran `BEGIN` on a 3-page file; `c1` committed 200 inserts, growing it
+  to 30 pages; `c2` inserted one row, then `ROLLBACK`. After reopening, `sqlite3` still saw the
+  rolled-back row — and `PRAGMA integrity_check` said `ok`, because the file was structurally
+  perfect. It just contained a row that was never committed.
+- **Assumed:** `Transaction.__init__` is "when the transaction starts", so it's the right moment to
+  snapshot `_page_count_before` — true all through week 5, with one connection.
+- **Actually:** with concurrency there are two different moments: when a transaction is *created*
+  and when it becomes *the writer*. A deferred `BEGIN` (or an autocommit statement queued on
+  `"__writer__"`) can sit between them while other writers commit. Every page they commit lands
+  above the stale snapshot, so `will_modify()` classified pages 4–30 as "allocated by this
+  transaction" — never journalled, because rollback's `truncate()` supposedly erases them for free.
+  Rollback then had no original bytes to restore.
+- **Fix:** `Transaction._acquire_writer()` re-snapshots `page_count` the first time the transaction
+  holds `"__writer__"` — the moment `page_count` stops moving. `journal.begin()` now records that same
+  snapshot rather than the live count, so recovery truncates to the same point rollback does.
+  *Lesson: `integrity_check` is an acceptance test for the **format**, not for **atomicity**. A
+  transaction bug that produces a valid file is invisible to it; only asserting the actual contents
+  catches it.*
+
+### B6-3 An application error that locked the whole database
+- **Symptom:** inside `with conn.transaction():`, a `DELETE`, a `SELECT` with one `fetchone()`, then
+  the app raised `KeyError`. The caller got `ValueError: page 5 is still pinned` instead, and every
+  other connection's next write timed out on `"__writer__"` — permanently.
+- **Assumed:** session 5's narrowed `pool.clear(self._journalled)` (§37.5) was safe to raise on a
+  pinned page, because 2PL guarantees nobody else pins a page this transaction wrote.
+- **Actually:** *nobody else*, true — but this transaction's own open cursor can. `execute("ROLLBACK")`
+  closes the open cursor first; `transaction()` and `close()` roll back directly and didn't. The
+  raise came after `journal.delete()` and before `release_all()`: a half-finished rollback holding
+  every lock it had.
+- **Fix:** `Connection._end_txn()` (shared by commit and rollback) closes the open cursor first,
+  every time. *Lesson: "nothing else can hold X" arguments need "…including me" checked
+  separately.*
+
+### B6-4 Closing one connection closed them all
+- **Symptom:** `c1.close()` then `c2.execute(...)` → `ValueError: truncate of closed file`. The
+  transfer stress test had even documented it and worked around it ("deliberately never closed").
+- **Assumed:** `Connection.close()` keeping its week-3 body (`pool.flush_all(); pager.close()`) was
+  fine after session 3 moved the pager and pool into `Database`.
+- **Actually:** after session 3 those objects belong to the `Database`, shared by every connection.
+  One connection closing them closed the file for all of them — and `flush_all()` with another
+  connection mid-write would have tripped the write-barrier assertion on its pre-barrier pages.
+- **Fix:** `Database` ref-counts open connections; `Connection.close()` rolls back, closes its
+  cursor, and reports in. The last one out flushes and closes the file, so every single-connection
+  caller behaves exactly as before.
+
+### B6-5 ★ A deadlock resolved by whichever timer fired first
+- **Symptom:** txn 2 blocks on `A` (held by 1). Then txn 1 blocks on `B` (held by 2), closing the
+  cycle. Across 5 runs: 3 times txn 2 got `DeadlockError` 0.15–1s late; 2 times txn 1 — the one that
+  should survive — got `LockTimeoutError` on a genuine cycle, which the week-6 checklist forbids.
+- **Assumed:** session 2's "not me, so wait" rule was complete: the real victim's own `acquire()`
+  walks the same graph from itself and raises for itself.
+- **Actually:** only if it's awake to walk it. The victim ran detection when *it* blocked — before
+  the cycle existed — and has been asleep in `wait()` ever since. Nothing in a deadlock ever releases
+  a lock the victim waits on (that's what deadlock means), so no `notify_all()` comes. It only
+  re-checks at its own timeout, and by then it's a race between two timers. The `test_deadlock.py`
+  tests never caught it because every one of them blocks the *youngest* transaction last.
+- **Fix:** the detector records the victim in `LockManager._doomed` and wakes the victim's resource
+  via `_wake()`, which drops the detector's own condition before taking the victim's (holding two
+  entry conditions at once is a lock-order inversion between two concurrent detectors). The victim's
+  loop checks `_doomed` first thing. `_detect_deadlock` now runs under `_latch` with a
+  `tuple(entry.holders)` snapshot, so the walk sees one consistent graph instead of iterating
+  another resource's dict while its owner resizes it.
+
+### B6-6 A timed-out queue head that nobody noticed leaving
+- **Symptom:** reader 1 holds `SHARED`; writer 2 queues for `EXCLUSIVE` and times out; reader 3,
+  queued behind 2 by FIFO, is now compatible with everything held — and slept until its own timeout.
+- **Assumed:** B6-1's fix covered wakeups: every *grant* notifies the queue.
+- **Actually:** B6-1 covered one of three ways out of the queue. A waiter leaving on
+  `LockTimeoutError` or `DeadlockError` changes the queue head just as much, and notified no one.
+- **Fix:** the `notify_all()` moved into `acquire()`'s `finally`, covering every exit. *Lesson: the
+  same missed-wakeup twice; B6-1's fix was written at the event ("a grant") instead of the state
+  change ("the queue head moved").*
+
+### B6-7 Other connections could see a `CREATE TABLE` before it committed
+- **Symptom:** `c1: BEGIN; CREATE TABLE u`, then `c2: EXPLAIN SELECT * FROM u` succeeded, planning a
+  table that `c1` was about to roll back. (A plain `SELECT` hid it by blocking on `u`'s table lock.)
+- **Assumed:** the schema-cookie check (§37.4) was enough — each connection reloads when the cookie
+  moves.
+- **Actually:** the cookie moves in memory the moment DDL runs, not when it commits, and
+  `create_table()` edits the one shared `Catalog` directly. Worse, the reload itself read page 1
+  (the `sqlite_schema` root) with no lock at all, while the DDL writer could be mid-way through
+  changing it. Page 1 and the catalog were the one piece of shared state with no resource in the
+  lock manager.
+- **Fix:** a `"__schema__"` resource, first in the lock order (docs/concurrency.md, "Lock order").
+  Every statement takes it before binding — `SHARED`, or `EXCLUSIVE` for DDL. DDL rollback reloads
+  the catalog *before* releasing its locks, which meant splitting release out of
+  `Transaction.commit()`/`rollback()` (`release=False` + `release_locks()`); as a side effect,
+  `_end_txn` now unwires the pager/pool hook while still holding `"__writer__"`, which removes the
+  session-5 unwiring race structurally instead of guarding against it.
+
+### B6-8 `ANALYZE` wrote outside every transaction
+- **Symptom:** `c1: BEGIN; INSERT ...`, then `c2: ANALYZE` ran straight through instead of waiting
+  for the writer. Reading the path it took: its `quill_stat1` writes go through `get_page_for_write`
+  while `pool._txn` is **`c1`'s** transaction, so they're journalled into `c1`'s journal and `c1`'s
+  `ROLLBACK` would silently erase `c2`'s statistics; with no writer at all, they're written with no
+  journal. (The regression test pins the observable half: `ANALYZE` must block.)
+- **Assumed:** `ANALYZE` is bookkeeping, not a "real" write — it had never been routed through
+  `_run_mutation`.
+- **Actually:** any write through the pool is a real write.
+- **Fix:** `ANALYZE` runs through `_run_mutation` like every other writer: `EXCLUSIVE` on
+  `quill_stat1` (via `StatisticsCatalog.table_name`) plus `SHARED` on each table it measures.
+
+### B6-9 `BEGIN IMMEDIATE` reserved a word SQLite doesn't
+- **Symptom:** `CREATE TABLE flags (immediate INTEGER)` stopped parsing once `BEGIN IMMEDIATE`
+  added `IMMEDIATE` to the keyword table.
+- **Fix:** `_begin()` matches an identifier whose lexeme is `immediate` rather than a dedicated
+  token, so `immediate` stays a legal column or table name, as it is in SQLite.
+
+### Hardening from the same review (no observed failure)
+- `Pager.reload_header()` and `restore_page()` still used the buffered `seek()`+`read()/write()`
+  after session 4 moved everything else to `pread`/`pwrite`. Verified in isolation that a buffered
+  read after an `os.pwrite` to the same offset returns the **old** bytes; it didn't reproduce through
+  the engine only because the buffered write in `restore_page` happens to invalidate the buffer
+  first. Both now follow the same `pread`/`pwrite`-or-`_io_lock` split as `read_page`/`write_page`,
+  and `truncate()` takes `_io_lock` (the `:memory:` path shares one `BytesIO` position with readers).
+- Stale `TODO(human)` blocks on already-implemented code were rewritten as plain comments
+  (`locks.py`, `transaction.py`, `database.py`, `connection.py`, `bufferpool.py`, the transfer stress
+  test), and the unused `Database._writer_txn` was removed.

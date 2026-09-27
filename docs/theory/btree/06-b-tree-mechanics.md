@@ -3,7 +3,7 @@
 
 > **Read during week 2, before the split sessions (6 and 7).**
 >
-> **Time:** ~50 minutes. **Prerequisite:** [chapter 05](05-why-b-trees.md) for the *why*; [chapter 02](../storage/02-the-slotted-page.md) for the page layout this all sits on.
+> **Time:** ~50 minutes. **Prerequisite:** [chapter 05](05-why-b-trees.md) for the *why*; [chapter 02](../storage/02-slotted-page.md) for the page layout this all sits on.
 >
 > This is the chapter for the hard part. `guide.md` warns that week 2 sessions 6–7 will overflow their two hours; `references.md` says "this is the week where a good walkthrough saves you the most time." Both are right. Read §6.4 and §6.6 before you start coding, not when you're stuck.
 
@@ -176,7 +176,7 @@ So **why bother?** Two reasons:
 ⚠️ Binary search over the *slot array* is what makes this work — you binary-search the sorted 2-byte offsets and dereference to read each key (chapter 02 §2.3). You cannot binary-search the cell content, because it's in arbitrary order. This is the payoff for the slotted page design and it's worth noticing that the two chapters lock together here.
 
 
-`docs/implementation/week-2-*.md` session 2 has you build this against a **hand-built page** before insert works. Do it that way. Testing search against a fixture you constructed by hand means a failure is unambiguously in search, not in insert.
+`docs/implementation/week2-*.md` session 2 has you build this against a **hand-built page** before insert works. Do it that way. Testing search against a fixture you constructed by hand means a failure is unambiguously in search, not in insert.
 
 
 ---
@@ -757,5 +757,5 @@ Before starting week 2, the two things from these chapters that will change your
 ---
 
 
-**Next:** [07 — From SQL text to a tree](../sql/07-from-sql-text-to-a-tree.md) — tokenization, ASTs,
+**Next:** [07 — From SQL text to a tree](../sql/07-from-text-sql-to-a-tree.md) — tokenization, ASTs,
 recursive-descent statements, and Pratt expression parsing.

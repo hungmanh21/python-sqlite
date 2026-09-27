@@ -3,7 +3,7 @@
 
 > **Read at the start of week 2.** The theory behind everything in `btree/`.
 >
-> **Time:** ~40 minutes. **Prerequisite:** [chapter 04](../storage/04-the-buffer-pool.md). The arithmetic in §5.3 is the centre of the chapter.
+> **Time:** ~40 minutes. **Prerequisite:** [chapter 04](../storage/04-buffer-pool.md). The arithmetic in §5.3 is the centre of the chapter.
 
 
 ---

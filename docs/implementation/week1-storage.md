@@ -1,7 +1,7 @@
 # quilldb — Implementation Plan: Week 1, Storage and Codec
 
 
-← [Index](README.md)  ·  Next: [Week 2 — B+Tree](week-2-btree.md)
+← [Index](README.md)  ·  Next: [Week 2 — B+Tree](week2-btree.md)
 
 
 ---
@@ -795,7 +795,7 @@ This is SQLite's exact layout (fileformat2.html §1.3). Note what that means:
 page 1 is NOT header-only. It is simultaneously the file header (bytes 0-99)
 and the root b-tree page of `sqlite_schema`, whose own page header begins at
 byte 100. Page 1 therefore has 100 fewer usable bytes than every other page.
-See docs/theory/storage/01-pages-and-the-pager.md §1.6.
+See docs/theory/storage/01-pages-and-pager.md §1.6.
 """
 
 

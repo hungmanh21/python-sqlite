@@ -36,6 +36,7 @@ def _crash_after_barrier(path: pathlib.Path, rows: range) -> None:
 
     with db.pool.pinned_for_write(SCHEMA_ROOT_PAGE) as page:
         page[:FILE_HEADER_SIZE] = db.pager.header_bytes()
+    assert txn._journal is not None
     txn._journal.commit_barrier()
     txn.barrier_passed = True
     db.pool.flush_all()

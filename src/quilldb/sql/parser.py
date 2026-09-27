@@ -319,7 +319,15 @@ class Parser:
 
     def _begin(self) -> Begin:
         self._expect(TokenType.BEGIN, "expected BEGIN")
-        return Begin()
+        # IMMEDIATE is matched as an identifier, not a keyword: SQLite
+        # doesn't reserve it, so a column or table named `immediate` has to
+        # keep parsing (NOTES.md B6-9).
+        immediate = False
+        token = self._peek()
+        if token.type is TokenType.IDENTIFIER and token.lexeme.casefold() == "immediate":
+            self._advance()
+            immediate = True
+        return Begin(immediate)
 
 
     def _commit(self) -> Commit:

@@ -40,7 +40,7 @@ def _new_tree(pager: Pager, pool: BufferPool) -> BTree:
     sqlite_schema (§1.6) and never used as a bare table root, matching every
     other insert()-driven test in this codebase.
     """
-    root = pager.allocate_page()
+    root = pager._allocate_page()
     with pool.pinned(root, dirty=True) as raw:
         raw[:] = serialize_page(PageBody(PageType.LEAF_TABLE))
     return BTree(pager, pool, root)

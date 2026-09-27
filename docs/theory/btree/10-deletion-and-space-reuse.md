@@ -4,7 +4,7 @@
 > **Read at the start of week 4, before you write `BTree.delete()`.** Covers roadmap week 4's
 > `DELETE`/`UPDATE` operators and B+tree deletion.
 >
-> **Time:** ~35 minutes. **Prerequisites:** [chapter 02 §2.4](../storage/02-the-slotted-page.md) (the
+> **Time:** ~35 minutes. **Prerequisites:** [chapter 02 §2.4](../storage/02-slotted-page.md) (the
 > three kinds of free space), [chapter 06](06-b-tree-mechanics.md) (cells, splits, the validator).
 
 

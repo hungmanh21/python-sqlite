@@ -105,10 +105,10 @@ both halves incomprehensible.
 
 | #   | Chapter                                                                   | What you'll be able to explain afterwards                                                                                                                    |
 | --- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 01  | [Pages and the pager](storage/01-pages-and-the-pager.md)                  | Why fixed-size numbered pages beat every alternative, why the pager indirection is the most valuable line you draw all project, and how the freelist works   |
-| 02  | [The slotted page](storage/02-the-slotted-page.md)                        | How variable-length rows fit in a fixed-size box, why two regions grow toward each other, and what fragmentation actually costs                              |
+| 01  | [Pages and the pager](storage/01-pages-and-pager.md)                  | Why fixed-size numbered pages beat every alternative, why the pager indirection is the most valuable line you draw all project, and how the freelist works   |
+| 02  | [The slotted page](storage/02-slotted-page.md)                        | How variable-length rows fit in a fixed-size box, why two regions grow toward each other, and what fragmentation actually costs                              |
 | 03  | [Encoding: varints and records](codec/03-encoding-varints-and-records.md) | Why numbers aren't stored as 8 bytes, how a manifest-then-body layout lets you read column 5 without decoding columns 1–4, and the endianness trap           |
-| 04  | [The buffer pool](storage/04-the-buffer-pool.md)                          | Caching theory from first principles, why LRU is wrong for table scans, what pin counts protect against, and the dirty-page rule that data loss hides behind |
+| 04  | [The buffer pool](storage/04-buffer-pool.md)                          | Caching theory from first principles, why LRU is wrong for table scans, what pin counts protect against, and the dirty-page rule that data loss hides behind |
 
 
 ### Part 2 — Week 2: The B+Tree
@@ -125,7 +125,7 @@ both halves incomprehensible.
 
 | #   | Chapter                                                          | What you'll be able to explain afterwards                                                                                                                                                         |
 | --- | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 07  | [From SQL text to a tree](sql/07-from-sql-text-to-a-tree.md)     | Why tokenization and parsing are separate, how an AST preserves meaning, how Pratt binding powers encode precedence, and why quilldb handwrites a parser while SQLite uses Lemon                  |
+| 07  | [From SQL text to a tree](sql/07-from-text-sql-to-a-tree.md)     | Why tokenization and parsing are separate, how an AST preserves meaning, how Pratt binding powers encode precedence, and why quilldb handwrites a parser while SQLite uses Lemon                  |
 | 08  | [The catalog and binding](catalog/08-the-catalog-and-binding.md) | How page 1 bootstraps a self-describing database, why SQLite stores CREATE text, what the schema cookie invalidates, and why names and parameters disappear before execution                      |
 | 09  | [Iterator execution](exec/09-iterator-execution.md)              | How open/next/close streams rows through composable operators, how SQL's three-valued NULL logic works, how resources follow cursor lifetime, and why SQLite's bytecode VM is a valid alternative |
 
@@ -154,7 +154,7 @@ both halves incomprehensible.
 
 | #   | Chapter                                                          | What you'll be able to explain afterwards                                                                                                                                                 |
 | --- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 15  | [Isolation and the anomalies](txn/15-isolation-and-anomalies.md) | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly               |
+| 15  | [Isolation and the anomalies](txn/15-isolation-anomalies.md) | The four anomalies as concrete interleavings rather than vocabulary, what serializability actually means, which level forbids which anomaly, and how to name yours honestly               |
 | 16  | [Locking, 2PL, and deadlock](txn/16-locking-and-deadlock.md)     | Why the *second* phase of two-phase locking is the load-bearing half, locks vs. latches, deadlock detection vs. avoidance vs. prevention, and why SQLite's 5-state ladder needs `PENDING` |
 
 

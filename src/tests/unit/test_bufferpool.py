@@ -22,7 +22,7 @@ def pager(tmp_path):
 
 def test_get_page_returns_page_sized_bytearray(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     page = pool.get_page(page_id)
@@ -37,7 +37,7 @@ def test_get_page_returns_page_sized_bytearray(pager) -> None:
 
 def test_hit_returns_identical_object(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     first = pool.get_page(page_id)
@@ -53,7 +53,7 @@ def test_hit_returns_identical_object(pager) -> None:
 
 def test_mutation_is_visible_through_every_reference(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     a = pool.get_page(page_id)
@@ -75,7 +75,7 @@ def test_mutation_is_visible_through_every_reference(pager) -> None:
 
 def test_eviction_targets_least_recently_used(pager) -> None:
     pool = BufferPool(pager, capacity=2)
-    a, b, c = pager.allocate_page(), pager.allocate_page(), pager.allocate_page()
+    a, b, c = pager._allocate_page(), pager._allocate_page(), pager._allocate_page()
 
 
     a1 = pool.get_page(a)
@@ -100,7 +100,7 @@ def test_eviction_targets_least_recently_used(pager) -> None:
 
 def test_get_page_refreshes_recency(pager) -> None:
     pool = BufferPool(pager, capacity=2)
-    a, b, c = pager.allocate_page(), pager.allocate_page(), pager.allocate_page()
+    a, b, c = pager._allocate_page(), pager._allocate_page(), pager._allocate_page()
 
 
     a1 = pool.get_page(a)
@@ -136,7 +136,7 @@ def test_get_page_refreshes_recency(pager) -> None:
 
 def test_pinned_page_is_never_evicted(pager) -> None:
     pool = BufferPool(pager, capacity=2)
-    a, b, c = pager.allocate_page(), pager.allocate_page(), pager.allocate_page()
+    a, b, c = pager._allocate_page(), pager._allocate_page(), pager._allocate_page()
 
 
     a1 = pool.get_page(a)  # left pinned deliberately
@@ -163,7 +163,7 @@ def test_pinned_page_is_never_evicted(pager) -> None:
 
 def test_pool_exhausted_when_every_page_is_pinned(pager) -> None:
     pool = BufferPool(pager, capacity=2)
-    a, b, c = pager.allocate_page(), pager.allocate_page(), pager.allocate_page()
+    a, b, c = pager._allocate_page(), pager._allocate_page(), pager._allocate_page()
 
 
     pool.get_page(a)
@@ -182,7 +182,7 @@ def test_pool_exhausted_when_every_page_is_pinned(pager) -> None:
 
 def test_unpin_without_outstanding_pin_raises(pager) -> None:
     pool = BufferPool(pager, capacity=2)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     pool.get_page(page_id)
     pool.unpin(page_id)
 
@@ -208,7 +208,7 @@ def test_unpin_unknown_page_raises(pager) -> None:
 
 def test_dirty_page_is_written_back_before_eviction(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     page = pool.get_page(a)
@@ -227,7 +227,7 @@ def test_dirty_page_is_written_back_before_eviction(pager) -> None:
 
 def test_clean_page_evicted_without_corrupting_disk(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     page = pool.get_page(a)
@@ -248,7 +248,7 @@ def test_clean_page_evicted_without_corrupting_disk(pager) -> None:
 
 def test_dirty_flag_is_sticky_across_unpins(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     page = pool.get_page(a)
@@ -276,7 +276,7 @@ def test_dirty_flag_is_sticky_across_unpins(pager) -> None:
 
 def test_flush_page_writes_back_without_evicting(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     page = pool.get_page(page_id)
@@ -305,7 +305,7 @@ def test_flush_page_on_uncached_page_is_a_noop(pager) -> None:
 
 def test_flush_all_writes_every_dirty_page(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    ids = [pager.allocate_page() for _ in range(3)]
+    ids = [pager._allocate_page() for _ in range(3)]
 
 
     for i, page_id in enumerate(ids):
@@ -330,7 +330,7 @@ def test_flush_all_writes_every_dirty_page(pager) -> None:
 
 def test_pinned_context_manager_yields_the_page(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     with pool.pinned(page_id) as page:
@@ -344,7 +344,7 @@ def test_pinned_context_manager_yields_the_page(pager) -> None:
 
 def test_pinned_context_manager_releases_the_pin_on_normal_exit(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     with pool.pinned(a) as page:
@@ -359,7 +359,7 @@ def test_pinned_context_manager_releases_the_pin_on_normal_exit(pager) -> None:
 
 def test_pinned_context_manager_releases_the_pin_even_on_exception(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     with pytest.raises(RuntimeError), pool.pinned(a):
@@ -374,7 +374,7 @@ def test_pinned_context_manager_releases_the_pin_even_on_exception(pager) -> Non
 
 def test_pinned_context_manager_marks_dirty(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     with pool.pinned(a, dirty=True) as page:
@@ -397,7 +397,7 @@ def test_pinned_context_manager_marks_dirty(pager) -> None:
 
 def test_get_page_for_write_marks_dirty_at_acquisition(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     pool.get_page_for_write(page_id)
@@ -412,7 +412,7 @@ def test_get_page_for_write_marks_dirty_at_acquisition(pager) -> None:
 
 def test_get_page_for_write_returns_same_object_as_get_page(pager) -> None:
     pool = BufferPool(pager, capacity=4)
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
 
 
     a = pool.get_page(page_id)
@@ -430,7 +430,7 @@ def test_get_page_for_write_returns_same_object_as_get_page(pager) -> None:
 
 def test_get_page_for_write_dirty_survives_a_clean_unpin(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     page = pool.get_page_for_write(a)
@@ -449,7 +449,7 @@ def test_get_page_for_write_dirty_survives_a_clean_unpin(pager) -> None:
 
 def test_pinned_for_write_marks_dirty_and_releases_pin(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     with pool.pinned_for_write(a) as page:
@@ -467,7 +467,7 @@ def test_pinned_for_write_marks_dirty_and_releases_pin(pager) -> None:
 
 def test_pinned_for_write_releases_pin_even_on_exception(pager) -> None:
     pool = BufferPool(pager, capacity=1)
-    a, b = pager.allocate_page(), pager.allocate_page()
+    a, b = pager._allocate_page(), pager._allocate_page()
 
 
     with pytest.raises(RuntimeError), pool.pinned_for_write(a):
@@ -489,7 +489,7 @@ def test_get_page_for_write_is_an_inert_hook_this_session(pager) -> None:
     assert pool._txn is None
 
 
-    page_id = pager.allocate_page()
+    page_id = pager._allocate_page()
     pool.get_page_for_write(page_id)  # must not raise
     pool.unpin(page_id)
 
