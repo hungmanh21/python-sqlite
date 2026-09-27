@@ -13,10 +13,14 @@ Session map (docs/implementation/week5-transactions.md, "Week 5 sessions"):
 
 week6-concurrency.md session 5 (SS38) adds lock_for_read()/lock_for_write()
 and commit()/rollback() releasing this transaction's locks (both done).
-SS37.2's read-only-vs-journalling split lives in will_modify(), not in
-lock_for_write(): CREATE TABLE/CREATE INDEX/ANALYZE dirty pages without ever
-calling lock_for_write, so will_modify() -- the one call every real write
-reaches, locked or not -- is the only place that can be right for both.
+SS37.2's read-only-vs-journalling split lives in will_modify(): the
+Journal is only constructed on the first write to a page that existed
+before this transaction became the writer.
+
+Lock hierarchy, always acquired in this order (docs/concurrency.md, "Lock
+order"): "__schema__" -> "__writer__" -> tables. Every statement except
+BEGIN/COMMIT/ROLLBACK takes "__schema__" before binding -- SHARED, or
+EXCLUSIVE for CREATE TABLE/CREATE INDEX (NOTES.md B6-7).
 """
 
 from quilldb.constants import FILE_HEADER_SIZE, SCHEMA_ROOT_PAGE
@@ -24,6 +28,9 @@ from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
 from quilldb.txn.journal import Journal
 from quilldb.txn.locks import LockManager, LockMode
+
+SCHEMA_RESOURCE = "__schema__"
+WRITER_RESOURCE = "__writer__"
 
 
 class Transaction:
@@ -56,9 +63,40 @@ class Transaction:
         # pager._txn/pool._txn.
         self._journal: Journal | None = None
         self._journalled: set[int] = set()
+        # Re-snapshotted by _become_writer() the moment this transaction
+        # first holds "__writer__". The value here only matters for a
+        # transaction that never writes, which never reads it.
         self._page_count_before = pager.page_count
+        self._is_writer = False
+        self._holds_schema_write = False
         self._active = True
         self.barrier_passed = False  # read by Pager.write_page's assertion
+
+    def lock_schema_read(self) -> None:
+        """SHARED on "__schema__", taken by Connection.execute() before
+        binding any statement, so no statement ever binds against -- or
+        catalog.load()s from page 1 while a writer is mid-way through --
+        an uncommitted CREATE TABLE/CREATE INDEX (NOTES.md B6-7).
+        """
+        self._lock_manager.acquire(self.id, SCHEMA_RESOURCE, LockMode.SHARED, self._timeout)
+
+    def lock_schema_write(self) -> None:
+        """EXCLUSIVE on "__schema__", for CREATE TABLE/CREATE INDEX. Taken
+        BEFORE "__writer__" (the lock hierarchy in this module's
+        docstring): taken after it, a DDL holding "__writer__" would wait
+        on every reader's SHARED "__schema__" while any of those readers
+        that also wants to write waits on "__writer__" -- a deadlock
+        between every DDL and every concurrent writer.
+        """
+        self._lock_manager.acquire(self.id, SCHEMA_RESOURCE, LockMode.EXCLUSIVE, self._timeout)
+        self._holds_schema_write = True
+
+    @property
+    def holds_schema_write(self) -> bool:
+        """True once lock_schema_write() succeeded -- i.e. this transaction
+        may have changed the schema, so rolling it back has to resync the
+        shared Catalog (Connection._end_txn step 4)."""
+        return self._holds_schema_write
 
     def lock_for_read(self, table: str) -> None:
         """SHARED on `table`. Called from SeqScan/IndexScan.open() -- before
@@ -68,9 +106,9 @@ class Transaction:
         self._lock_manager.acquire(self.id, table, LockMode.SHARED, self._timeout)
 
     def lock_for_write(self, table: str) -> None:
-        """EXCLUSIVE on `table`, for InsertOp/DeleteOp/UpdateOp.open() (and
-        CREATE TABLE/CREATE INDEX's own mutation bodies, wired in
-        connection.py -- see that file's TODO note).
+        """EXCLUSIVE on `table`, for InsertOp/DeleteOp/UpdateOp.open(), and
+        for CREATE TABLE/CREATE INDEX/ANALYZE's mutation bodies in
+        connection.py.
 
         Global-writer-first ordering (chapter 16, docs/concurrency.md "Why
         a single writer"): EXCLUSIVE on "__writer__" before EXCLUSIVE on
@@ -86,20 +124,24 @@ class Transaction:
         they're it. Setting it more than once (a second table, later in the
         same transaction) is harmless, so there's no guard against that.
         """
-        self._lock_manager.acquire(self.id, "__writer__", LockMode.EXCLUSIVE, self._timeout)
+        self._acquire_writer()
         self._lock_manager.acquire(self.id, table, LockMode.EXCLUSIVE, self._timeout)
         self._pager._txn = self
         self._pool._txn = self
 
     def lock_immediate(self) -> None:
-        """EXCLUSIVE on the global "__writer__" resource, right now -- for
+        """SHARED "__schema__", then EXCLUSIVE "__writer__", right now -- for
         `BEGIN IMMEDIATE` (week6-concurrency.md, "declare write intent up
-        front"). A plain BEGIN leaves this acquisition until the first real
-        write reaches lock_for_write(); IMMEDIATE moves that same
-        acquisition to the start of the transaction, so a transaction that
-        knows it's going to write claims its place in the writer queue
-        before doing any reads, instead of discovering -- possibly after a
-        long run of SELECTs -- that another writer got there first.
+        front"). A plain BEGIN leaves the "__writer__" acquisition until
+        the first real write reaches lock_for_write(); IMMEDIATE moves it
+        to the start of the transaction, so a transaction that knows it's
+        going to write claims its place in the writer queue before doing
+        any reads, instead of discovering -- possibly after a long run of
+        SELECTs -- that another writer got there first.
+
+        "__schema__" first because that's the lock hierarchy: every
+        statement this transaction runs will take it anyway, and taking it
+        AFTER "__writer__" would invert the order a concurrent DDL uses.
 
         Deliberately does NOT acquire any table's lock or wire
         pager._txn/pool._txn: which table gets written is still unknown at
@@ -108,7 +150,26 @@ class Transaction:
         "__writer__" grant taken here is simply already-held by then, at no
         extra cost.
         """
-        self._lock_manager.acquire(self.id, "__writer__", LockMode.EXCLUSIVE, self._timeout)
+        self.lock_schema_read()
+        self._acquire_writer()
+
+    def _acquire_writer(self) -> None:
+        """EXCLUSIVE on "__writer__", and -- the first time only -- snapshot
+        page_count as this transaction's rollback point.
+
+        The snapshot has to be taken HERE, not in __init__: a deferred
+        BEGIN (or an autocommit statement queued behind another writer)
+        can wait arbitrarily long between being constructed and becoming
+        the writer, and every page some other writer commits in that gap
+        would otherwise sit above _page_count_before -- will_modify()
+        would skip journalling them as "allocated by this transaction",
+        and rollback could not undo writes to them (NOTES.md B6-2).
+        Holding "__writer__" is what makes page_count stop moving.
+        """
+        self._lock_manager.acquire(self.id, WRITER_RESOURCE, LockMode.EXCLUSIVE, self._timeout)
+        if not self._is_writer:
+            self._is_writer = True
+            self._page_count_before = self._pager.page_count
 
     def will_modify(self, page_id: int) -> None:
         """Called before the first modification of a page, by
@@ -141,36 +202,20 @@ class Transaction:
             self._journalled.add(page_id)
             return
 
-        # TODO(human): reaching here means a page that existed BEFORE this
-        # transaction began is about to be overwritten -- the one case that
-        # actually needs journalling, and SS37.2's promotion point: if
-        # self._journal is still None, this is the FIRST such write this
-        # transaction has made. Promote it now --
-        #   1. construct a Journal at self._pager.path
-        #   2. journal.begin(self._pager.page_count)
-        #   3. store it on self._journal
-        # (pager._txn/pool._txn are already wired by now, by
-        # lock_for_write() -- get_page_for_write only ever calls this method
-        # once that's true, so there's nothing left to wire here.) A second
-        # dirtied page later in the same transaction must leave an
-        # already-promoted journal alone -- guard on `self._journal is None`
-        # before doing any of this, or you'll re-begin() a journal that
-        # already has records in it and lose them.
-        #
-        # Then, same as before: read the page's current bytes and hand them
-        # to the journal --
-        #   data = self._pager.read_page(page_id)
-        #   self._journal.record_original(page_id, bytes(data))
-        #   self._journalled.add(page_id)
+        # A page that existed before this transaction became the writer is
+        # about to be overwritten -- the one case that needs journalling,
+        # and SS37.2's promotion point on the first such write. The journal
+        # records _page_count_before, not the live page_count: a growth-path
+        # allocate_page() may already have bumped the latter, and recovery
+        # must truncate to the same point rollback() does.
         if self._journal is None:
             self._journal = Journal(self._pager.path)
-            self._journal.begin(self._pager.page_count)
+            self._journal.begin(self._page_count_before)
         data = self._pager.read_page(page_id)
         self._journal.record_original(page_id, bytes(data))
         self._journalled.add(page_id)
-            
 
-    def commit(self) -> None:
+    def commit(self, *, release: bool = True) -> None:
         """Make every change in this transaction durable, then discard the
         journal -- the operation that turns "recoverable" into "permanent".
 
@@ -205,6 +250,10 @@ class Transaction:
         A transaction that never dirtied a page has self._journal still
         None (SS37.2) -- nothing was ever written, so there is nothing to
         make durable; skip straight to releasing locks.
+
+        `release=False` skips step 6 so Connection can unwire the pager/pool
+        hook and resync its catalog while this transaction still holds its
+        locks, then call release_locks() itself.
         """
         if self._journal is not None:
             with self._pool.pinned_for_write(SCHEMA_ROOT_PAGE) as page:
@@ -217,9 +266,10 @@ class Transaction:
             self._pager.sync()
             self._journal.delete()
 
-        self._lock_manager.release_all(self.id)
+        if release:
+            self.release_locks()
 
-    def rollback(self) -> None:
+    def rollback(self, *, release: bool = True) -> None:
         """Undo every change in this transaction, restoring the database to
         exactly its pre-BEGIN state.
 
@@ -259,6 +309,8 @@ class Transaction:
         A transaction that never dirtied a page has self._journal still
         None (SS37.2) -- there is nothing on disk to undo; skip straight to
         releasing locks.
+
+        `release=False`: same as commit()'s.
         """
         if self._journal is not None:
             self._journal.replay(self._pager)
@@ -268,4 +320,12 @@ class Transaction:
             self._pool.clear(self._journalled)
             self._pager.reload_header()
 
+        if release:
+            self.release_locks()
+
+    def release_locks(self) -> None:
+        """Strict 2PL's single release point -- every lock this transaction
+        holds, at once. Called by commit()/rollback() unless they were told
+        release=False, in which case the caller owns calling this.
+        """
         self._lock_manager.release_all(self.id)

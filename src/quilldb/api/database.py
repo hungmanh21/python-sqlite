@@ -42,19 +42,20 @@ class Database:
         self.catalog = catalog
         self.stats = stats
         self.lock_manager = LockManager()
-        self._writer_txn = None  # renamed from pool._txn -- set/cleared under "__writer__" (SS37.2)
         self._txn_id_lock = threading.Lock()
         self._next_txn_id = 0
+        # How many Connections are open. The file closes when the LAST one
+        # does -- any earlier and it closes underneath its siblings
+        # (NOTES.md B6-4).
+        self._connections_lock = threading.Lock()
+        self._open_connections = 0
+        self._closed = False
 
     def next_txn_id(self) -> int:
-        """Hand out a unique, increasing transaction id.
-
-        TODO(human): two Connections on different threads can call this at
-        the same instant -- the shared-state table in week6-concurrency.md
-        names exactly this ("two transactions with one id -> release_all
-        frees the wrong locks"). self._txn_id_lock exists for you to use.
-        Not wired into Connection._begin() yet -- that's session 5's job,
-        once LockManager.acquire() actually needs an id to call with.
+        """Hand out a unique, increasing transaction id. Latched: two
+        Connections on different threads can call this at the same instant,
+        and two transactions sharing one id would let release_all() free
+        the wrong locks (week6-concurrency.md's shared-state table).
         """
         with self._txn_id_lock:
             txn_id = self._next_txn_id
@@ -62,12 +63,40 @@ class Database:
         return txn_id
 
     def connect(self) -> "Connection":
-        """A new Connection bound to the calling thread."""
+        """A new Connection bound to the calling thread.
+
+        Raises:
+            ValueError: every earlier Connection has already closed, and
+                the file with them.
+        """
         from quilldb.api.connection import (  # avoids a cycle: Connection type-hints Database
             Connection,
         )
 
+        with self._connections_lock:
+            if self._closed:
+                raise ValueError("database is closed")
+            self._open_connections += 1
         return Connection(self)
+
+    def _connection_closed(self) -> None:
+        """Called once by each Connection.close(). The last one out flushes
+        the pool and closes the file -- the same thing every single-
+        Connection caller's close() has always done, now only when no other
+        Connection still depends on it.
+
+        Every closing Connection has already rolled back its own open
+        transaction, so by the time the count reaches zero there is no
+        writer left for flush_all() to write pre-barrier pages for.
+        """
+        with self._connections_lock:
+            self._open_connections -= 1
+            last = self._open_connections == 0
+            if last:
+                self._closed = True
+        if last:
+            self.pool.flush_all()
+            self.pager.close()
 
 
 def open_database(path: str | Path) -> Database:

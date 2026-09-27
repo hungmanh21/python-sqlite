@@ -323,6 +323,12 @@ class StatisticsCatalog:
         self._table = self._ensure_table()
 
 
+    @property
+    def table_name(self) -> str:
+        """quill_stat1's name -- what ANALYZE takes its write lock on."""
+        return self._table.name
+
+
     def _ensure_table(self) -> TableSchema:
         try:
             return self.catalog.get_table(_STAT1_TABLE_NAME)

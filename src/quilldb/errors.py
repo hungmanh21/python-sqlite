@@ -207,7 +207,15 @@ class DeadlockError(QuillDBError):
                        txn 7 waits for 'orders' (held by txn 4)
                        txn 4 waits for 'users'  (held by txn 7)
 
-    The transaction is rolled back before this is raised. The caller may retry.
+    Autocommit: the statement's own transaction is rolled back before this
+    propagates, and the caller may simply retry the statement.
+
+    Explicit transaction (BEGIN ... ): only the failing statement is
+    abandoned. The transaction stays open and KEEPS every lock it holds --
+    including whatever the survivor is waiting on -- until the caller
+    issues ROLLBACK, then retries the whole transaction. Retrying just the
+    statement inside the same transaction walks straight back into the
+    same cycle.
     """
 
     def __init__(self, victim: int, cycle: list[tuple[int, str, int]]) -> None:

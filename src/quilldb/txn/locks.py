@@ -56,7 +56,12 @@ class LockManager:
     def __init__(self, default_timeout: float = 5.0) -> None:
         self._locks: dict[str, LockEntry] = {}
         self._latch = threading.Lock()
+        # The wait-for graph, plus victims chosen by SOME OTHER waiter's
+        # detection pass (txn_id -> the cycle that condemned it). Both are
+        # guarded by _latch, and _detect_deadlock only ever runs under it,
+        # so a walk sees one consistent snapshot of who waits for what.
         self._waiting_for: dict[int, str] = {}  # txn_id -> resource it wants
+        self._doomed: dict[int, list[tuple[int, str, int]]] = {}
         self._default_timeout = default_timeout
 
     def _entry_for(self, resource: str) -> LockEntry:
@@ -78,11 +83,11 @@ class LockManager:
 
         Reentrant: a txn already holding a sufficient mode on `resource`
         returns immediately (holding EXCLUSIVE already satisfies a SHARED
-        request). There is no lock upgrade path here on purpose -- quilldb
-        sidesteps it with the single global "__writer__" lock a writer takes
-        before any table EXCLUSIVE (docs/concurrency.md, "Why a single
-        writer"), so acquire() never needs to turn a held SHARED into an
-        EXCLUSIVE.
+        request). A held SHARED can be upgraded to EXCLUSIVE -- grantable()
+        ignores the requester's own hold -- and the single global
+        "__writer__" lock a writer takes before any table EXCLUSIVE
+        (docs/concurrency.md, "Why a single writer") guarantees two
+        DIFFERENT transactions never race to upgrade the same table.
 
         FIFO: a request queues behind any earlier waiter on this resource
         even when it would be compatible with the current holders. Without
@@ -91,8 +96,9 @@ class LockManager:
         (chapter 16 SS16.5), a liveness bug no correctness test catches.
 
         Raises:
-            DeadlockError: session 2 wires this in -- see the TODO in
-                _detect_deadlock and the call site marked below.
+            DeadlockError: this txn is the youngest in a wait-for cycle --
+                found either by its own detection pass or by another
+                waiter's (which then wakes it; NOTES.md B6-5).
             LockTimeoutError: the busy_timeout backstop expired first.
         """
         timeout = self._default_timeout if timeout is None else timeout
@@ -125,21 +131,33 @@ class LockManager:
             entry.waiters.append((txn_id, mode))
             try:
                 while not grantable():
-                    self._waiting_for[txn_id] = resource
-                    detected = self._detect_deadlock(txn_id)
-                    if detected is not None:
-                        victim, cycle = detected
-                        if victim == txn_id:
-                            raise DeadlockError(victim, cycle)
-                        # The walk found a real cycle, but it closed on some
-                        # node other than txn_id -- txn_id is merely queued
-                        # behind one of the cycle's participants, not part of
-                        # the cycle itself. Raising here would abort an
-                        # innocent transaction while leaving the actual cycle
-                        # untouched (its members hold no lock txn_id is
-                        # waiting on). The real victim's own acquire() call
-                        # walks the same graph starting from itself, finds
-                        # itself at index 0, and raises for itself instead.
+                    victim_resource: str | None = None
+                    with self._latch:
+                        doomed_cycle = self._doomed.pop(txn_id, None)
+                        if doomed_cycle is not None:
+                            raise DeadlockError(txn_id, doomed_cycle)
+                        self._waiting_for[txn_id] = resource
+                        detected = self._detect_deadlock(txn_id)
+                        if detected is not None:
+                            victim, cycle = detected
+                            if victim == txn_id:
+                                raise DeadlockError(victim, cycle)
+                            # The cycle is real but its youngest member is
+                            # someone else -- possibly txn_id closed it, and
+                            # the victim has been asleep in its own wait()
+                            # since BEFORE the cycle existed. Nothing else
+                            # will ever wake it (no lock in the cycle can be
+                            # released), so doom it and wake it here; left
+                            # alone, it only noticed at its own timeout, and
+                            # whichever side's timer fired first lost --
+                            # sometimes the OLDER txn, with LockTimeoutError
+                            # on a genuine cycle (NOTES.md B6-5).
+                            if victim not in self._doomed:
+                                self._doomed[victim] = cycle
+                                victim_resource = self._waiting_for.get(victim)
+                    if victim_resource is not None:
+                        self._wake(victim_resource, entry)
+                        continue  # _wake may have dropped our condition -- re-check grantable()
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         raise LockTimeoutError(
@@ -149,21 +167,41 @@ class LockManager:
                     # Re-check deadline next loop, don't trust wait()'s return (NOTES.md B6-1).
                     entry.condition.wait(timeout=remaining)
                 entry.holders[txn_id] = mode
-                # A grant changes what's grantable for whoever is now next in
-                # the FIFO queue (this txn just left entry.waiters' front, or
-                # a SHARED grant just added a compatible holder). Only
-                # release_all() used to call notify_all(); when N readers
-                # queue behind each other with no intervening release, the
-                # single notify_all() that woke this queue only lets the
-                # front waiter through; without this, everyone behind them
-                # sleeps forever waiting for a notify that never comes
-                # (NOTES.md B6-1 -- caught once the FIFO test stopped using
-                # short timeouts, which had been masking it by re-polling on
-                # their own schedule regardless of notification).
-                entry.condition.notify_all()
             finally:
                 entry.waiters.remove((txn_id, mode))
-                self._waiting_for.pop(txn_id, None)
+                # Leaving the queue -- granted, timed out, or doomed --
+                # changes what's grantable for whoever is now at its front,
+                # and nothing else will tell them. Granted: only
+                # release_all() used to notify, so N readers queued behind
+                # each other with no intervening release woke one at a time
+                # and the rest slept forever (NOTES.md B6-1). Timed out or
+                # doomed: the leaver may have been the FIFO head blocking
+                # everyone behind it (NOTES.md B6-6). notify_all() is free
+                # when nobody is waiting.
+                entry.condition.notify_all()
+                with self._latch:
+                    self._waiting_for.pop(txn_id, None)
+                    self._doomed.pop(txn_id, None)
+
+    def _wake(self, resource: str, held: LockEntry) -> None:
+        """notify_all() on `resource`'s condition, so a doomed victim asleep
+        there re-runs its wait loop and finds itself in self._doomed.
+
+        The caller holds `held.condition`. Taking a SECOND entry's condition
+        while holding one is a lock-order inversion waiting to happen (two
+        detectors each waking the other's resource), so drop ours first and
+        take it back afterwards -- the same thing wait() does anyway.
+        """
+        target = self._entry_for(resource)
+        if target is held:
+            held.condition.notify_all()
+            return
+        held.condition.release()
+        try:
+            with target.condition:
+                target.condition.notify_all()
+        finally:
+            held.condition.acquire()
 
     def release_all(self, txn_id: int) -> None:
         """Drop every lock held by this transaction and wake each resource's
@@ -180,7 +218,9 @@ class LockManager:
                 if entry.holders.pop(txn_id, None) is not None:
                     entry.condition.notify_all()
 
-        self._waiting_for.pop(txn_id, None)
+        with self._latch:
+            self._waiting_for.pop(txn_id, None)
+            self._doomed.pop(txn_id, None)
 
     def _detect_deadlock(
         self, waiting_txn: int
@@ -192,17 +232,15 @@ class LockManager:
         be perpetually aborted (chapter 16 SS16.4) -- and cycle is the edges
         walked to find it, for DeadlockError's message. Otherwise None.
 
-        Called only at the moment a transaction blocks (see the TODO in
-        acquire()'s wait loop), because that's the only moment a new edge
-        appears -- a background scanner would do the same work later, never
-        earlier.
+        Called only at the moment a transaction blocks (acquire()'s wait
+        loop), because that's the only moment a new edge appears -- a
+        background scanner would do the same work later, never earlier.
 
-        TODO(human): see the TODO inline in _walk below -- the "upgrade
-        problem" (docs/implementation/week6-concurrency.md §35, "the upgrade
-        problem, which the roadmap doesn't mention and which will bite
-        you") has a self-loop variant this walk doesn't handle yet.
-        test_deadlock.py::test_upgrade_blocked_by_another_reader_is_not_a_deadlock
-        reproduces it and is currently red.
+        Caller must hold self._latch: every read of _waiting_for below, and
+        every snapshot of another resource's holders, has to come from one
+        consistent moment, or the walk can iterate a holders dict that
+        another thread is resizing ("dictionary changed size during
+        iteration") or chase edges that no longer exist.
         """
         def _walk(
             txn_id: int, path: list[int], path_edges: list[tuple[int, str, int]]
@@ -219,24 +257,13 @@ class LockManager:
                 return None  # no holders, so no cycle
 
             path.append(txn_id)
-            for holder in entry.holders:
-                # TODO(human): txn_id can be its OWN holder here -- that's
-                # exactly the "upgrade" pattern (docs/implementation/
-                # week6-concurrency.md §35): txn_id already holds SHARED on
-                # `resource` from an earlier read, and is now waiting to
-                # escalate to EXCLUSIVE on that SAME resource. That is not a
-                # wait-for edge -- a transaction never waits behind its own
-                # hold, only behind a DIFFERENT transaction's conflicting
-                # one. Left as-is, `holder == txn_id` recurses straight back
-                # into txn_id, `if txn_id in path` fires one level down, and
-                # this reports txn_id deadlocked against itself even when
-                # the REAL blocker (some other holder of `resource`, elsewhere
-                # in this same dict) isn't part of any cycle at all -- the
-                # global "__writer__" lock (docs/concurrency.md, "Why a
-                # single writer") only rules out two DIFFERENT transactions
-                # racing to upgrade the same table; it says nothing about a
-                # transaction upgrading against its own prior hold. Skip
-                # `holder == txn_id` before recursing.
+            # tuple(): a snapshot -- this entry's holders are mutated under
+            # its own condition, which the walk deliberately doesn't take.
+            for holder in tuple(entry.holders):
+                # A txn upgrading SHARED -> EXCLUSIVE is its own holder here.
+                # That's not a wait-for edge (nobody waits behind their own
+                # hold), and following it reports a self-deadlock
+                # (NOTES.md, week 6 session 6).
                 if holder == txn_id:
                     continue
                 path_edges.append((txn_id, resource, holder))

@@ -35,24 +35,19 @@ def setup_accounts(tmp_path: Path, accounts: int, each: int) -> Database:
 
 
 def all_balances(db: Database) -> list[int]:
-    """Every account's current balance, oldest connection style: a fresh,
-    throwaway Connection per call, deliberately never closed.
+    """Every account's current balance, read through a fresh throwaway
+    Connection.
 
-    Connection.close() tears down the whole Database's shared pager --
-    there's no refcounting across the many Connections one Database can
-    hand out via db.connect() -- so a per-call helper closing its own
-    connection would silently break every OTHER connection still using this
-    same db. That failure is also latent, not immediate: it only surfaces
-    once some other connection needs a page that isn't already cached and
-    tries to read it through the now-closed file. Not calling close() here
-    costs nothing: this Connection holds no resource of its own to release,
-    only references into state the Database still owns.
+    Closing it is safe now that Database ref-counts its Connections and only
+    closes the shared pager when the LAST one closes (NOTES.md B6-4) --
+    setup_accounts' bootstrap connection is never closed, so this never is.
     """
     conn = db.connect()
     balances = []
     for row in conn.execute("SELECT balance FROM accounts").fetchall():
         assert isinstance(row[0], int)
         balances.append(row[0])
+    conn.close()
     return balances
 
 
@@ -97,30 +92,10 @@ def transfer(conn: Connection, src: int, dst: int, amount: int) -> None:
     """
     conn.execute("BEGIN")
     try:
-        # TODO(human): debit `src` and credit `dst` by `amount`, preserving
-        # two invariants the test above checks: sum_balances(db) must not
-        # change, and no account may go negative.
-        #
-        # The tempting first draft is SELECT the current balance, decide in
-        # Python, then UPDATE -- but SELECT takes only a SHARED lock
-        # (lock_for_read), and this same transaction's later UPDATE needs
-        # EXCLUSIVE on the same table (lock_for_write). That's a lock
-        # *upgrade* within one transaction, not two transactions racing --
-        # and there's a live bug in that exact path right now:
-        # locks.py's _detect_deadlock has its own TODO(human) for a
-        # self-upgrade false positive, reproduced by
-        # test_deadlock.py::test_upgrade_blocked_by_another_reader_is_not_a_deadlock
-        # (currently red). You don't have to fix that one to finish this
-        # one -- but a `transfer()` that never triggers the pattern sidesteps
-        # it rather than depending on it being fixed.
-        #
-        # Worth knowing before you pick an approach: an UPDATE's SET value
-        # and WHERE clause are both allowed to reference the row's own
-        # current column values (`SET age = age + 1` works; see
-        # BoundAssignment's docstring in sql/binder.py) -- which may mean
-        # the balance check and the write don't have to be two separate
-        # statements at all.
-
+        # One conditional UPDATE does the balance check and the debit
+        # together (`WHERE balance >= ?`), so no SELECT-then-UPDATE lock
+        # upgrade is needed -- and the debit's rowcount says whether the
+        # credit should happen at all.
         debited = conn.execute(
             "UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?",
             (amount, src, amount),
@@ -179,6 +154,8 @@ def test_sum_of_balances_never_changes(tmp_path: Path) -> None:
     assert min(all_balances(db)) >= 0  # no account went negative
 
     db_path = db.pager.path
-    db.connect().close()  # the ONE close() call in this whole test -- see all_balances' note
+    # No close() needed before the check: every commit already stamped the
+    # header into page 1 and fsynced, and the bootstrap connection keeps the
+    # Database open anyway (all_balances' note).
     assert db_path is not None
     assert sqlite3_integrity_check(db_path) == "ok"

@@ -57,17 +57,14 @@ class BufferPool:
         # whichever entry currently sits at the front.
         self._cache: OrderedDict[int, _Entry] = OrderedDict()
 
-        # TODO(human): guards self._cache (both the dict and its recency
-        # order) plus pin_count/dirty on every _Entry. Every method below
-        # that reads or mutates those -- get_page, unpin, _evict_one,
-        # allocate_page, free_page, flush_page/flush_all, clear, discard --
-        # needs to take this latch. The one trap (week6-concurrency.md
-        # SS37.6, chapter 16 SS16.3): NEVER hold it across a disk read.
-        # get_page()'s miss path has to insert a placeholder frame, pin it,
-        # RELEASE the latch, do pager.read_page(), then re-acquire to fill
-        # the real data in -- holding it across I/O serializes every thread
-        # on disk latency, which is exactly what a pool exists to avoid.
-        # Not wired in yet; every method below still runs unlatched.
+        # Guards self._cache (both the dict and its recency order) plus
+        # pin_count/dirty on every _Entry; every method that reads or
+        # mutates those takes it. Known gap (week6-concurrency.md SS37.6,
+        # chapter 16 SS16.3): it is still held across pager.read_page() on
+        # a miss and across will_modify()'s journal write -- correct, but it
+        # serializes every thread on disk latency. The placeholder-frame
+        # pattern (pin a placeholder, release, read, re-acquire, fill) is
+        # the fix when that shows up in a benchmark.
         self._latch = threading.Lock()
 
 

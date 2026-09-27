@@ -176,8 +176,16 @@ class Pager:
         is still whatever this transaction last set it to -- this is what
         rollback calls to resync memory from the now-restored file.
         """
-        self._file.seek(0)
-        self._header = FileHeader.from_bytes(self._file.read(FILE_HEADER_SIZE))
+        # Same pread-or-lock split as read_page: a buffered seek()+read()
+        # here can be served from a read buffer filled BEFORE later
+        # os.pwrite()s changed the bytes underneath it.
+        if self._path is not None:
+            raw = os.pread(self._file.fileno(), FILE_HEADER_SIZE, 0)
+        else:
+            with self._io_lock:
+                self._file.seek(0)
+                raw = self._file.read(FILE_HEADER_SIZE)
+        self._header = FileHeader.from_bytes(raw)
 
     def read_page(self, page_id: int) -> bytearray:
         """Read one page.
@@ -392,7 +400,8 @@ class Pager:
         if page_count < 1:
             raise ValueError("page_count must be >= 1 (since 1 is for header)")
 
-        self._file.truncate(page_count * PAGE_SIZE)
+        with self._io_lock:
+            self._file.truncate(page_count * PAGE_SIZE)
         self._header.page_count = page_count
         self._header.freelist_count = 0
         self._header.freelist_trunk = 0
@@ -419,6 +428,13 @@ class Pager:
         if len(data) != PAGE_SIZE:
             raise ValueError(f"data length {len(data)} != PAGE_SIZE {PAGE_SIZE}")
 
+        # Same pwrite-or-lock split as write_page: on :memory:, an unlocked
+        # seek()+write() races a concurrent reader's locked seek()+read()
+        # on the one shared BytesIO position.
         offset = (page_id - 1) * PAGE_SIZE
-        self._file.seek(offset)
-        self._file.write(data)
+        if self._path is not None:
+            os.pwrite(self._file.fileno(), bytes(data), offset)
+        else:
+            with self._io_lock:
+                self._file.seek(offset)
+                self._file.write(data)
