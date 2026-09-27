@@ -216,13 +216,21 @@ def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats:
     into `rows_per_prefix`.
     """
     # get the distinct columns in seek_terms of AccessPath
-    if path.kind == "index_scan":
+    if path.kind == "index_scan" and path.seek_terms:
         columns = {predicate.column for predicate in path.seek_terms}
         if stats:
             rows_fetched = max(1, stats.rows_per_prefix[len(columns) - 1])
         else:
             rows_fetched = 1
     else:
+        # A seq_scan, OR an index_scan with no seek_terms at all -- the
+        # full-index-order path session 0.2 adds (planner.py's
+        # _index_order_path). `columns` would be the empty set there, and
+        # `rows_per_prefix[len(columns) - 1]` is `rows_per_prefix[-1]`:
+        # Python's negative-index wraparound silently grabs the stat for
+        # the FULLY specified key -- the narrowest, smallest count in the
+        # array -- making an unfiltered full scan look nearly free. A scan
+        # that seeks on nothing fetches the same rows a SeqScan would.
         rows_fetched = table_stats.row_count
    
     value = rows_fetched * (1 / 3) ** len(path.residual)

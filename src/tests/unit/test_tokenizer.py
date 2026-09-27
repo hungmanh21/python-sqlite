@@ -190,3 +190,50 @@ def test_question_mark_produces_a_parameter_token_without_an_index() -> None:
 def test_unknown_character_raises_syntax_error() -> None:
     with pytest.raises(SQLSyntaxError):
         tokenize("SELECT # FROM t")
+
+
+# =====================================================================
+# Week 7: DOT and the new keyword set (session 0.6)
+# =====================================================================
+
+
+def test_qualified_name_produces_identifier_dot_identifier() -> None:
+    tokens = tokenize("SELECT u.age FROM users u")
+    assert _types(tokens)[:4] == [
+        TokenType.SELECT,
+        TokenType.IDENTIFIER,
+        TokenType.DOT,
+        TokenType.IDENTIFIER,
+    ]
+
+
+def test_a_leading_decimal_point_is_still_a_number_not_a_dot() -> None:
+    """`.5` must stay one REAL token -- DOT must not steal the digit
+    branch's own leading-dot case (tokenizer.py's number-scan condition)."""
+    tokens = tokenize("SELECT .5")
+    assert _types(tokens) == [TokenType.SELECT, TokenType.REAL, TokenType.EOF]
+    assert tokens[1].value == 0.5
+
+
+@pytest.mark.parametrize(
+    "spelling,expected",
+    [
+        ("join", TokenType.JOIN),
+        ("left", TokenType.LEFT),
+        ("inner", TokenType.INNER),
+        ("outer", TokenType.OUTER),
+        ("group", TokenType.GROUP),
+        ("by", TokenType.BY),
+        ("having", TokenType.HAVING),
+        ("order", TokenType.ORDER),
+        ("asc", TokenType.ASC),
+        ("desc", TokenType.DESC),
+        ("limit", TokenType.LIMIT),
+        ("offset", TokenType.OFFSET),
+        ("distinct", TokenType.DISTINCT),
+        ("as", TokenType.AS),
+    ],
+)
+def test_week7_keywords_are_recognized_case_insensitively(spelling: str, expected: TokenType) -> None:
+    for casing in (spelling, spelling.upper(), spelling.capitalize()):
+        assert tokenize(casing)[0].type is expected

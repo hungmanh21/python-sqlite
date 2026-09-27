@@ -422,3 +422,36 @@ tests was confirmed to **fail** against the pre-fix source before being trusted 
 - Stale `TODO(human)` blocks on already-implemented code were rewritten as plain comments
   (`locks.py`, `transaction.py`, `database.py`, `connection.py`, `bufferpool.py`, the transfer stress
   test), and the unused `Database._writer_txn` was removed.
+
+---
+
+## Week 7 — query processing (session 0 retrofit)
+
+### The roadmap's question, answered: `open(outer_row)`
+Week 3's iterator abstraction (`Operator.open()`/`next()`/`close()`) held up almost exactly as
+written. Adding the one thing a join needs from it — an `IndexScan` re-opened once per outer row,
+seeking with that row's join value — required changing `open()`'s signature
+(`open(self, outer: Row = ())`) and threading `outer` through `Filter`/`Project` to their child.
+`next()` needed no change at all: a `NestedLoopJoin` still just calls `child.next()` in a loop.
+So the interface leaked exactly one parameter, not a redesign — `_seek_value` (exec/operators.py)
+now evaluates a seek term against `outer` instead of always `()`, which is also what makes an
+index-nested-loop join "free": the inner `IndexScan`'s seek bound is an expression over the
+*outer* row's columns, bound against the outer row's own layout (never the combined one — that
+distinction is week7-query-processing.md §40's `resolve_layout`, session 1's job, not this one's).
+
+### B7-1 ★ An unfiltered index scan would have looked almost free
+- **Symptom:** none observed yet — caught while implementing session 0.2 (an index-order access
+  path for `ORDER BY indexed_col` with no `WHERE`), before it ever reached a real query.
+- **Assumed:** `estimate_row_counts` (`plan/statistics.py`) only ever sees an `index_scan` path
+  with at least one seek term, because `_match_index_prefix` returns `None` otherwise — so
+  `rows_per_prefix[len(columns) - 1]` was written assuming `columns` is never empty.
+- **Actually:** session 0.2 adds exactly the case that assumption excluded: a full index-order
+  scan with `seek_terms == ()`. `len(columns) - 1` is then `-1`, and Python's negative-index
+  wraparound silently returns `rows_per_prefix[-1]` — the average row count for the FULLY
+  specified key, the smallest number in the array. An unfiltered scan of the whole index would
+  have been costed as if it touched almost nothing, making it look free next to a seq_scan
+  instead of costing the same as one.
+- **Fix:** `estimate_row_counts` now falls back to `table_stats.row_count` (same as a seq_scan)
+  whenever `path.seek_terms` is empty, index or not. *Lesson: a helper's "N-1" indexing math is
+  only as safe as its caller's promise that N is never 0 — and a new caller is exactly how that
+  promise gets broken without either side's code changing.*

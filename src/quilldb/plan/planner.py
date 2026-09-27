@@ -99,6 +99,16 @@ def enumerate_access_paths(
         path = _match_index_prefix(index, by_column, predicates)
         if path is not None:
             paths.append(path)
+        else:
+            # No predicate touches this index's leading column, so
+            # _match_index_prefix has nothing to seek with -- but the
+            # index's own sort order is still a legal (if usually
+            # expensive) way to answer the query, and it's the ONLY
+            # candidate that can satisfy an `ORDER BY indexed_col` without
+            # a Sort on top (week7-query-processing.md session 0.2). Offer
+            # it here so cost comparison, not omission, is what rules it
+            # out when there's no LIMIT to make it worthwhile.
+            paths.append(_index_order_path(index, predicates))
 
 
     return paths
@@ -187,3 +197,22 @@ def _match_index_prefix(
         seek_terms=tuple(seek_terms),
         residual=residual,
     )
+
+
+
+
+def _index_order_path(index: IndexSchema, predicates: list[Predicate]) -> AccessPath:
+    """A full walk of `index` start to end, in its own sort order -- no
+    seek at all (week7-query-processing.md session 0.2).
+
+
+    Shares the "index_scan" kind with a seeking path (empty `seek_terms`
+    is what tells them apart), which is deliberate: IndexScan.open()
+    already treats an empty `seek_terms` as "seek_eq([])", and
+    `compare_keys` already treats a zero-length probe as matching every
+    stored key, so the executor needs no new case at all -- only the
+    planner needs to know this candidate exists. Every predicate stays in
+    `residual`, since a path with nothing to seek on filters nothing on
+    its own.
+    """
+    return AccessPath(kind="index_scan", index=index, seek_terms=(), residual=tuple(predicates))

@@ -181,3 +181,22 @@ def test_seek_terms_and_residual_are_preserved():
     assert result.residual == residual
     assert result.index is _ABC
     assert result.kind == "index_scan"
+
+
+# =====================================================================
+# index_scan with NO seek_terms at all: the full-index-order path
+# planner.py's _index_order_path adds (week7-query-processing.md 0.2)
+# =====================================================================
+
+
+def test_an_index_scan_with_no_seek_terms_fetches_the_whole_table():
+    """Regression for a real bug this session's retrofit found: indexing
+    `rows_per_prefix` with `len(columns) - 1` when `columns` is empty
+    reads `rows_per_prefix[-1]` -- Python's negative-index wraparound
+    silently returns the stat for the FULLY specified key, the smallest
+    number in the array, making an unfiltered index-order scan look
+    almost free. It must cost exactly like a seq_scan: the whole table.
+    """
+    path = AccessPath("index_scan", _ABC, (), ())
+    result = estimate_row_counts(path, _STATS, _TABLE_STATS)
+    assert result.rows_fetched == _TABLE_STATS.row_count == 10_000

@@ -149,6 +149,27 @@ class ColumnNotFoundError(SQLError):
     """A statement named a column that does not exist in its input row."""
 
 
+class AmbiguousColumnError(SQLError):
+    """A bare column name matched more than one table in scope.
+
+    Must never be resolved by silently picking the first match -- that's
+    how a join returns plausible wrong data (week7-query-processing.md
+    §40). Qualifying the column (`t.col`) is the caller's way out.
+    """
+
+
+class AggregateError(SQLError):
+    """A SELECT/HAVING/ORDER BY expression is neither an aggregate call
+    nor functionally determined by the GROUP BY keys, or an aggregate
+    was used somewhere SQL doesn't allow one (e.g. inside WHERE)."""
+
+
+class SortLimitExceededError(SQLError):
+    """ORDER BY would sort more rows than quilldb keeps in memory for an
+    in-memory Sort. A documented limitation, not a crash: the message
+    names the actionable fix (add an index on the ORDER BY column)."""
+
+
 class ColumnCountError(SQLError):
     """A statement supplied a different number of values than the table has
     columns.

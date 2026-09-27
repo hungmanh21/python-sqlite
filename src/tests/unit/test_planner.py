@@ -147,12 +147,30 @@ def test_c_dropped_when_b_has_no_predicate_at_all():
 
 
 
-def test_c_alone_offers_no_seek_at_all():
+def test_c_alone_offers_no_seek_but_still_an_index_order_candidate():
     """`WHERE c=3` with no constraint on `a`: the index's first column has
-    no predicate, so this index must not appear as a candidate.
+    no predicate, so there is nothing to SEEK with -- but
+    week7-query-processing.md session 0.2 still offers the index's own
+    sort order as a candidate (empty seek_terms), because a future
+    `ORDER BY a` needs *something* to compare against a Sort. `c=3` can't
+    be consumed by this path at all, so it stays in `residual` whole.
     """
     paths = enumerate_access_paths(_TABLE, [_ABC], [_eq("c", 3)])
-    assert _index_paths(paths) == []
+    (path,) = _index_paths(paths)
+    assert path.seek_terms == ()
+    assert [p.column for p in path.residual] == ["c"]
+
+
+def test_index_order_candidate_appears_even_with_no_where_at_all():
+    """week7-query-processing.md session 0.2, DoD row: `enumerate_access_paths`
+    offers an index-order candidate with no seek terms -- this is what makes
+    a bare `SELECT * FROM t ORDER BY a` (no WHERE clause) able to avoid a
+    Sort at all, where before this index simply never became a candidate.
+    """
+    paths = enumerate_access_paths(_TABLE, [_ABC], [])
+    (path,) = _index_paths(paths)
+    assert path.seek_terms == ()
+    assert path.residual == ()
 
 
 

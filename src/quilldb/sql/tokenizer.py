@@ -53,6 +53,7 @@ def tokenize(sql: str) -> list[Token]:
         ")": TokenType.RIGHT_PAREN,
         ",": TokenType.COMMA,
         ";": TokenType.SEMICOLON,
+        ".": TokenType.DOT,
         "*": TokenType.STAR,
         "+": TokenType.PLUS,
         "-": TokenType.MINUS,

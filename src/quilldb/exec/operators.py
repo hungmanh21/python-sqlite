@@ -65,12 +65,22 @@ class Operator(ABC):
 
 
     @abstractmethod
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         """Acquire whatever this operator needs to produce rows.
 
 
         Calling open() on an already-open operator resets it: any resources
         from the previous open are released first, so re-opening can't leak.
+
+
+        `outer` is the current row of whatever ENCLOSES this operator --
+        empty for a top-level SELECT, and the outer side's current row for
+        an operator re-opened once per outer row inside a NestedLoopJoin
+        (week7-query-processing.md session 0.4/§41). Only IndexScan reads
+        it (a correlated seek value is an expression over the outer row's
+        columns); every other operator either ignores it or threads it
+        straight to its child. The default `()` is what keeps every
+        pre-week-7 call site (`operator.open()`) working unchanged.
         """
 
 
@@ -139,11 +149,14 @@ class SeqScan(Operator):
         self._positioned = False
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         # SHARED on the table before either cursor touches a page (SS38) --
         # txn is None only for tests that build this operator directly,
         # bypassing Connection/locking entirely (build_operator's own
-        # `stats=None` default follows the same convention).
+        # `stats=None` default follows the same convention). SeqScan has
+        # no correlated seek to evaluate, so `outer` is accepted and
+        # otherwise unused -- it exists on every open() only to keep the
+        # Operator contract uniform.
         if self.txn is not None:
             self.txn.lock_for_read(self.table.name)
         self.close()  # re-opening resets rather than leaking the old cursor
@@ -185,7 +198,7 @@ class SeqScan(Operator):
 
 
 
-def _seek_value(predicate: Predicate) -> Value:
+def _seek_value(predicate: Predicate, outer: Row = ()) -> Value:
     """Fold a seek_term's value side down to the constant to probe with.
 
 
@@ -199,15 +212,24 @@ def _seek_value(predicate: Predicate) -> Value:
     not to refuse the index.
 
 
-    `evaluate` is pure and, for a column-free expression, never indexes
-    into `row` -- the empty row is unreachable input rather than a stub.
-    Should a BoundColumn ever leak through classify_predicate, it surfaces
-    as ColumnNotFoundError ("the row is shorter than a BoundColumn's
-    index"), which is errors.py's existing name for a binder/executor
-    disagreement -- the right classification for this, and the reason no
-    bare assert is needed to guard it.
+    `outer` (week7-query-processing.md session 0.4) is the enclosing
+    NestedLoopJoin's current outer row -- what makes an index-join's
+    correlated seek (`o.user_id = u.id`, planned as a seek on `orders`
+    parameterized by `u.id`) possible: the seek VALUE is an expression
+    over the OUTER row's columns, bound against the outer row's own
+    layout, never the combined one (§41 trap #3). Every non-correlated
+    seek keeps working unchanged because `outer` defaults to `()`, same
+    empty row `evaluate` already treated as unreachable input for a
+    column-free expression.
+
+
+    Should a BoundColumn ever leak through classify_predicate for a
+    non-correlated seek, it surfaces as ColumnNotFoundError ("the row is
+    shorter than a BoundColumn's index"), which is errors.py's existing
+    name for a binder/executor disagreement -- the right classification
+    for this, and the reason no bare assert is needed to guard it.
     """
-    return evaluate(predicate.value, ())
+    return evaluate(predicate.value, outer)
 
 
 
@@ -267,7 +289,7 @@ class IndexScan(Operator):
         self._cursor: TableCursor | None = None
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         """Position this scan at the start of its rowid stream.
 
 
@@ -349,7 +371,7 @@ class IndexScan(Operator):
         # only allowed to change a query's SPEED, never its RESULTS, and
         # getting it wrong returns wrong rows silently rather than raising.
         for term in self.path.seek_terms:
-            if _seek_value(term) is None and term.operator != "IS":
+            if _seek_value(term, outer) is None and term.operator != "IS":
                 self._rowids = iter(())
                 return
 
@@ -365,17 +387,21 @@ class IndexScan(Operator):
 
         if all_eq:
             # get all the predicates
-            values = [_seek_value(predicate) for predicate in self.path.seek_terms]
+            values = [_seek_value(predicate, outer) for predicate in self.path.seek_terms]
             self._rowids = btree.seek_eq(values)
         else:
-            equality_prefix = [_seek_value(predicate) for predicate in self.path.seek_terms if predicate.operator in ["=", "IS"]]
+            equality_prefix = [
+                _seek_value(predicate, outer)
+                for predicate in self.path.seek_terms
+                if predicate.operator in ["=", "IS"]
+            ]
             low_bound: list[Value] = []
             high_bound: list[Value] = []
             low_inclusive = high_inclusive = True
 
 
             for predicate in self.path.seek_terms:
-                value = _seek_value(predicate)
+                value = _seek_value(predicate, outer)
                 if predicate.operator in ["<", "<="]:
                     # keep the TIGHTEST (smallest) upper bound seen -- two
                     # same-direction inequalities on one column (e.g. a
@@ -476,8 +502,8 @@ class Filter(Operator):
         self.predicate = predicate
 
 
-    def open(self) -> None:
-        self.child.open()
+    def open(self, outer: Row = ()) -> None:
+        self.child.open(outer)
 
 
     def next(self) -> Row | None:
@@ -515,8 +541,8 @@ class Project(Operator):
         self.expressions = expressions
 
 
-    def open(self) -> None:
-        self.child.open()
+    def open(self, outer: Row = ()) -> None:
+        self.child.open(outer)
 
 
     def next(self) -> Row | None:
@@ -579,7 +605,7 @@ class Insert(Operator):
         self._attempted = False
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         if self.txn is not None:
             self.txn.lock_for_write(self.statement.table.name)
         self._attempted = False
@@ -710,7 +736,7 @@ class Delete(Operator):
         self._attempted = False
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         if self.txn is not None:
             self.txn.lock_for_write(self.table.name)
         self._attempted = False
@@ -783,7 +809,7 @@ class Update(Operator):
         self._attempted = False
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         if self.txn is not None:
             self.txn.lock_for_write(self.table.name)
         self._attempted = False
@@ -961,7 +987,7 @@ class ExplainResult(Operator):
         self._row: Row | None = None
 
 
-    def open(self) -> None:
+    def open(self, outer: Row = ()) -> None:
         self._row = self._original_row
 
 

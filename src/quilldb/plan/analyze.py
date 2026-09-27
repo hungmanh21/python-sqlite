@@ -445,6 +445,18 @@ class StatisticsCatalog:
         else:
             self._analyze_table(self.catalog.get_table(target))
 
+        # New statistics invalidate any plan cached against the old ones
+        # (week7-query-processing.md §43), the same signal CREATE TABLE/
+        # CREATE INDEX already use. Bumping it HERE -- inside the caller's
+        # _run_mutation transaction, same as catalog.py's own two call
+        # sites -- means a rolled-back ANALYZE leaves it untouched: nothing
+        # about this write is special-cased, so it rides the same
+        # journal/header machinery that already makes DDL's bump
+        # rollback-safe (Transaction.commit() bakes the live header into
+        # page 1; a rollback's reload_header() re-reads the pre-transaction
+        # bytes and undoes it along with everything else).
+        self.pager.bump_schema_cookie()
+
 
     def _analyze_table(self, table: TableSchema) -> None:
         """Measure one table and every index on it, replacing their

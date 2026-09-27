@@ -504,3 +504,73 @@ def test_seek_range_respects_inclusive_bounds(index) -> None:
     assert list(index.seek_range(["b"], ["c"], high_inclusive=False)) == [2]
     assert list(index.seek_range(low=["c"])) == [3, 4]
     assert list(index.seek_range(high=["b"])) == [1, 2]
+
+
+def test_index_order_limit_reads_few_pages(tmp_path) -> None:
+    """week7-query-processing.md session 0.1: seek_eq/seek_range/scan must
+    be generators, not `return iter(a_list_built_up_front)` -- otherwise
+    `ORDER BY indexed_col LIMIT 10` reads the entire index before the
+    first row comes out, which this test would catch and the old
+    `test_scan_returns_every_entry_in_key_order` above never could (it
+    drains everything anyway).
+
+    Build a tree tall enough to have interior pages (~150 children per
+    interior page, per test_index_invariants.py), then reopen it through a
+    deliberately small pool and pull exactly one rowid from an unbounded
+    seek_range. A tree this size that streamed lazily touches only the
+    handful of pages on the root-to-leaf path; one that materializes the
+    whole rowid list first touches every leaf.
+    """
+    path = tmp_path / "t.db"
+    build_pager = Pager.create(path)
+    build_pool = BufferPool(build_pager, capacity=64)
+    root = _new_index_root(build_pager, build_pool)
+    idx = IndexBTree(build_pager, build_pool, root, n_key_columns=1, unique=False)
+    for i in range(3000):
+        idx.insert([i], i)
+    build_pool.flush_all()
+    build_pager.close()
+
+    pager = Pager.open(path)
+    pool = BufferPool(pager, capacity=64)
+    try:
+        idx = IndexBTree(pager, pool, root, n_key_columns=1, unique=False)
+        rowids = idx.seek_range()
+        assert next(rowids) == 0
+        assert pool.misses < 10
+    finally:
+        pager.close()
+
+
+def test_scan_reverse_on_a_leaf_only_tree_matches_reversed_scan(index) -> None:
+    """Sanity check with no interior pages at all -- if this fails, the
+    bug is in `_descend_rightmost`/the leaf case of `_scan_backward`, not
+    in the interior ascend/re-descend logic the next test exercises.
+    """
+    index.insert(["b"], 2)
+    index.insert(["a"], 1)
+    index.insert(["c"], 3)
+    assert list(index.scan_reverse()) == list(reversed(list(index.scan())))
+
+
+def test_scan_reverse_yields_forward_scan_reversed_across_interior_pages(tmp_path) -> None:
+    """week7-query-processing.md session 0.3's own proof: a backward walk
+    must re-emit interior (promoted) keys too, in the right place -- a
+    leaf-only walk in reverse would silently drop one entry per interior
+    cell, the same class of bug _scan_forward's own docstring warns about
+    for the forward direction.
+    """
+    pager = Pager.create(tmp_path / "t.db")
+    pool = BufferPool(pager, capacity=64)
+    try:
+        root = _new_index_root(pager, pool)
+        idx = IndexBTree(pager, pool, root, n_key_columns=1, unique=False)
+        for i in range(3000):
+            idx.insert([i], i)
+
+        forward = list(idx.scan())
+        backward = list(idx.scan_reverse())
+        assert backward == list(reversed(forward))
+        assert len(forward) == 3000
+    finally:
+        pager.close()
