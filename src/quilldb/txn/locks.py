@@ -196,6 +196,13 @@ class LockManager:
         acquire()'s wait loop), because that's the only moment a new edge
         appears -- a background scanner would do the same work later, never
         earlier.
+
+        TODO(human): see the TODO inline in _walk below -- the "upgrade
+        problem" (docs/implementation/week6-concurrency.md §35, "the upgrade
+        problem, which the roadmap doesn't mention and which will bite
+        you") has a self-loop variant this walk doesn't handle yet.
+        test_deadlock.py::test_upgrade_blocked_by_another_reader_is_not_a_deadlock
+        reproduces it and is currently red.
         """
         def _walk(
             txn_id: int, path: list[int], path_edges: list[tuple[int, str, int]]
@@ -213,6 +220,25 @@ class LockManager:
 
             path.append(txn_id)
             for holder in entry.holders:
+                # TODO(human): txn_id can be its OWN holder here -- that's
+                # exactly the "upgrade" pattern (docs/implementation/
+                # week6-concurrency.md §35): txn_id already holds SHARED on
+                # `resource` from an earlier read, and is now waiting to
+                # escalate to EXCLUSIVE on that SAME resource. That is not a
+                # wait-for edge -- a transaction never waits behind its own
+                # hold, only behind a DIFFERENT transaction's conflicting
+                # one. Left as-is, `holder == txn_id` recurses straight back
+                # into txn_id, `if txn_id in path` fires one level down, and
+                # this reports txn_id deadlocked against itself even when
+                # the REAL blocker (some other holder of `resource`, elsewhere
+                # in this same dict) isn't part of any cycle at all -- the
+                # global "__writer__" lock (docs/concurrency.md, "Why a
+                # single writer") only rules out two DIFFERENT transactions
+                # racing to upgrade the same table; it says nothing about a
+                # transaction upgrading against its own prior hold. Skip
+                # `holder == txn_id` before recursing.
+                if holder == txn_id:
+                    continue
                 path_edges.append((txn_id, resource, holder))
                 found = _walk(holder, path, path_edges)
                 if found is not None:

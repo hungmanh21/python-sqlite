@@ -169,6 +169,56 @@ def test_bystander_queued_behind_a_cycle_is_not_raised_as_its_victim(lm: LockMan
         lm.acquire(1, "X", LockMode.EXCLUSIVE, timeout=0.3)
 
 
+def test_upgrade_blocked_by_another_reader_is_not_a_deadlock(lm: LockManager) -> None:
+    """The upgrade problem (week6-concurrency.md SS35, "the upgrade problem,
+    which the roadmap doesn't mention and which will bite you"): txn 1 reads
+    "accounts" (SHARED), txn 2 also reads it (SHARED) -- an unrelated,
+    perfectly ordinary concurrent reader -- then txn 1 wants to write it
+    (EXCLUSIVE). Txn 1 is legitimately blocked by txn 2's SHARED hold; txn 2
+    isn't waiting on anything and will simply finish and release. That's
+    ordinary contention, not a cycle -- the "__writer__" global lock
+    (week6-concurrency.md's recommended sidestep) only rules out two
+    DIFFERENT transactions racing to upgrade the same table; it says nothing
+    about a transaction's own prior SHARED hold on the table it's now
+    escalating on.
+
+    Regression: txn 1's own SHARED hold on "accounts" must not create a
+    wait-for edge back to itself. _detect_deadlock's walk, given a resource
+    whose holders include the waiting transaction itself (exactly what an
+    upgrade looks like), must skip that self-entry rather than recursing
+    into it -- recursing finds txn_id already in `path` one level down and
+    reports a deadlock against itself, even though the real (and only)
+    blocker, txn 2, isn't part of any cycle at all.
+    """
+    lm.acquire(1, "accounts", LockMode.SHARED)
+    lm.acquire(2, "accounts", LockMode.SHARED)
+
+    results: dict[int, BaseException | None] = {}
+
+    def upgrade() -> None:
+        try:
+            lm.acquire(1, "accounts", LockMode.EXCLUSIVE, timeout=2.0)
+            results[1] = None
+        except (DeadlockError, LockTimeoutError) as exc:
+            results[1] = exc
+
+    t = threading.Thread(target=upgrade, daemon=True)
+    t.start()
+
+    # Not _wait_until_waiting_for: under the bug, _detect_deadlock raises
+    # within the very acquire() call that sets the wait-for edge, and
+    # acquire()'s `finally` clears that edge again before this could ever
+    # observe it "set" -- there is no window where it reliably persists.
+    # A short sleep is the honest wait here: give the (buggy) detector every
+    # opportunity to have already run and raised.
+    time.sleep(0.2)
+    assert 1 not in results  # still legitimately waiting on txn 2, not deadlocked
+
+    lm.release_all(2)  # the real reader finishes
+    t.join(timeout=2.0)
+    assert results.get(1) is None
+
+
 def test_blocked_wait_without_a_cycle_is_not_a_deadlock(lm: LockManager) -> None:
     """A plain block (no reverse edge) must not be mistaken for a cycle --
     it should just wait, then get granted once the holder releases.
