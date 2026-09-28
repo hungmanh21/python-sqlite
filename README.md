@@ -146,8 +146,10 @@ $ quilldb inspect mydata.db             # dump a file header
 
 Named, not hidden: WAL, `VACUUM`, `DROP TABLE` / `DROP INDEX` / `ALTER TABLE`, partial and
 expression indexes, `COLLATE`, `DESC` indexes, `WITHOUT ROWID`, `AUTOINCREMENT`, foreign keys,
-`CHECK`, `INSERT OR REPLACE` / `ON CONFLICT`, and — in the planner — skip-scan, `OR`
-decomposition and multi-index intersection.
+`CHECK`, `INSERT OR REPLACE` / `ON CONFLICT`, `GROUP BY` / `HAVING` / `DISTINCT` combined with a
+`JOIN` (`sql/binder.py`'s `bind_join_select` rejects it explicitly rather than silently returning
+unaggregated rows), and — in the planner — skip-scan, `OR` decomposition and multi-index
+intersection.
 
 Feature gaps and format fidelity are different claims. Missing features are gaps; anything that
 touches on-disk bytes has to match the real format exactly, because a real SQLite binary reads
@@ -164,9 +166,16 @@ direction (refuse rather than silently coerce or guess):
 | `1 + 'a'` raises `TypeMismatchError` | `1` (text casts to `0`) | Same reasoning, for expressions instead of storage (`exec/expressions.py`) |
 | `WHERE '1'` treats all text as false | Treats `'1'` as true | Implementing SQLite's numeric-string affinity for `WHERE` but not elsewhere would be an inconsistent half-measure (`exec/expressions.py`) |
 | `SELECT id, COUNT(*) FROM t` (no `GROUP BY`) raises `AggregateError` | Returns `COUNT(*)` alongside an arbitrary row's `id` | A bare column with no `GROUP BY` key to be functionally determined by is ambiguous the moment the table has more than one row — silently picking one row's value is how a query returns a plausible wrong answer (`sql/binder.py`'s `bind_aggregate_select`, week7-query-processing.md §40) |
+| An `ORDER BY` sorting more than 1,000,000 rows raises `SortLimitExceededError` | Spills to a temp file and keeps sorting | `exec/sort.py`'s `Sort` holds every row in memory (`MAX_SORT_ROWS`); refusing past a documented cap with an actionable message ("add an index on the `ORDER BY` column") beats risking an OOM kill |
 
 A differential test that disagrees with sqlite3 on one of these rows is expected behavior, not a
 bug — that's what distinguishes a documented deviation from an undocumented one.
+
+The join-order search (`plan/search.py`'s `enumerate_join_plans`) enumerates every legal order
+exhaustively rather than pruning, which is only "obviously cheap" (at most `3! = 6` orders) because
+this project's tests never join more than three tables — the SQL grammar itself has no such limit,
+so a longer chain still parses and runs, just without the same search-is-basically-free guarantee
+or test coverage past three.
 
 ## Documentation
 
