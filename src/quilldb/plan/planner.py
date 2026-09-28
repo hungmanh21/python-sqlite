@@ -17,6 +17,33 @@ from typing import Literal
 
 from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.plan.predicates import Predicate
+from quilldb.sql.binder import BoundColumn, BoundExpression
+
+
+@dataclass(frozen=True)
+class SortKey:
+    """One ORDER BY-shaped requirement or guarantee: an expression plus a
+    direction (week7-query-processing.md session 7, "interesting orders").
+
+    Doubles as both sides of the comparison plan/search.py's sort_cost has
+    to make:
+      - what a query's ORDER BY actually asks for (built from the bound
+        SELECT's own order_by, one SortKey per key, in the query's own
+        write order), and
+      - what an AccessPath/PlanCandidate's own traversal already guarantees
+        (AccessPath.output_order below), one entry per index column past
+        any equality prefix, ALL sharing that path's single `reverse` flag
+        -- a B+tree walks forward or backward as a whole, never some
+        columns one way and others the other (chapter 18 SS18.3).
+
+    `expression` is unresolved table-scope (BoundColumn.table_ordinal),
+    exactly the form _join_expression/_expression already produce for a
+    bare column reference -- so comparing a requested key against a
+    guaranteed one is plain `==`, no translation needed either direction.
+    """
+
+    expression: BoundExpression
+    descending: bool
 
 
 @dataclass(frozen=True)
@@ -58,6 +85,19 @@ class AccessPath:
     only decides legality, so it has nothing to estimate from yet.
     `cost` is None until stage 3 (plan/cost.py's assign_cost) fills it
     in, for the same reason.
+
+    `output_order`/`reverse` (session 7, "interesting orders") are the
+    physical-ordering half of this path, set only by `_index_order_path`
+    below -- a full, unconstrained walk of an index is the only shape
+    stage 1 currently knows is genuinely still sorted end to end. An
+    equality-consumed prefix ALSO leaves its trailing columns sorted in
+    principle, but `_match_index_prefix` doesn't advertise that yet
+    (documented gap, same spirit as exec/sort.py's missing top-K heap):
+    every seeking AccessPath here has `output_order == ()`, so it never
+    wins a sort-avoidance comparison even where a real database could.
+    `reverse` tells IndexScan.open() which of IndexBTree's two full-walk
+    methods to call (`scan()`/`seek_eq([])` vs `scan_reverse()`) -- it is
+    meaningless (and always False) whenever `output_order` is empty.
     """
 
 
@@ -68,6 +108,8 @@ class AccessPath:
     rows_fetched: int = 0
     est_rows: int = 0
     cost: PlanCost | None = None
+    output_order: tuple[SortKey, ...] = ()
+    reverse: bool = False
 
 
 
@@ -76,6 +118,7 @@ def enumerate_access_paths(
     table: TableSchema,
     indexes: list[IndexSchema],
     predicates: list[Predicate],
+    table_ordinal: int = 0,
 ) -> list[AccessPath]:
     """Every legal way to answer a WHERE clause against `table`.
 
@@ -86,6 +129,14 @@ def enumerate_access_paths(
     `indexes` is then checked against the leading-column rule (§12.3); an
     index that can't form a seek at all is simply omitted, not added with
     an empty seek.
+
+
+    `table_ordinal` (default 0, session 7) is only ever non-zero for a
+    join's own per-table planning (plan/search.py's `_cheapest_path`): it's
+    threaded into every SortKey this table's candidates advertise, so an
+    ORDER BY expression bound against that same table-scope (`_join_expression`'s
+    output) can be compared to it with plain `==` -- no separate
+    translation step, matching BoundColumn.table_ordinal's own reasoning.
     """
     paths = [AccessPath("seq_scan", None, (), tuple(predicates))]
 
@@ -103,12 +154,15 @@ def enumerate_access_paths(
             # No predicate touches this index's leading column, so
             # _match_index_prefix has nothing to seek with -- but the
             # index's own sort order is still a legal (if usually
-            # expensive) way to answer the query, and it's the ONLY
-            # candidate that can satisfy an `ORDER BY indexed_col` without
-            # a Sort on top (week7-query-processing.md session 0.2). Offer
-            # it here so cost comparison, not omission, is what rules it
-            # out when there's no LIMIT to make it worthwhile.
-            paths.append(_index_order_path(index, predicates))
+            # expensive) way to answer the query, and it's the ONLY shape
+            # that can satisfy an ORDER BY without a Sort on top
+            # (week7-query-processing.md session 0.2/session 7). Offer
+            # both traversal directions -- a B+tree walks backwards for
+            # free (chapter 18 SS18.3) -- so cost comparison, not omission,
+            # is what rules either out when there's no ORDER BY/LIMIT to
+            # make it worthwhile.
+            paths.append(_index_order_path(index, predicates, table, table_ordinal, reverse=False))
+            paths.append(_index_order_path(index, predicates, table, table_ordinal, reverse=True))
 
 
     return paths
@@ -201,18 +255,114 @@ def _match_index_prefix(
 
 
 
-def _index_order_path(index: IndexSchema, predicates: list[Predicate]) -> AccessPath:
-    """A full walk of `index` start to end, in its own sort order -- no
-    seek at all (week7-query-processing.md session 0.2).
+def _index_order_path(
+    index: IndexSchema,
+    predicates: list[Predicate],
+    table: TableSchema,
+    table_ordinal: int,
+    *,
+    reverse: bool,
+) -> AccessPath:
+    """A full walk of `index` start to end, in its own sort order (forward)
+    or the reverse of it (backward) -- no seek at all
+    (week7-query-processing.md session 0.2/session 7).
 
 
     Shares the "index_scan" kind with a seeking path (empty `seek_terms`
     is what tells them apart), which is deliberate: IndexScan.open()
-    already treats an empty `seek_terms` as "seek_eq([])", and
-    `compare_keys` already treats a zero-length probe as matching every
-    stored key, so the executor needs no new case at all -- only the
-    planner needs to know this candidate exists. Every predicate stays in
-    `residual`, since a path with nothing to seek on filters nothing on
-    its own.
+    already treats an empty `seek_terms` as "every entry, in `reverse`'s
+    direction" (a forward walk was the only direction before session 7;
+    `reverse` picks between IndexBTree's `scan()`/`seek_eq([])` and
+    `scan_reverse()`), so the executor needs no new AccessPath.kind at all
+    -- only `reverse`. Every predicate stays in `residual`, since a path
+    with nothing to seek on filters nothing on its own.
+
+
+    `output_order` is every one of `index.columns`, in index order, each
+    tagged `reverse` -- this is the ONE shape stage 1 currently knows is
+    still sorted end to end (see AccessPath's own docstring for the gap
+    this leaves on a seeking path). BoundColumn's `index`/`data_type` come
+    from `table.column_index`/`table.columns`, not from the Predicate
+    machinery -- there may be no predicate on these columns at all (that's
+    the whole point: nothing constrained this index, so nothing but its
+    own order makes it worth considering).
     """
-    return AccessPath(kind="index_scan", index=index, seek_terms=(), residual=tuple(predicates))
+    output_order = tuple(
+        SortKey(BoundColumn(table.column_index(name), name, table.columns[table.column_index(name)].data_type, table_ordinal), reverse)
+        for name in index.columns
+    )
+    return AccessPath(
+        kind="index_scan",
+        index=index,
+        seek_terms=(),
+        residual=tuple(predicates),
+        output_order=output_order,
+        reverse=reverse,
+    )
+
+
+@dataclass(frozen=True)
+class PlanShape:
+    """The reusable GEOMETRY of a winning AccessPath -- which index (or
+    none, for seq_scan) and which direction -- with no bound VALUE
+    anywhere in it (plan/cache.py, week7-query-processing.md §43's plan
+    cache).
+
+
+    Deliberately NOT the AccessPath itself: an AccessPath's `seek_terms`/
+    `residual` are Predicate objects whose `.value` is THIS bind's own
+    BoundExpression tree -- for `WHERE id = ?`, literally a BoundLiteral
+    holding this call's parameter value. Caching and reusing THAT for a
+    later call with a different `?` would answer every later call with the
+    first call's value -- exactly the trap the plan cache's own docstring
+    warns never to fall into. `rebuild_access_path` below re-derives a
+    fresh AccessPath from a PlanShape plus THIS call's own fresh
+    predicates, so every value in it is this execution's.
+    """
+
+    kind: Literal["seq_scan", "index_scan"]
+    index_name: str | None
+    reverse: bool
+
+
+def access_path_shape(path: AccessPath) -> PlanShape:
+    """The PlanShape a chosen AccessPath reduces to -- what plan/cache.py
+    actually stores."""
+    return PlanShape(path.kind, path.index.name if path.index is not None else None, path.reverse)
+
+
+def rebuild_access_path(
+    shape: PlanShape,
+    table: TableSchema,
+    indexes: list[IndexSchema],
+    predicates: list[Predicate],
+    table_ordinal: int = 0,
+) -> AccessPath:
+    """Re-derive the AccessPath a cached PlanShape names, against THIS
+    call's own fresh `predicates` -- skips re-enumerating and re-costing
+    every OTHER candidate (that's the whole saving a cache hit buys), but
+    reuses the exact same column-matching logic enumerate_access_paths
+    would have run for the winning index, so the rebuilt seek_terms/
+    residual split is identical to a fresh enumeration+choose, just
+    without paying to cost the candidates that would have lost anyway.
+
+
+    For a fixed SQL text (plan/cache.py's cache key), WHICH columns carry
+    an equality/inequality predicate is fixed too -- only the VALUES those
+    predicates hold differ call to call -- so `_match_index_prefix`
+    against the SAME index always reaches the SAME seek_terms/residual
+    split; nothing here depends on `shape` beyond which index and
+    direction to use.
+    """
+    if shape.kind == "seq_scan":
+        return AccessPath("seq_scan", None, (), tuple(predicates))
+
+    index = next(i for i in indexes if i.name == shape.index_name)
+    by_column: dict[str, list[Predicate]] = {}
+    for predicate in predicates:
+        by_column.setdefault(predicate.column, []).append(predicate)
+
+    path = _match_index_prefix(index, by_column, predicates)
+    if path is not None:
+        return path
+    return _index_order_path(index, predicates, table, table_ordinal, reverse=shape.reverse)

@@ -11,10 +11,10 @@ rule, not just a rule that happens to agree on cases we made up ourselves.
 
 
 from quilldb.catalog.schema import ColumnSchema, IndexSchema, TableSchema
-from quilldb.plan.planner import AccessPath, enumerate_access_paths
+from quilldb.plan.planner import AccessPath, SortKey, enumerate_access_paths
 from quilldb.plan.predicates import Predicate
 from quilldb.sql.ast import DataType
-from quilldb.sql.binder import BoundLiteral
+from quilldb.sql.binder import BoundColumn, BoundLiteral
 
 _TABLE = TableSchema(
     "t",
@@ -147,32 +147,71 @@ def test_c_dropped_when_b_has_no_predicate_at_all():
 
 
 
-def test_c_alone_offers_no_seek_but_still_an_index_order_candidate():
+def test_c_alone_offers_no_seek_but_still_an_index_order_candidate() -> None:
     """`WHERE c=3` with no constraint on `a`: the index's first column has
     no predicate, so there is nothing to SEEK with -- but
     week7-query-processing.md session 0.2 still offers the index's own
     sort order as a candidate (empty seek_terms), because a future
     `ORDER BY a` needs *something* to compare against a Sort. `c=3` can't
     be consumed by this path at all, so it stays in `residual` whole.
+
+    Session 7 offers BOTH traversal directions (a B+tree walks backwards
+    for free) -- forward for `ORDER BY a ASC`, reverse for `ORDER BY a DESC`.
     """
     paths = enumerate_access_paths(_TABLE, [_ABC], [_eq("c", 3)])
-    (path,) = _index_paths(paths)
-    assert path.seek_terms == ()
-    assert [p.column for p in path.residual] == ["c"]
+    forward, backward = sorted(_index_paths(paths), key=lambda p: p.reverse)
+    for path in (forward, backward):
+        assert path.seek_terms == ()
+        assert [p.column for p in path.residual] == ["c"]
+    assert forward.reverse is False
+    assert backward.reverse is True
 
 
-def test_index_order_candidate_appears_even_with_no_where_at_all():
+def test_index_order_candidate_appears_even_with_no_where_at_all() -> None:
     """week7-query-processing.md session 0.2, DoD row: `enumerate_access_paths`
     offers an index-order candidate with no seek terms -- this is what makes
     a bare `SELECT * FROM t ORDER BY a` (no WHERE clause) able to avoid a
     Sort at all, where before this index simply never became a candidate.
     """
     paths = enumerate_access_paths(_TABLE, [_ABC], [])
-    (path,) = _index_paths(paths)
-    assert path.seek_terms == ()
-    assert path.residual == ()
+    forward, backward = sorted(_index_paths(paths), key=lambda p: p.reverse)
+    for path in (forward, backward):
+        assert path.seek_terms == ()
+        assert path.residual == ()
+    assert forward.reverse is False
+    assert backward.reverse is True
 
 
+def _column_names(keys: tuple[SortKey, ...]) -> list[str]:
+    names = []
+    for key in keys:
+        assert isinstance(key.expression, BoundColumn)
+        names.append(key.expression.name)
+    return names
+
+
+def test_index_order_candidates_advertise_every_column_as_output_order() -> None:
+    """Session 7: an unconstrained index-order path's `output_order` is
+    every one of its columns, in index order, each tagged with that path's
+    own direction -- what plan/search.py's sort_cost compares an ORDER BY
+    against.
+    """
+    paths = enumerate_access_paths(_TABLE, [_ABC], [])
+    forward, backward = sorted(_index_paths(paths), key=lambda p: p.reverse)
+    assert _column_names(forward.output_order) == ["a", "b", "c"]
+    assert all(key.descending is False for key in forward.output_order)
+    assert _column_names(backward.output_order) == ["a", "b", "c"]
+    assert all(key.descending is True for key in backward.output_order)
+
+
+def test_seeking_path_has_no_output_order() -> None:
+    """Documented gap (planner.py's AccessPath docstring): an
+    equality-consumed prefix leaves its trailing columns genuinely sorted
+    too, but stage 1 doesn't advertise that yet -- every seeking path's
+    output_order stays empty, so it never wins a sort-avoidance comparison.
+    """
+    (path,) = _index_paths(enumerate_access_paths(_TABLE, [_ABC], [_eq("a")]))
+    assert path.output_order == ()
 
 
 def test_in_counts_as_equality_for_prefix_purposes():

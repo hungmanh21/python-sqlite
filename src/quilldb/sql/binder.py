@@ -169,6 +169,29 @@ class BoundOrderKey:
 
 
 @dataclass(frozen=True)
+class JoinOrderKey:
+    """BoundOrderKey's twin for a joined SELECT (session 7): an ORDER BY
+    key kept as an EXPRESSION rather than resolved to a row position.
+
+    A single-table/aggregate SELECT's output row shape is fixed the moment
+    binding finishes, so BoundOrderKey can commit to "column N" right away.
+    A join's row shape isn't decided until plan/search.py picks a join
+    order -- and which order it picks can itself depend on whether it
+    satisfies this ORDER BY (plan/planner.py's SortKey, the
+    "interesting orders" comparison) -- so resolving to a position has to
+    wait until exec/operators.py's _build_join_operator has a chosen
+    PlanCandidate's flat layout in hand. `expression` is table-scope
+    (BoundColumn.table_ordinal), exactly what _join_expression already
+    produces for a bare column reference -- comparable with plain `==`
+    against a PlanCandidate's own output_order with no translation, same
+    reasoning as SortKey's own docstring.
+    """
+
+    expression: BoundExpression
+    descending: bool = False
+
+
+@dataclass(frozen=True)
 class BoundCreateTable:
     statement: CreateTable
     """CREATE TABLE needs no resolution -- it INTRODUCES names rather than
@@ -275,6 +298,15 @@ class BoundJoinSelect:
     joins: tuple[BoundJoin, ...]
     expressions: tuple[BoundExpression, ...]
     where: BoundExpression | None
+    order_by: tuple[JoinOrderKey, ...] = ()
+    limit: int | None = None
+    offset: int = 0
+    """Session 7: DISTINCT/GROUP BY/HAVING combined with a JOIN are still
+    rejected outright (bind_join_select), but ORDER BY/LIMIT/OFFSET no
+    longer are -- see JoinOrderKey's own docstring for why `order_by`
+    stays expression-shaped here instead of matching BoundSelect's
+    position-based BoundOrderKey.
+    """
 
 
 @dataclass(frozen=True)
@@ -403,13 +435,18 @@ class BoundAnalyze:
 
 @dataclass(frozen=True)
 class BoundExplain:
-    select: BoundSelect
+    select: BoundSelect | BoundJoinSelect
     analyze: bool
     """Unlike BoundCreateTable/BoundAnalyze, this DOES resolve: the inner
-    SELECT is bound through the same bind_select() a bare SELECT uses, so
-    an EXPLAIN of an unknown table/column fails at bind time exactly like
-    the SELECT it wraps would -- there's no reason EXPLAIN should be more
-    forgiving about names than the query it's explaining.
+    SELECT is bound through the same bind_select()/bind_join_select() a
+    bare SELECT uses, so an EXPLAIN of an unknown table/column fails at
+    bind time exactly like the SELECT it wraps would -- there's no reason
+    EXPLAIN should be more forgiving about names than the query it's
+    explaining.
+
+    `BoundJoinSelect` only (session 7, "EXPLAIN for joins") -- an
+    aggregate SELECT's own EXPLAIN support is a separate, still-open gap,
+    unrelated to this session's join work.
     """
 
 
@@ -613,9 +650,12 @@ def bind(
     elif isinstance(statement, Analyze):
         bound = BoundAnalyze(statement)
     elif isinstance(statement, Explain):
-        if statement.statement.joins:
-            raise UnsupportedFeatureError("EXPLAIN of a joined SELECT is not supported yet")
-        bound = BoundExplain(binder.bind_select(statement.statement), statement.analyze)
+        explained: BoundSelect | BoundJoinSelect = (
+            binder.bind_join_select(statement.statement)
+            if statement.statement.joins
+            else binder.bind_select(statement.statement)
+        )
+        bound = BoundExplain(explained, statement.analyze)
     elif isinstance(statement, Begin):
         bound = BoundBegin(statement)
     elif isinstance(statement, Commit):
@@ -711,18 +751,23 @@ class _Binder:
         0..k are already assembled into one row, and it's only checking
         that its own new table fits.
 
-        `statement.distinct`/`group_by`/`having`/`order_by`/`limit`/`offset`
-        are rejected rather than silently dropped: BoundJoinSelect has none
-        of those fields, and this method never looks at them below, so an
-        unguarded `SELECT DISTINCT ... FROM a JOIN b` or `... FROM a JOIN b
-        GROUP BY ...` would parse and bind cleanly but quietly return every
-        unaggregated joined row -- the exact "binder changes results"
-        failure this codebase's error policy exists to avoid. A select
-        list with a top-level aggregate call still gets caught downstream
+        `statement.distinct`/`group_by`/`having` are still rejected rather
+        than silently dropped: BoundJoinSelect has no fields for them, and
+        this method never looks at them below, so an unguarded `SELECT
+        DISTINCT ... FROM a JOIN b` or `... FROM a JOIN b GROUP BY ...`
+        would parse and bind cleanly but quietly return every unaggregated
+        joined row -- the exact "binder changes results" failure this
+        codebase's error policy exists to avoid. A select list with a
+        top-level aggregate call still gets caught downstream
         (`_join_expression` has no FunctionCall case), but GROUP BY/HAVING
-        with no such call, or a bare DISTINCT/ORDER BY/LIMIT, would
-        otherwise sail through unnoticed (same reasoning as bind_aggregate_select's own
+        with no such call, or a bare DISTINCT, would otherwise sail
+        through unnoticed (same reasoning as bind_aggregate_select's own
         DISTINCT check).
+
+        `order_by`/`limit`/`offset` (session 7) ARE bound below, into
+        BoundJoinSelect's own fields -- see JoinOrderKey's docstring for
+        why ORDER BY stays expression-shaped instead of matching
+        BoundSelect's position-based resolution.
         """
         if statement.distinct:
             raise UnsupportedFeatureError("DISTINCT combined with a JOIN is not supported yet")
@@ -730,12 +775,6 @@ class _Binder:
             raise UnsupportedFeatureError("GROUP BY combined with a JOIN is not supported yet")
         if statement.having is not None:
             raise UnsupportedFeatureError("HAVING combined with a JOIN is not supported yet")
-        if statement.order_by:
-            raise UnsupportedFeatureError("ORDER BY combined with a JOIN is not supported yet")
-        if statement.limit is not None:
-            raise UnsupportedFeatureError("LIMIT combined with a JOIN is not supported yet")
-        if statement.offset is not None:
-            raise UnsupportedFeatureError("OFFSET combined with a JOIN is not supported yet")
 
         scopes = self._build_scopes(statement)
 
@@ -755,7 +794,36 @@ class _Binder:
             expressions = tuple(self._join_expression(e, scopes) for e in statement.expressions)
 
         where = None if statement.where is None else self._join_expression(statement.where, scopes)
-        return BoundJoinSelect(tuple(scopes), tuple(joins), expressions, where)
+        order_by = self._bind_join_order_by(statement.order_by, expressions, scopes)
+        limit = self._bind_limit(statement.limit)
+        offset = self._bind_offset(statement.offset)
+        return BoundJoinSelect(tuple(scopes), tuple(joins), expressions, where, order_by, limit, offset)
+
+    def _bind_join_order_by(
+        self,
+        items: tuple[OrderKey, ...],
+        expressions: tuple[BoundExpression, ...],
+        scopes: list[TableScope],
+    ) -> tuple[JoinOrderKey, ...]:
+        """`_bind_order_by`'s twin for a joined SELECT: resolves each item
+        to a JoinOrderKey (expression, not position) rather than a
+        BoundOrderKey. An ordinal (`ORDER BY 2`) still means "the second
+        output column" and is resolved eagerly against `expressions` here
+        -- which expression that names doesn't depend on a join order that
+        hasn't been picked yet, only WHERE it lands in the final row does,
+        and that's exec/operators.py's _build_join_operator's job, once a
+        PlanCandidate's flat layout exists to resolve against.
+        """
+        keys = []
+        for item in items:
+            if isinstance(item.expression, Literal) and isinstance(item.expression.value, int):
+                ordinal = item.expression.value
+                if ordinal < 1 or ordinal > len(expressions):
+                    raise ColumnNotFoundError(f"ORDER BY position {ordinal} is out of range")
+                keys.append(JoinOrderKey(expressions[ordinal - 1], item.descending))
+            else:
+                keys.append(JoinOrderKey(self._join_expression(item.expression, scopes), item.descending))
+        return tuple(keys)
 
     def _build_scopes(self, statement: Select) -> list[TableScope]:
         refs = (statement.table, *(join.table for join in statement.joins))

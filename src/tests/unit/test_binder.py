@@ -43,6 +43,7 @@ from quilldb.sql.binder import (
     BoundSelect,
     BoundUnaryOp,
     BoundUpdate,
+    JoinOrderKey,
     bind,
     resolve_layout,
 )
@@ -1032,25 +1033,53 @@ def test_negative_offset_raises() -> None:
         bind(parse("SELECT * FROM users LIMIT 10 OFFSET -1"), _USERS_CATALOG)
 
 
-def test_order_by_combined_with_join_is_unsupported() -> None:
-    with pytest.raises(UnsupportedFeatureError):
+def test_order_by_on_a_join_binds_as_a_join_order_key() -> None:
+    """Session 7: ORDER BY combined with a JOIN is no longer rejected --
+    it binds to JoinOrderKey (expression-shaped, table-scope), not the
+    position-based BoundOrderKey a single-table/aggregate SELECT gets,
+    since a join's row layout isn't decided until a PlanCandidate is
+    chosen (see JoinOrderKey's own docstring).
+    """
+    bound = bind(
+        parse("SELECT users.id FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.id DESC"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.order_by == (JoinOrderKey(BoundColumn(0, "id", DataType.INTEGER, 0), descending=True),)
+
+
+def test_order_by_ordinal_on_a_join_resolves_against_the_select_list() -> None:
+    bound = bind(
+        parse("SELECT users.id, orders.total FROM users JOIN orders ON users.id = orders.user_id ORDER BY 2"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.order_by == (JoinOrderKey(bound.expressions[1], descending=False),)
+
+
+def test_order_by_ordinal_past_the_select_list_on_a_join_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
         bind(
-            parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.id"),
+            parse("SELECT users.id FROM users JOIN orders ON users.id = orders.user_id ORDER BY 5"),
             _JOIN_CATALOG,
         )
 
 
-def test_limit_combined_with_join_is_unsupported() -> None:
-    with pytest.raises(UnsupportedFeatureError):
-        bind(parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1"), _JOIN_CATALOG)
+def test_limit_on_a_join_binds() -> None:
+    bound = bind(parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1"), _JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.limit == 1
+    assert bound.offset == 0
 
 
-def test_offset_combined_with_join_is_unsupported() -> None:
-    with pytest.raises(UnsupportedFeatureError):
-        bind(
-            parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1 OFFSET 1"),
-            _JOIN_CATALOG,
-        )
+def test_offset_on_a_join_binds() -> None:
+    bound = bind(
+        parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1 OFFSET 1"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.limit == 1
+    assert bound.offset == 1
 
 
 # ---- exercises _resolve_order_by_key (implemented) ----

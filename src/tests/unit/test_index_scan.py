@@ -9,6 +9,8 @@ AccessPath is Step 2's concern, not this file's.
 """
 
 
+from pathlib import Path
+
 from quilldb.catalog.catalog import Catalog
 from quilldb.catalog.schema import IndexSchema, TableSchema
 from quilldb.exec.operators import IndexScan, Insert, Operator
@@ -166,6 +168,78 @@ def test_equality_seek_on_an_index_matching_many_rows_returns_all_of_them(tmp_pa
     path = _path(index, _eq("age", 30))
     rows = _drain(IndexScan(pager, pool, table, path))
     assert {r[0] for r in rows} == {1, 2, 3}
+    pager.close()
+
+
+
+
+# =====================================================================
+# full index-order walk, forward and reverse (session 7, no seek at all --
+# plan/planner.py's _index_order_path)
+# =====================================================================
+
+
+
+
+def test_no_seek_terms_walks_the_index_forward_by_default(tmp_path: Path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 30), (2, "bob", 10), (3, "amy", 20))
+
+
+    path = AccessPath("index_scan", index, (), ())
+    rows = _drain(IndexScan(pager, pool, table, path))
+    assert [r[2] for r in rows] == [10, 20, 30]
+    pager.close()
+
+
+
+
+def test_reverse_flag_walks_the_index_backward(tmp_path: Path) -> None:
+    """The executor half of session 7's sort-avoidance story:
+    `ORDER BY age DESC` with no WHERE at all can be answered by walking the
+    index back to front (IndexBTree.scan_reverse, chapter 18 SS18.3) --
+    proven here directly against IndexScan, independent of whether the
+    planner has learned to pick this path yet (plan/search.py's sort_cost).
+    """
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 30), (2, "bob", 10), (3, "amy", 20))
+
+
+    path = AccessPath("index_scan", index, (), (), reverse=True)
+    rows = _drain(IndexScan(pager, pool, table, path))
+    assert [r[2] for r in rows] == [30, 20, 10]
+    pager.close()
+
+
+
+
+def test_reverse_with_no_rows_produces_no_rows(tmp_path: Path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+
+
+    path = AccessPath("index_scan", index, (), (), reverse=True)
+    assert _drain(IndexScan(pager, pool, table, path)) == []
+    pager.close()
+
+
+
+
+def test_reverse_leaves_no_pins_after_exhaustion(tmp_path: Path) -> None:
+    pager, pool, catalog = _db(tmp_path)
+    table = _create_users(catalog)
+    index = _create_index(catalog, "CREATE INDEX idx_age ON users (age)")
+    _insert(pager, pool, catalog, (1, "ada", 30), (2, "bob", 10), (3, "amy", 20))
+
+
+    path = AccessPath("index_scan", index, (), (), reverse=True)
+    _drain(IndexScan(pager, pool, table, path))
+    assert _outstanding_pins(pool) == 0
     pager.close()
 
 

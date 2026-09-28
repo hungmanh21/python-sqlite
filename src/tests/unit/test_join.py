@@ -198,3 +198,99 @@ def test_matched_flag_resets_per_outer_row_not_per_open(tmp_path: Path) -> None:
             "SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id"
         ).fetchall()
         assert sorted(rows, key=str) == [("ada", 100), ("ada", 50), ("carol", None)]
+
+
+# =====================================================================
+# ORDER BY / LIMIT / OFFSET on a joined SELECT (session 7, §43-44)
+# =====================================================================
+
+
+def _seed_orders(db: quilldb.Connection) -> None:
+    _setup(db)
+    db.execute("INSERT INTO users VALUES (1, 'ada')")
+    db.execute("INSERT INTO users VALUES (2, 'bob')")
+    db.execute("INSERT INTO orders VALUES (10, 1, 100)")
+    db.execute("INSERT INTO orders VALUES (11, 1, 50)")
+    db.execute("INSERT INTO orders VALUES (12, 2, 200)")
+    db.execute("ANALYZE")
+
+
+def test_order_by_on_a_join_sorts_the_joined_rows(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.total DESC"
+        ).fetchall()
+        assert rows == [("bob", 200), ("ada", 100), ("ada", 50)]
+
+
+def test_order_by_ordinal_on_a_join(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY 2"
+        ).fetchall()
+        assert rows == [("ada", 50), ("ada", 100), ("bob", 200)]
+
+
+def test_order_by_a_column_not_in_the_select_list_on_a_join(tmp_path: Path) -> None:
+    """Exercises the hidden-column strip for a join: `u.name` never
+    appears in the output row, only in the row Sort itself sorts on."""
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "SELECT o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY u.name, o.total"
+        ).fetchall()
+        assert rows == [(50,), (100,), (200,)]
+
+
+def test_limit_on_a_join(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "SELECT o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.total LIMIT 2"
+        ).fetchall()
+        assert rows == [(50,), (100,)]
+
+
+def test_offset_on_a_join(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "SELECT o.total FROM users u JOIN orders o ON u.id = o.user_id ORDER BY o.total LIMIT 2 OFFSET 1"
+        ).fetchall()
+        assert rows == [(100,), (200,)]
+
+
+def test_left_join_order_by_still_never_reorders_the_join_itself(tmp_path: Path) -> None:
+    """A LEFT JOIN's own table order is untouched by sort-cost-aware
+    ranking, same guarantee test_join_planner.py already proves for the
+    no-ORDER-BY case -- ORDER BY only ever adds a Sort on top, never
+    reorders which side drives."""
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        db.execute("INSERT INTO users VALUES (3, 'carol')")  # no orders
+        rows = db.execute(
+            "SELECT u.name, o.total FROM users u LEFT JOIN orders o ON u.id = o.user_id ORDER BY u.name"
+        ).fetchall()
+        assert rows == [("ada", 100), ("ada", 50), ("bob", 200), ("carol", None)]
+
+
+# =====================================================================
+# EXPLAIN of a joined SELECT (session 7)
+# =====================================================================
+
+
+def test_explain_of_a_join_no_longer_raises(tmp_path: Path) -> None:
+    """On these few rows a SeqScan legitimately beats an index descent for
+    both tables (assign_cost's own honest arithmetic, chapter 12 SS12.6) --
+    EXPLAIN just has to report whatever build_operator() actually built,
+    not force an index. test_join_planner.py's own page-read test is where
+    "IndexScan wins on a bigger table" gets proven.
+    """
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_orders(db)
+        rows = db.execute(
+            "EXPLAIN SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
+        ).fetchall()
+        assert rows == [("Project\n└─ NestedLoopJoin\n   └─ SeqScan users\n   └─ SeqScan orders",)]

@@ -8,21 +8,27 @@ picking the winning left-deep JOIN order out of every legal one.
 `enumerate_join_plans`/`choose_join_plan` below do the same job one level
 up: enumerate every legal order the tables could be joined in, cost each
 one with the same stage 1-3 pipeline applied per table, and pick the
-cheapest. ORDER BY/sort_cost interaction (comparing this against a Sort on
-top) is session 7's "interesting orders" extension, not attempted here --
-`choose_join_plan` ranks on `cost.total` alone, which is exactly correct
-until a Sort operator exists to make that unsafe.
+cheapest.
+
+
+Session 7 ("interesting orders") folds ORDER BY into both rankings: an
+optional `order_by` parameter on `choose_access_path`/`choose_join_plan`,
+defaulting to `()` -- which keeps every pre-session-7 call site ranking on
+`cost.total` alone, byte-for-byte the old behavior, matching every other
+`outer: Row = ()`-shaped extension already in this codebase. See
+`total_cost_with_ordering`/`sort_cost` below for the actual comparison.
 """
 
 
 import itertools
+import math
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from quilldb.catalog.catalog import Catalog
 from quilldb.catalog.schema import IndexSchema, TableSchema
-from quilldb.plan.cost import assign_cost
-from quilldb.plan.planner import AccessPath, PlanCost, enumerate_access_paths
+from quilldb.plan.cost import CPU_PER_ROW, assign_cost
+from quilldb.plan.planner import AccessPath, PlanCost, SortKey, enumerate_access_paths
 from quilldb.plan.predicates import (
     Predicate,
     classify_predicate,
@@ -53,8 +59,10 @@ class StatsSource(Protocol):
     def index_stats(self, index: IndexSchema) -> IndexStats: ...
 
 
-def choose_access_path(candidates: list[AccessPath]) -> AccessPath:
-    """Pick the minimum-cost.total candidate.
+def choose_access_path(candidates: list[AccessPath], order_by: tuple[SortKey, ...] = ()) -> AccessPath:
+    """Pick the minimum-cost.total candidate -- or, when `order_by` is given
+    and some candidate might actually satisfy it, the minimum
+    total-cost-including-any-Sort-on-top candidate (session 7).
 
 
     Call this AFTER every candidate has been through estimate_row_counts()
@@ -69,13 +77,22 @@ def choose_access_path(candidates: list[AccessPath]) -> AccessPath:
             includes a seq_scan (chapter 12 §12.6 trap #2) -- but don't
             assume that here; an empty list is a caller bug, not a case
             to silently paper over.
+        order_by: this query's ORDER BY, as SortKeys, or `()` for none.
+            Deliberately checked against every candidate's `output_order`
+            BEFORE ever calling total_cost_with_ordering/sort_cost: when
+            nothing here has a nonempty `output_order` at all (the common
+            case -- no index leads with an unconstrained walk over this
+            table), no candidate could possibly avoid a Sort, so ranking
+            on `cost.total` alone is already the right answer and there's
+            nothing to gain -- or risk -- by invoking sort_cost.
 
 
     Returns:
-        The candidate with the lowest `cost.total`. Ties are legal (a
-        seq_scan and a full-key index seek can cost the same on a tiny
-        table) and any tiebreak is fine -- the two candidates are
-        interchangeable by definition once their costs are equal.
+        The candidate with the lowest (ordering-aware, if applicable)
+        cost. Ties are legal (a seq_scan and a full-key index seek can
+        cost the same on a tiny table) and any tiebreak is fine -- the
+        two candidates are interchangeable by definition once their costs
+        are equal.
 
 
     This is deliberately the simplest possible reduction over `cost.total`
@@ -87,6 +104,8 @@ def choose_access_path(candidates: list[AccessPath]) -> AccessPath:
     if/elif per AccessPath.kind to get the right answer, that's a sign a
     cost is wrong upstream, not that this function needs to get smarter.
     """
+    if order_by and any(path.output_order for path in candidates):
+        return min(candidates, key=lambda path: total_cost_with_ordering(path, order_by))
     return min(candidates, key=_cost_total)
 
 
@@ -114,6 +133,15 @@ class PlanCandidate:
     _build_join_operator resolves it to this candidate's own flat layout
     with sql/binder.py's resolve_layout, exactly the pass that function
     exists for.
+
+
+    `output_order` (session 7) is exactly `access_paths[0].output_order`:
+    "the output order comes from the OUTERMOST table's access path" in a
+    left-deep nested loop (§43) -- position 0 is the only table whose rows
+    reach the final output un-interleaved with anything else, so it's the
+    only one whose own sort order survives the join. A later position's
+    output_order, however good, says nothing about the JOINED stream's
+    order and is deliberately not consulted here.
     """
 
 
@@ -124,6 +152,83 @@ class PlanCandidate:
     residual: BoundExpression | None  # evaluated on the FINAL combined row, after every join
     est_rows: int
     cost: PlanCost
+    output_order: tuple[SortKey, ...] = ()
+
+
+Costed = AccessPath | PlanCandidate
+"""The two stage-4 candidate shapes sort_cost/total_cost_with_ordering
+compare -- a plain Union rather than a Protocol: both already declare
+`output_order`/`est_rows` with identical types, and a Protocol's
+structural match rejects a frozen dataclass's read-only attributes against
+a plain (settable-by-default) Protocol member, for no benefit here since
+there are exactly two concrete implementers, not an open set (contrast
+StatsSource, which really does stand in for either a live StatisticsCatalog
+or build_operator's `stats=None` fallback).
+"""
+
+
+def total_cost_with_ordering(candidate: Costed, order_by: tuple[SortKey, ...]) -> float:
+    """THE comparison key whenever there's an ORDER BY (week7-query-processing.md
+    §43): never rank candidates on `candidate.cost.total` alone once a Sort
+    might be needed on top of one of them but not another -- see this
+    module's own docstring and sort_cost's for why ranking on cost.total
+    alone is the "interesting orders" trap.
+    """
+    assert candidate.cost is not None, "total_cost_with_ordering requires every candidate to be costed first"
+    return candidate.cost.total + sort_cost(candidate, order_by)
+
+
+def sort_cost(candidate: Costed, order_by: tuple[SortKey, ...]) -> float:
+    """0.0 if `candidate.output_order` already satisfies `order_by`, else
+    the cost of the Sort this candidate would need on top
+    (week7-query-processing.md §43).
+
+
+    `order_by` is this query's ORDER BY, one SortKey per key, in the
+    query's own written order. `candidate.output_order` is what
+    `candidate`'s own access path already guarantees, forward from
+    position 0 -- empty when nothing about this candidate is known to be
+    sorted at all (plan/planner.py's AccessPath docstring explains exactly
+    which shapes populate it and which don't).
+
+
+    "Satisfied" means `order_by` is a prefix of `candidate.output_order`,
+    compared key by key with plain `==` (SortKey is a frozen dataclass, so
+    `SortKey(expr, descending) == SortKey(expr, descending)` is exactly
+    the check) -- both the expression AND the direction must match at
+    every position `order_by` cares about; positions past `len(order_by)`
+    in `output_order` don't matter (an index on (a, b) with `ORDER BY a`
+    is already satisfied, whatever `b` does). If `order_by` is longer than
+    `candidate.output_order`, or any key disagrees, it's not satisfied.
+
+
+    When not satisfied, return a cost > 0.0 for the Sort this candidate
+    would need -- in the same page-read-equivalent units plan/cost.py's
+    other costs use (SEQ_PAGE_COST/RANDOM_PAGE_COST/CPU_PER_ROW), so it's
+    comparable to `candidate.cost.total`. `candidate.est_rows` is what
+    exec/sort.py's own Sort would actually have to sort; the roadmap has
+    no prescribed formula for what that costs (an in-memory sort has no
+    page reads to count), so pick something that scales with `est_rows`
+    and document the reasoning -- the two things that must be true no
+    matter which formula you pick: it's 0.0 exactly when satisfied (never
+    a small positive number that rounding could still lose to a genuinely
+    cheaper unsorted candidate), and it's large enough, for a real Sort
+    over a nontrivial number of rows, to flip a ranking that cost.total
+    alone would get wrong -- test_sort_cost_is_inside_the_join_comparison
+    (test_join_planner.py, once you write it) is what actually proves that.
+    """
+    if candidate.output_order[: len(order_by)] == order_by:
+        return 0.0
+
+    # An in-memory comparison sort is ~n*log2(n) comparisons; price each one
+    # at CPU_PER_ROW, the same per-row CPU unit assign_cost() already uses,
+    # so this stays comparable to cost.total. Clamped to at least 2 rows so
+    # log2 never collapses to 0 (which would silently reintroduce the "small
+    # positive number that rounding could still lose" bug this function's
+    # own docstring warns against) -- a real Sort is never actually free just
+    # because a row estimate happens to be 0 or 1.
+    rows = max(2, candidate.est_rows)
+    return CPU_PER_ROW * rows * math.log2(rows)
 
 
 def enumerate_join_plans(
@@ -194,16 +299,16 @@ def enumerate_join_plans(
     ]
 
 
-def choose_join_plan(candidates: list[PlanCandidate]) -> PlanCandidate:
-    """Pick the minimum total-cost join order.
-
-
-    Ranks on `cost.total` alone -- there's no ORDER BY/sort_cost term to
-    fold in yet (Sort doesn't exist before session 5, and
-    total_cost_with_ordering is session 7's job). Once a Sort operator
-    exists, ranking on `cost.total` alone becomes exactly the "interesting
-    orders" trap §43 warns about; until then, it's simply correct.
+def choose_join_plan(candidates: list[PlanCandidate], order_by: tuple[SortKey, ...] = ()) -> PlanCandidate:
+    """Pick the minimum total-cost join order -- or, when `order_by` is
+    given and some candidate's driving table might actually satisfy it,
+    the minimum cost-including-any-Sort-on-top (session 7, "interesting
+    orders"). Same `order_by`/guard reasoning as choose_access_path's own
+    docstring -- `order_by=()` (every pre-session-7 caller) ranks on
+    `cost.total` alone, unchanged.
     """
+    if order_by and any(candidate.output_order for candidate in candidates):
+        return min(candidates, key=lambda candidate: total_cost_with_ordering(candidate, order_by))
     return min(candidates, key=lambda candidate: candidate.cost.total)
 
 
@@ -251,7 +356,7 @@ def _build_candidate(
                 conjuncts, table_ordinal, available, used, allow_cross_table=all_inner
             )
         used |= newly_used
-        path = _cheapest_path(table, catalog, step_predicates, stats, table_stats)
+        path = _cheapest_path(table, catalog, step_predicates, stats, table_stats, table_ordinal)
         assert path.cost is not None, "_cheapest_path returns paths already costed by assign_cost"
         access_paths.append(path)
 
@@ -294,6 +399,7 @@ def _build_candidate(
         residual=residual,
         est_rows=est_rows,
         cost=PlanCost(startup=startup, total=total_cost),
+        output_order=access_paths[0].output_order,  # the driving table's, and only the driving table's
     )
 
 
@@ -341,6 +447,7 @@ def _cheapest_path(
     predicates: list[Predicate],
     stats: StatsSource,
     table_stats: TableStats,
+    table_ordinal: int,
 ) -> AccessPath:
     """The single-table stage 1-4 pipeline (planner.py/statistics.py/cost.py/
     this module's own choose_access_path), applied to one join step exactly
@@ -351,9 +458,20 @@ def _cheapest_path(
     it pairs with -- which is what makes a chosen index_scan here into a
     correlated/parameterized seek for free once exec/join.py's NestedLoopJoin
     re-opens it per outer row.
+
+
+    `table_ordinal` is only for tagging each candidate's own `output_order`
+    (planner.py's SortKey) with the right table-scope, so a driving-table
+    (position 0) candidate's advertised order can be `==`-compared against
+    an ORDER BY expression bound the same way (_join_expression). Ranking
+    itself stays plain `choose_access_path(costed)`, order-UNaware, at
+    every position: only PlanCandidate.output_order (position 0's own path)
+    ever feeds sort_cost, so there is nothing for a later position to gain
+    -- and something to get subtly wrong -- by ranking here as if its own
+    order mattered to the join as a whole (see PlanCandidate's docstring).
     """
     indexes = list(catalog.indexes_for(table.name))
-    candidates = enumerate_access_paths(table, indexes, predicates)
+    candidates = enumerate_access_paths(table, indexes, predicates, table_ordinal)
     costed = []
     for candidate in candidates:
         index_stats = stats.index_stats(candidate.index) if candidate.index is not None else None
@@ -402,11 +520,11 @@ def _joined_row_estimate(
 
 def _leading_ndv(table: TableSchema, column: str, catalog: Catalog, stats: StatsSource) -> int | None:
     """This table's NDV for `column`, or None if `column` doesn't LEAD any
-    index on `table` -- the "unknown" case estimate_equijoin_rows's
-    TODO(human) fallback has to handle. A defaulted (never-ANALYZEd) index
-    still counts as "known": index_ndv() derives a number from it either
-    way, real stats or the documented default (week7-query-processing.md
-    §43's own note on what "known" means here).
+    index on `table` -- the "unknown" case estimate_equijoin_rows's own
+    fallback handles. A defaulted (never-ANALYZEd) index still counts as
+    "known": index_ndv() derives a number from it either way, real stats
+    or the documented default (week7-query-processing.md §43's own note
+    on what "known" means here).
     """
     folded = column.casefold()
     for index in catalog.indexes_for(table.name):

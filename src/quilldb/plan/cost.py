@@ -142,5 +142,7 @@ def assign_cost(path: AccessPath, stats: IndexStats | None, table_stats: TableSt
         cost=PlanCost(
             startup=startup,
             total=startup + cost
-        )
+        ),
+        output_order=path.output_order,
+        reverse=path.reverse,
     )

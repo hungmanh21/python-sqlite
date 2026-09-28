@@ -29,7 +29,7 @@ there.
 
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Self
 
 from quilldb.btree.btree import BTree
@@ -42,7 +42,14 @@ from quilldb.errors import PageFullError, UniqueViolationError
 from quilldb.exec.expressions import Row, evaluate, where_passes
 from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.plan.cost import assign_cost
-from quilldb.plan.planner import AccessPath, enumerate_access_paths
+from quilldb.plan.planner import (
+    AccessPath,
+    PlanShape,
+    SortKey,
+    access_path_shape,
+    enumerate_access_paths,
+    rebuild_access_path,
+)
 from quilldb.plan.predicates import (
     Predicate,
     classify_predicate,
@@ -54,6 +61,7 @@ from quilldb.plan.search import (
     choose_access_path,
     choose_join_plan,
     enumerate_join_plans,
+    sort_cost,
 )
 from quilldb.plan.statistics import (
     IndexStats,
@@ -75,6 +83,7 @@ from quilldb.sql.binder import (
     BoundOrderKey,
     BoundSelect,
     BoundUpdate,
+    JoinOrderKey,
     resolve_layout,
 )
 from quilldb.storage.bufferpool import BufferPool
@@ -408,9 +417,20 @@ class IndexScan(Operator):
 
 
         if all_eq:
-            # get all the predicates
-            values = [_seek_value(predicate, outer) for predicate in self.path.seek_terms]
-            self._rowids = btree.seek_eq(values)
+            if not self.path.seek_terms and self.path.reverse:
+                # No seek at all -- session 7's sort-avoidance candidate for
+                # `ORDER BY indexed_col DESC` (plan/planner.py's
+                # _index_order_path, output_order tagged reverse=True): walk
+                # the WHOLE index back to front instead of front to back, a
+                # B+tree's own free direction (chapter 18 SS18.3). scan_reverse
+                # yields (key values, rowid) pairs, unlike seek_eq's bare
+                # rowids -- drop the key half, the same shape every other
+                # branch here already produces.
+                self._rowids = (rowid for _, rowid in btree.scan_reverse())
+            else:
+                # get all the predicates
+                values = [_seek_value(predicate, outer) for predicate in self.path.seek_terms]
+                self._rowids = btree.seek_eq(values)
         else:
             equality_prefix = [
                 _seek_value(predicate, outer)
@@ -496,6 +516,8 @@ class IndexScan(Operator):
     def explain(self, depth: int = 0, verbose: bool = False) -> str:
         index_name = self.path.index.name if self.path.index is not None else "?"
         label = f"IndexScan {index_name}"
+        if self.path.reverse:
+            label += " REVERSE"
         if not verbose:
             return _explain_line(depth, label)
 
@@ -1219,6 +1241,15 @@ def _build_join_operator(
     each operator actually reads, using `offsets`, built up here exactly as
     NestedLoopJoin will concatenate rows: table_ordinal -> its starting
     position once every table up to and including it is in hand.
+
+
+    ORDER BY/LIMIT/OFFSET (session 7) sit on top, same tail as a plain
+    SELECT's own (`_apply_order_limit`) -- but `statement.order_by` arrives
+    as JoinOrderKeys (expression-shaped, table-scope: see that type's own
+    docstring), which can only become a row-position-shaped BoundOrderKey
+    once `offsets` exists, i.e. AFTER a candidate is chosen -- so, unlike
+    the single-table/aggregate paths, that resolution happens here rather
+    than at bind time.
     """
     # Deferred: exec/join.py imports Operator from this module at its own
     # import time, so a module-level import here would cycle.
@@ -1228,7 +1259,8 @@ def _build_join_operator(
     candidates = enumerate_join_plans(
         list(statement.scopes), list(statement.joins), statement.where, catalog, stats_source
     )
-    candidate: PlanCandidate = choose_join_plan(candidates)
+    sort_keys = tuple(SortKey(key.expression, key.descending) for key in statement.order_by)
+    candidate: PlanCandidate = choose_join_plan(candidates, sort_keys)
 
     source: Operator | None = None
     offsets: dict[int, int] = {}
@@ -1277,7 +1309,47 @@ def _build_join_operator(
         source = Filter(source, resolve_layout(candidate.residual, offsets))
 
     expressions = tuple(resolve_layout(expression, offsets) for expression in statement.expressions)
-    return Project(source, expressions)
+    order_by, hidden_order_by = _resolve_join_order_by(statement.order_by, expressions, offsets)
+    projected: Operator = Project(source, expressions + hidden_order_by)
+    skip_sort = bool(sort_keys) and bool(candidate.output_order) and sort_cost(candidate, sort_keys) == 0.0
+    return _apply_order_limit(
+        projected,
+        len(expressions),
+        order_by,
+        hidden_order_by,
+        statement.limit,
+        statement.offset,
+        skip_sort=skip_sort,
+    )
+
+
+def _resolve_join_order_by(
+    items: tuple[JoinOrderKey, ...],
+    expressions: tuple[BoundExpression, ...],
+    offsets: dict[int, int],
+) -> tuple[tuple[BoundOrderKey, ...], tuple[BoundExpression, ...]]:
+    """_build_join_operator's own version of sql/binder.py's
+    _resolve_order_by_key/_bind_order_by, run here instead of at bind time
+    because a join's row layout doesn't exist until `offsets` does (see
+    _build_join_operator's own docstring). Every `items[i].expression` is
+    already a concrete BoundExpression -- JoinOrderKey has no ordinal case
+    left to resolve, sql/binder.py's _bind_join_order_by settled that
+    eagerly against the SELECT list, before a join order was even chosen.
+    """
+    hidden: list[BoundExpression] = []
+    keys = []
+    for item in items:
+        resolved = resolve_layout(item.expression, offsets)
+        position = None
+        for i, expr in enumerate(expressions):
+            if expr == resolved:
+                position = i
+                break
+        if position is None:
+            hidden.append(resolved)
+            position = len(expressions) + len(hidden) - 1
+        keys.append(BoundOrderKey(position, item.descending))
+    return tuple(keys), tuple(hidden)
 
 
 def _build_single_table_source(
@@ -1288,7 +1360,9 @@ def _build_single_table_source(
     catalog: Catalog,
     stats: StatisticsCatalog | None,
     txn: Transaction | None,
-) -> Operator:
+    order_by: tuple[SortKey, ...] = (),
+    cached_shape: PlanShape | None = None,
+) -> tuple[Operator, AccessPath]:
     """The cost-based SeqScan/IndexScan (+ Filter) pipeline shared by a
     plain SELECT and a no-GROUP-BY aggregate SELECT alike -- WHERE
     placement and access-path choice don't depend on what sits on top of
@@ -1296,24 +1370,46 @@ def _build_single_table_source(
     Factored out of build_operator()'s single-table branch so
     _build_aggregate_operator() doesn't duplicate stages 1-4 of the
     cost-based pipeline.
+
+    Returns the chosen AccessPath alongside the operator (session 7): a
+    plain SELECT's build_operator() needs it to decide whether the row
+    stream already satisfies its own ORDER BY (path.output_order, via
+    plan/search.py's sort_cost) and can skip adding a Sort.
+    `order_by=()` (every pre-session-7 caller, and every call from
+    _build_aggregate_operator below) keeps choose_access_path ranking on
+    `cost.total` alone -- HashAggregate doesn't promise to preserve
+    whatever order its own child scan happened to produce, so a raw
+    table's physical order is not a property _build_aggregate_operator's
+    OWN ORDER BY (over the grouped output) could safely rely on; that's a
+    documented gap, not something this function tries to solve.
+
+    `cached_shape` (plan/cache.py, session 7): when given, skips stages
+    2-4 (row estimates, costs, and every candidate but the winning one)
+    entirely -- `plan/planner.py`'s `rebuild_access_path` re-derives the
+    SAME AccessPath a fresh enumeration+choose would have picked, against
+    THIS call's own fresh `predicates`, with no quill_stat1 read at all.
     """
-    indexes = catalog.indexes_for(table.name)
+    indexes = list(catalog.indexes_for(table.name))
     predicates, non_sargable = _extract_predicates(where)
 
-    table_stats = stats.table_stats(table.name) if stats is not None else default_table_stats()
-    candidates = enumerate_access_paths(table, list(indexes), predicates)
-    costed_candidates = []
-    for candidate in candidates:
-        if candidate.index is None:
-            index_stats = None
-        elif stats is not None:
-            index_stats = stats.index_stats(candidate.index)
-        else:
-            index_stats = default_index_stats(candidate.index, table_stats)
-        candidate = estimate_row_counts(candidate, index_stats, table_stats)
-        candidate = assign_cost(candidate, index_stats, table_stats)
-        costed_candidates.append(candidate)
-    path = choose_access_path(costed_candidates)
+    path: AccessPath
+    if cached_shape is not None:
+        path = rebuild_access_path(cached_shape, table, indexes, predicates)
+    else:
+        table_stats = stats.table_stats(table.name) if stats is not None else default_table_stats()
+        candidates = enumerate_access_paths(table, indexes, predicates)
+        costed_candidates = []
+        for candidate in candidates:
+            if candidate.index is None:
+                index_stats = None
+            elif stats is not None:
+                index_stats = stats.index_stats(candidate.index)
+            else:
+                index_stats = default_index_stats(candidate.index, table_stats)
+            candidate = estimate_row_counts(candidate, index_stats, table_stats)
+            candidate = assign_cost(candidate, index_stats, table_stats)
+            costed_candidates.append(candidate)
+        path = choose_access_path(costed_candidates, order_by)
 
     source: Operator
     if path.kind == "index_scan":
@@ -1324,7 +1420,7 @@ def _build_single_table_source(
     filter_expression = _residual_filter_expression(non_sargable, path.residual)
     if filter_expression is not None:
         source = Filter(source, filter_expression)
-    return source
+    return source, path
 
 
 def _strip_hidden_columns(source: Operator, visible_count: int) -> Operator:
@@ -1341,6 +1437,24 @@ def _strip_hidden_columns(source: Operator, visible_count: int) -> Operator:
     return Project(source, expressions)
 
 
+def _order_by_sort_keys(
+    expressions: tuple[BoundExpression, ...],
+    hidden_order_by: tuple[BoundExpression, ...],
+    order_by: tuple[BoundOrderKey, ...],
+) -> tuple[SortKey, ...]:
+    """Recover the EXPRESSION each already-resolved BoundOrderKey.index
+    refers to (session 7): `_resolve_order_by_key` (sql/binder.py) threw
+    that expression away once it settled on a row position, but
+    plan/search.py's sort_cost needs the expression back, to `==`-compare
+    against an AccessPath's own output_order. `(*expressions,
+    *hidden_order_by)` is exactly the row BoundOrderKey.index already
+    indexes into (BoundSelect.hidden_order_by's own docstring), so this is
+    a pure lookup, not a re-resolution.
+    """
+    produced = expressions + hidden_order_by
+    return tuple(SortKey(produced[key.index], key.descending) for key in order_by)
+
+
 def _apply_order_limit(
     source: Operator,
     visible_count: int,
@@ -1348,12 +1462,26 @@ def _apply_order_limit(
     hidden_order_by: tuple[BoundExpression, ...],
     limit: int | None,
     offset: int,
+    *,
+    skip_sort: bool = False,
 ) -> Operator:
     """The tail every SELECT shares once its own rows are ready: sort (if
-    ORDER BY was given), strip any hidden columns Sort needed but the
-    caller didn't ask for, then apply LIMIT/OFFSET. Shared between
-    build_operator()'s plain-SELECT path and _build_aggregate_operator()
-    so the two don't duplicate this sequencing.
+    ORDER BY was given and no cheaper access path already produced that
+    order -- `skip_sort`, session 7), strip any hidden columns Sort/the
+    caller's own ORDER BY needed but the caller didn't ask for, then apply
+    LIMIT/OFFSET. Shared between build_operator()'s plain-SELECT path,
+    _build_aggregate_operator(), and _build_join_operator() so none of the
+    three duplicate this sequencing.
+
+    `skip_sort=True` never means "ORDER BY was ignored" -- it means the
+    rows already arrived in that order (see build_operator()'s own
+    sort_cost-gated computation of it), so adding a Sort node would only
+    re-sort an already-sorted stream. The hidden-column strip still runs
+    whenever `hidden_order_by` is non-empty regardless of `skip_sort`: an
+    ORDER BY on a column outside the select list still had to widen the
+    row upstream (build_operator()'s Project) to be compared against
+    AT ALL, satisfied by the access path or not, so it still needs
+    removing before the caller sees it.
 
     No bounded top-K heap: Sort always fully materializes and sorts, and
     LIMIT/OFFSET are applied strictly on top by Limit -- see exec/sort.py's
@@ -1363,10 +1491,10 @@ def _apply_order_limit(
     from quilldb.exec.sort import Sort
 
     result = source
-    if order_by:
+    if order_by and not skip_sort:
         result = Sort(result, order_by)
-        if hidden_order_by:
-            result = _strip_hidden_columns(result, visible_count)
+    if hidden_order_by:
+        result = _strip_hidden_columns(result, visible_count)
     if limit is not None or offset:
         result = Limit(result, limit, offset)
     return result
@@ -1379,6 +1507,8 @@ def _build_aggregate_operator(
     catalog: Catalog,
     stats: StatisticsCatalog | None,
     txn: Transaction | None,
+    cached_shape: PlanShape | None = None,
+    on_planned: Callable[[PlanShape], None] | None = None,
 ) -> Operator:
     """
         Limit / Offset              # only when LIMIT or OFFSET was given
@@ -1394,13 +1524,21 @@ def _build_aggregate_operator(
     _bind_group_output), so the same Filter/Project operators a plain
     SELECT uses finish the pre-sort half of the query -- no special-cased
     evaluator needed for the post-grouping half.
+
+    `cached_shape`/`on_planned` (session 7): see build_operator's own
+    docstring -- this is just where they reach _build_single_table_source
+    for the aggregate path.
     """
     # Deferred: exec/aggregate.py imports Operator from this module at its
     # own import time, so a module-level import here would cycle -- same
     # reasoning as _build_join_operator's deferred NestedLoopJoin import.
     from quilldb.exec.aggregate import HashAggregate
 
-    source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
+    source, path = _build_single_table_source(
+        statement.table, statement.where, pager, pool, catalog, stats, txn, cached_shape=cached_shape
+    )
+    if cached_shape is None and on_planned is not None:
+        on_planned(access_path_shape(path))
     grouped: Operator = HashAggregate(source, statement.group_by, statement.aggregates)
     if statement.having is not None:
         grouped = Filter(grouped, statement.having)
@@ -1422,6 +1560,8 @@ def build_operator(
     catalog: Catalog,
     stats: StatisticsCatalog | None = None,
     txn: Transaction | None = None,
+    cached_shape: PlanShape | None = None,
+    on_planned: Callable[[PlanShape], None] | None = None,
 ) -> Operator:
     """Translate a bound statement into an executable operator tree.
 
@@ -1473,13 +1613,25 @@ def build_operator(
     `catalog` resolves which indexes need maintaining -- Catalog.indexes_for()
     -- for INSERT, DELETE, and UPDATE alike, and now also which indexes are
     available to seek for SELECT.
+
+
+    `cached_shape`/`on_planned` (plan/cache.py, session 7) are the plan
+    cache's own hooks, meaningful only for a single-table `BoundSelect`/
+    `BoundAggregateSelect` (a joined SELECT always plans fresh -- see
+    plan/cache.py's own docstring for why). `cached_shape`, when given,
+    skips straight to rebuilding the named AccessPath, no enumeration or
+    quill_stat1 reads. `on_planned`, when given AND `cached_shape` was
+    NOT, is called once with the freshly chosen AccessPath's shape -- the
+    plan cache's own way to learn what to store, without build_operator()
+    itself gaining a cache dependency or a different return type: every
+    pre-session-7 caller passes neither and sees no change at all.
     """
     if isinstance(statement, BoundJoinSelect):
         return _build_join_operator(statement, pager, pool, catalog, stats, txn)
 
 
     if isinstance(statement, BoundAggregateSelect):
-        return _build_aggregate_operator(statement, pager, pool, catalog, stats, txn)
+        return _build_aggregate_operator(statement, pager, pool, catalog, stats, txn, cached_shape, on_planned)
 
 
     if isinstance(statement, BoundInsert):
@@ -1497,10 +1649,20 @@ def build_operator(
         return Update(pager, pool, statement.table, statement.assignments, statement.where, indexes, txn)
 
 
-    source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
+    sort_keys = _order_by_sort_keys(statement.expressions, statement.hidden_order_by, statement.order_by)
+    source, path = _build_single_table_source(
+        statement.table, statement.where, pager, pool, catalog, stats, txn, sort_keys, cached_shape
+    )
+    if cached_shape is None and on_planned is not None:
+        on_planned(access_path_shape(path))
     projected: Operator = Project(source, statement.expressions + statement.hidden_order_by)
     if statement.distinct:
         projected = Distinct(projected)
+    # Only ever ask sort_cost when there's a real chance of an answer other
+    # than "not satisfied" -- session 7's own guard (see choose_access_path's
+    # docstring): with no candidate advertising ANY output_order, no Sort
+    # could ever be avoided, so there's nothing to gain from asking.
+    skip_sort = bool(sort_keys) and bool(path.output_order) and sort_cost(path, sort_keys) == 0.0
     return _apply_order_limit(
         projected,
         len(statement.expressions),
@@ -1508,4 +1670,5 @@ def build_operator(
         statement.hidden_order_by,
         statement.limit,
         statement.offset,
+        skip_sort=skip_sort,
     )

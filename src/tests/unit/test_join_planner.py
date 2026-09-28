@@ -12,9 +12,11 @@ from pathlib import Path
 import pytest
 
 import quilldb
-from quilldb.plan.search import choose_join_plan, enumerate_join_plans
+from quilldb.plan.planner import AccessPath, PlanCost, SortKey
+from quilldb.plan.search import PlanCandidate, choose_join_plan, enumerate_join_plans, sort_cost
 from quilldb.plan.statistics import IndexStats, estimate_equijoin_rows, index_ndv
-from quilldb.sql.binder import BoundJoinSelect, bind
+from quilldb.sql.ast import DataType
+from quilldb.sql.binder import BoundColumn, BoundJoinSelect, bind
 from quilldb.sql.parser import parse
 
 # =====================================================================
@@ -213,3 +215,91 @@ def test_join_leaves_no_pins_behind(tmp_path: Path) -> None:
 
         db.execute("SELECT * FROM a JOIN b ON a.id = b.a_id").fetchall()
         assert _outstanding_pins(db) == 0
+
+
+# =====================================================================
+# sort_cost / total_cost_with_ordering -- the "interesting orders"
+# comparison (week7-query-processing.md §43, session 7's TODO(human))
+# =====================================================================
+
+
+def _path_with_order(output_order: tuple[SortKey, ...], est_rows: int) -> AccessPath:
+    return AccessPath(
+        "index_scan", None, (), (), est_rows=est_rows, cost=PlanCost(startup=0.0, total=1.0), output_order=output_order
+    )
+
+
+def test_sort_cost_is_zero_when_output_order_already_satisfies_order_by() -> None:
+    key = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=False)
+    candidate = _path_with_order((key,), est_rows=1000)
+    assert sort_cost(candidate, (key,)) == 0.0
+
+
+def test_sort_cost_is_zero_when_output_order_is_a_longer_prefix_match() -> None:
+    """An index on (a, b) already satisfies `ORDER BY a` regardless of what
+    `b` does -- only the positions `order_by` actually names are compared.
+    """
+    a = SortKey(BoundColumn(0, "a", DataType.INTEGER), descending=False)
+    b = SortKey(BoundColumn(1, "b", DataType.INTEGER), descending=False)
+    candidate = _path_with_order((a, b), est_rows=1000)
+    assert sort_cost(candidate, (a,)) == 0.0
+
+
+def test_sort_cost_is_positive_when_output_order_is_empty() -> None:
+    key = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=False)
+    candidate = _path_with_order((), est_rows=1000)
+    assert sort_cost(candidate, (key,)) > 0.0
+
+
+def test_sort_cost_is_positive_when_direction_disagrees() -> None:
+    """Same column, wrong direction: a forward index scan doesn't satisfy
+    `ORDER BY id DESC`, so this still needs a real Sort.
+    """
+    forward = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=False)
+    backward = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=True)
+    candidate = _path_with_order((forward,), est_rows=1000)
+    assert sort_cost(candidate, (backward,)) > 0.0
+
+
+def test_sort_cost_grows_with_est_rows() -> None:
+    key = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=False)
+    small = _path_with_order((), est_rows=10)
+    large = _path_with_order((), est_rows=100_000)
+    assert sort_cost(small, (key,)) < sort_cost(large, (key,))
+
+
+def _candidate(*, cost_total: float, output_order: tuple[SortKey, ...], est_rows: int) -> PlanCandidate:
+    path = _path_with_order((), est_rows=est_rows)
+    return PlanCandidate(
+        order=(0, 1),
+        access_paths=(path, path),
+        join_types=("inner", "inner"),
+        match_expressions=(None, None),
+        residual=None,
+        est_rows=est_rows,
+        cost=PlanCost(startup=0.0, total=cost_total),
+        output_order=output_order,
+    )
+
+
+def test_sort_cost_is_inside_the_join_comparison() -> None:
+    """The roadmap's own "interesting orders" regression (week7-query-
+    processing.md §43): a candidate that's cheaper by `cost.total` alone
+    but needs a Sort on a large result set must lose to a slightly pricier
+    candidate whose driving table's own order already satisfies the
+    ORDER BY -- exactly the trap this module's own docstring names.
+    """
+    key = SortKey(BoundColumn(0, "id", DataType.INTEGER), descending=False)
+    order_by = (key,)
+
+    cheaper_but_unsorted = _candidate(cost_total=100.0, output_order=(), est_rows=5_000)
+    pricier_but_presorted = _candidate(cost_total=110.0, output_order=(key,), est_rows=5_000)
+
+    # Without an ORDER BY, raw cost.total wins -- confirms the "cheaper"
+    # label above is actually true, not begging the question.
+    assert choose_join_plan([cheaper_but_unsorted, pricier_but_presorted]) is cheaper_but_unsorted
+
+    # With the ORDER BY, the Sort `cheaper_but_unsorted` would need over
+    # 5,000 rows costs far more than the 10.0 cost.total gap -- the
+    # pre-sorted candidate wins instead.
+    assert choose_join_plan([cheaper_but_unsorted, pricier_but_presorted], order_by) is pricier_but_presorted

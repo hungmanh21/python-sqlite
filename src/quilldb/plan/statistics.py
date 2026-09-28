@@ -300,5 +300,7 @@ def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats:
         seek_terms=path.seek_terms,
         residual=path.residual,
         rows_fetched=rows_fetched,
-        est_rows=est_rows
+        est_rows=est_rows,
+        output_order=path.output_order,
+        reverse=path.reverse,
     )

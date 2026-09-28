@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from quilldb.catalog.catalog import Catalog
 from quilldb.constants import FILE_HEADER_SIZE, SCHEMA_ROOT_PAGE
 from quilldb.plan.analyze import StatisticsCatalog
+from quilldb.plan.cache import PlanCache
 from quilldb.storage.bufferpool import BufferPool
 from quilldb.storage.pager import Pager
 from quilldb.txn.locks import LockManager
@@ -41,6 +42,7 @@ class Database:
         self.pool = pool
         self.catalog = catalog
         self.stats = stats
+        self.plan_cache = PlanCache()
         self.lock_manager = LockManager()
         self._txn_id_lock = threading.Lock()
         self._next_txn_id = 0
