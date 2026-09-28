@@ -193,6 +193,7 @@ class BoundSelect:
     table: TableSchema
     expressions: tuple[BoundExpression, ...]
     where: BoundExpression | None
+    distinct: bool = False
 
 
 
@@ -257,20 +258,51 @@ class BoundAggregate:
 
 @dataclass(frozen=True)
 class BoundAggregateSelect:
-    """A SELECT whose entire select list is aggregate calls, with no
-    GROUP BY (session 4 adds grouping keys and mixed aggregate/plain
-    expressions). Deliberately a separate type from BoundSelect, for the
-    same reason BoundJoinSelect is one: a BoundAggregate cannot be
-    evaluate()d per row the way every BoundExpression can -- it needs the
-    whole stream of rows reaching it, not one row at a time -- so it isn't
-    a BoundExpression, and folding it into BoundSelect.expressions would
-    make every existing evaluate()/resolve_layout() caller handle a shape
-    it fundamentally can't.
+    """A SELECT that groups: either it has a GROUP BY clause, or its
+    select list contains at least one aggregate call. Deliberately a
+    separate type from BoundSelect, for the same reason BoundJoinSelect
+    is one: a BoundAggregate cannot be evaluate()d per row the way every
+    BoundExpression can -- it needs the whole stream of rows in a group,
+    not one row at a time -- so it isn't a BoundExpression, and folding
+    it into BoundSelect.expressions would make every existing
+    evaluate()/resolve_layout() caller handle a shape it fundamentally
+    can't.
+
+    `where` filters rows BEFORE grouping, against `table`'s own row shape
+    -- exactly like a plain SELECT's where. `group_by`, `select_items`,
+    and `having` all operate AFTER grouping, against the FLAT row one
+    finished group produces: `(*group_by values in order, *aggregates
+    values in order)`. That flat row is exec/aggregate.py's HashAggregate
+    output shape, session 4's "hidden columns" pipeline: `select_items`
+    and `having` are ordinary BoundExpression trees over it, with a
+    BoundColumn's `index` pointing at a position in THAT row rather than
+    `table`'s -- which is what lets build_operator() finish this query
+    with the same Project/Filter operators a plain SELECT already uses,
+    instead of a special-cased evaluator (see _bind_group_output).
+
+    `aggregates` is every aggregate call reachable from `select_items` or
+    `having`, collected in the order first seen, with no deduplication --
+    `SELECT COUNT(*) FROM t HAVING COUNT(*) > 1` binds two BoundAggregates
+    even though they're the same call, one for the slot select_items[0]
+    reads and one for the slot having reads. Simpler than deduplicating,
+    and correctness doesn't depend on it: HashAggregate folds every entry
+    in `aggregates` regardless of whether two entries happen to compute
+    the same thing.
+
+    `labels` is Cursor.description's column names, computed once here
+    from the ORIGINAL (unbound) select-list expressions -- by the time an
+    aggregate call is rewritten into a flat-row BoundColumn slot, its
+    function name and argument are gone, so there is nowhere left to
+    recover "COUNT(*)" or "MIN(id)" from downstream.
     """
 
     table: TableSchema
+    group_by: tuple[BoundExpression, ...]
     aggregates: tuple[BoundAggregate, ...]
+    select_items: tuple[BoundExpression, ...]
+    having: BoundExpression | None
     where: BoundExpression | None
+    labels: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -406,23 +438,60 @@ def resolve_layout(expr: BoundExpression, offsets: dict[int, int]) -> BoundExpre
     return expr  # BoundLiteral: nothing to rewrite
 
 
-def _select_has_aggregate(statement: Select) -> bool:
-    """True when at least one top-level select-list expression is a call
-    to a known aggregate function -- what routes a Select to
-    bind_aggregate_select() instead of the plain single-table bind_select().
+def _select_needs_aggregation(statement: Select) -> bool:
+    """True when this Select must route through bind_aggregate_select()
+    rather than the plain single-table bind_select(): either it has a
+    GROUP BY clause, or (session 3's original check) a top-level
+    select-list expression is a call to a known aggregate function.
 
-    Only checks the TOP level: `SUM(a) + 1` (an aggregate nested inside a
-    larger expression) is not detected here and falls through to
-    bind_select(), where a bare FunctionCall node has no handler and raises
-    UnsupportedFeatureError -- not yet supported, and a session-3 scope cut
-    rather than a silent wrong answer.
+    GROUP BY alone routes here even with no aggregate call anywhere --
+    `SELECT region FROM t GROUP BY region` has nothing to fold, but it
+    still has to deduplicate by key instead of running through the plain
+    Project every non-aggregate SELECT uses.
+
+    Only checks the TOP level of the select list for the aggregate-call
+    case: `SUM(a) + 1` (an aggregate nested inside a larger expression) is
+    not detected here and falls through to bind_select(), where a bare
+    FunctionCall node has no handler and raises UnsupportedFeatureError --
+    not yet supported, and a session-3 scope cut rather than a silent
+    wrong answer.
     """
+    if statement.group_by:
+        return True
     if statement.expressions is None:
         return False  # SELECT * can never be an aggregate select
     return any(
         isinstance(e, FunctionCall) and e.name.casefold() in _AGGREGATE_FUNCTIONS
         for e in statement.expressions
     )
+
+
+def _select_item_label(expression: Expression) -> str:
+    """The Cursor.description label for one top-level aggregate-select-list
+    or HAVING expression, computed from the UNBOUND AST -- mirrors
+    api/connection.py's _display_name closely enough that a plain SELECT
+    and an aggregate SELECT produce the same-shaped labels, but has to
+    live here rather than there: by the time _bind_group_output rewrites
+    an aggregate call into a flat-row BoundColumn slot, its function name
+    and argument are gone (BoundAggregateSelect's own docstring).
+    """
+    if isinstance(expression, FunctionCall):
+        if expression.star:
+            return f"{expression.name.upper()}(*)"
+        args = ", ".join(_select_item_label(arg) for arg in expression.args)
+        return f"{expression.name.upper()}({args})"
+    if isinstance(expression, Column):
+        return expression.name
+    if isinstance(expression, Literal):
+        return repr(expression.value)
+    if isinstance(expression, UnaryOp):
+        return f"{expression.operator}{_select_item_label(expression.operand)}"
+    if isinstance(expression, BinaryOp):
+        return f"{_select_item_label(expression.left)} {expression.operator} {_select_item_label(expression.right)}"
+    if isinstance(expression, IsNull):
+        suffix = "IS NOT NULL" if expression.negated else "IS NULL"
+        return f"{_select_item_label(expression.operand)} {suffix}"
+    return type(expression).__name__
 
 
 def _describe(expression: Expression) -> str:
@@ -458,11 +527,12 @@ def bind(
             from resolve_column() for a joined SELECT.
         AmbiguousColumnError: a joined SELECT's unqualified column name
             matches more than one table in scope.
-        AggregateError: an aggregate SELECT's list contains something other
-            than an aggregate call (bind_aggregate_select -- no GROUP BY
-            exists yet for it to be functionally determined by instead), or
-            an aggregate call is malformed (COUNT(*)-only star usage on a
-            non-COUNT function, wrong argument count).
+        AggregateError: an aggregate/GROUP BY SELECT's select list or
+            HAVING clause references a column that is neither an aggregate
+            call nor one of the GROUP BY keys (bind_aggregate_select's
+            _bind_group_output), `SELECT *` is combined with GROUP BY or an
+            aggregate call, or an aggregate call is malformed (COUNT(*)-only
+            star usage on a non-COUNT function, wrong argument count).
         ColumnCountError: an INSERT supplied a different number of values
             than the table has columns.
         ParameterCountError: the statement's `?` count and len(parameters)
@@ -488,7 +558,7 @@ def bind(
     elif isinstance(statement, Select):
         if statement.joins:
             bound = binder.bind_join_select(statement)
-        elif _select_has_aggregate(statement):
+        elif _select_needs_aggregation(statement):
             bound = binder.bind_aggregate_select(statement)
         else:
             bound = binder.bind_select(statement)
@@ -571,7 +641,7 @@ class _Binder:
 
 
         where = None if statement.where is None else self._expression(statement.where, table)
-        return BoundSelect(table, expressions, where)
+        return BoundSelect(table, expressions, where, statement.distinct)
 
 
     def bind_join_select(self, statement: Select) -> BoundJoinSelect:
@@ -585,7 +655,27 @@ class _Binder:
         when it evaluates that condition: by the time join k runs, tables
         0..k are already assembled into one row, and it's only checking
         that its own new table fits.
+
+        `statement.distinct`/`group_by`/`having` are rejected rather than
+        silently dropped: BoundJoinSelect has none of those fields, and
+        this method never looks at them below, so an unguarded
+        `SELECT DISTINCT ... FROM a JOIN b` or `... FROM a JOIN b GROUP BY
+        ...` would parse and bind cleanly but quietly return every
+        unaggregated joined row -- the exact "binder changes results"
+        failure this codebase's error policy exists to avoid. A select
+        list with a top-level aggregate call still gets caught downstream
+        (`_join_expression` has no FunctionCall case), but GROUP BY/HAVING
+        with no such call, or a bare DISTINCT, would otherwise sail
+        through unnoticed (same reasoning as bind_aggregate_select's own
+        DISTINCT check).
         """
+        if statement.distinct:
+            raise UnsupportedFeatureError("DISTINCT combined with a JOIN is not supported yet")
+        if statement.group_by:
+            raise UnsupportedFeatureError("GROUP BY combined with a JOIN is not supported yet")
+        if statement.having is not None:
+            raise UnsupportedFeatureError("HAVING combined with a JOIN is not supported yet")
+
         scopes = self._build_scopes(statement)
 
         joins = []
@@ -690,30 +780,140 @@ class _Binder:
         return BoundColumn(index, column.name, column.data_type, scope.ordinal)
 
     def bind_aggregate_select(self, statement: Select) -> BoundAggregateSelect:
-        """The no-GROUP-BY aggregate path: every SELECT-list expression must
-        be an aggregate call.
+        """The grouping path: a GROUP BY clause, at least one aggregate
+        call in the select list, or both.
 
-        With no GROUP BY there is no key for a plain column to be
-        FUNCTIONALLY DETERMINED by (§40's validate_aggregates rule, which
-        session 4 generalizes once GROUP BY keys exist) -- so with zero
-        keys, that rule collapses to exactly this: nothing but an aggregate
-        call is legal in the select list. `SELECT id, COUNT(*) FROM t`
-        fails here for the same reason it would fail validate_aggregates
-        later, just checked earlier because there's nothing later yet.
+        `where` binds against `table`'s own row, exactly like bind_select's
+        -- filtering happens before any grouping, same as real SQL. Every
+        GROUP BY key expression binds the same way (a key is not allowed to
+        contain an aggregate call: `_expression` has no FunctionCall case,
+        so `GROUP BY COUNT(*)` surfaces as UnsupportedFeatureError, which is
+        the right rejection even if not the most specific message).
+
+        `select_items` and `having` are rewritten by _bind_group_output
+        into BoundExpression trees over the FLAT post-grouping row
+        (BoundAggregateSelect's own docstring) -- that's where every
+        aggregate call actually gets collected into `aggregates`, and
+        where a bare column is checked against `group_by`
+        (_group_by_key_index).
         """
-        assert statement.expressions is not None, "_select_has_aggregate already ruled out SELECT *"
+        if statement.expressions is None:
+            raise AggregateError("SELECT * cannot be combined with GROUP BY or an aggregate function")
+        if statement.distinct:
+            raise UnsupportedFeatureError("DISTINCT combined with GROUP BY or an aggregate is not supported yet")
 
         table = self.catalog.get_table(statement.table.name)
-        aggregates = tuple(self._bind_aggregate_item(e, table) for e in statement.expressions)
         where = None if statement.where is None else self._expression(statement.where, table)
-        return BoundAggregateSelect(table, aggregates, where)
+        group_by = tuple(self._expression(e, table) for e in statement.group_by)
 
-    def _bind_aggregate_item(self, expression: Expression, table: TableSchema) -> BoundAggregate:
-        if not isinstance(expression, FunctionCall) or expression.name.casefold() not in _AGGREGATE_FUNCTIONS:
-            raise AggregateError(
-                f"'{_describe(expression)}' is neither an aggregate function nor part of a GROUP BY"
+        aggregates: list[BoundAggregate] = []
+        select_items = tuple(
+            self._bind_group_output(e, table, group_by, aggregates) for e in statement.expressions
+        )
+        having = (
+            None
+            if statement.having is None
+            else self._bind_group_output(statement.having, table, group_by, aggregates)
+        )
+        labels = tuple(_select_item_label(e) for e in statement.expressions)
+
+        return BoundAggregateSelect(table, group_by, tuple(aggregates), select_items, having, where, labels)
+
+    def _bind_group_output(
+        self,
+        expression: Expression,
+        table: TableSchema,
+        group_by: tuple[BoundExpression, ...],
+        aggregates: list[BoundAggregate],
+    ) -> BoundExpression:
+        """Rewrite one select-list or HAVING expression into a
+        BoundExpression over the flat post-grouping row
+        `(*group_by values, *aggregates values)`, collecting every
+        aggregate call it contains into `aggregates` as it goes.
+
+        An aggregate call becomes a BoundColumn pointing at the slot its
+        own position in `aggregates` will land at once HashAggregate has
+        run -- `len(group_by) + <its index>`, since every group key comes
+        first in the flat row. A bare column has to be one of the GROUP BY
+        keys (_group_by_key_index); anything else -- SUM(a)+1's outer `+`,
+        for instance -- recurses structurally, same shape as _expression.
+        """
+        if isinstance(expression, FunctionCall) and expression.name.casefold() in _AGGREGATE_FUNCTIONS:
+            aggregates.append(self._bind_aggregate_call(expression, table))
+            slot = len(group_by) + len(aggregates) - 1
+            return BoundColumn(slot, _select_item_label(expression), DataType.INTEGER)
+
+        if isinstance(expression, Literal):
+            return BoundLiteral(expression.value)
+
+        if isinstance(expression, Parameter):
+            return BoundLiteral(self._parameter(expression.index))
+
+        if isinstance(expression, Column):
+            # With zero GROUP BY keys there is nothing an unmatched column
+            # could ever match -- session 3's original rule, unconditional
+            # and independent of _group_by_key_index below, which is only
+            # ever reached once group_by is non-empty.
+            if not group_by:
+                raise AggregateError(
+                    f"'{_describe(expression)}' is neither an aggregate function nor part of a GROUP BY"
+                )
+            index = self._group_by_key_index(expression, table, group_by)
+            if index is None:
+                raise AggregateError(
+                    f"'{_describe(expression)}' is neither an aggregate function nor part of a GROUP BY"
+                )
+            column = table.columns[table.column_index(expression.name)]
+            return BoundColumn(index, column.name, column.data_type)
+
+        if isinstance(expression, UnaryOp):
+            return BoundUnaryOp(
+                expression.operator, self._bind_group_output(expression.operand, table, group_by, aggregates)
             )
-        return self._bind_aggregate_call(expression, table)
+
+        if isinstance(expression, BinaryOp):
+            return BoundBinaryOp(
+                self._bind_group_output(expression.left, table, group_by, aggregates),
+                expression.operator,
+                self._bind_group_output(expression.right, table, group_by, aggregates),
+            )
+
+        if isinstance(expression, IsNull):
+            return BoundIsNull(
+                self._bind_group_output(expression.operand, table, group_by, aggregates), expression.negated
+            )
+
+        raise UnsupportedFeatureError(f"cannot bind a {type(expression).__name__} expression in an aggregate SELECT")
+
+    def _group_by_key_index(
+        self, expression: Column, table: TableSchema, group_by: tuple[BoundExpression, ...]
+    ) -> int | None:
+        """Return the position of `expression`, bound against `table`,
+        within `group_by` -- or None if it isn't one of the GROUP BY keys
+        at all.
+
+        This is validate_aggregates's real rule (week7-query-processing.md
+        §40): every non-aggregate item in the select list or HAVING clause
+        must be "functionally determined by GROUP BY", which -- with no
+        primary-key/functional-dependency analysis in this binder -- means
+        exactly "appears in GROUP BY".
+
+        `expression` is resolved against `table` the same way any other
+        single-table column reference is (table.column_index -- case
+        insensitive, qualifier ignored, matching _expression's own
+        convention), then matched against `group_by` by that resolved
+        index rather than by name or by a full BoundExpression `==`: a
+        GROUP BY key that isn't itself a bare column (`GROUP BY a + 1`)
+        can never match a bare column reference here, since only a
+        BoundColumn in `group_by` has an `.index` to compare against --
+        which is correct, not a gap, given _bind_group_output only ever
+        calls this for a bare Column.
+        """
+        tbl_index = table.column_index(expression.name)
+        for i, key in enumerate(group_by):
+            if isinstance(key, BoundColumn) and key.index == tbl_index:
+                return i
+        return None
 
     def _bind_aggregate_call(self, call: FunctionCall, table: TableSchema) -> BoundAggregate:
         name = call.name.casefold()

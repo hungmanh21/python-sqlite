@@ -1,23 +1,38 @@
 """Aggregate function and HashAggregate tests (chapter 18 §18.5-§18.6,
-week7-query-processing.md §42).
+week7-query-processing.md §42/session 4).
 
-Two layers: AGGREGATES' init/step/final are pure functions, tested directly
-with no Operator or database at all (the semantics table IS the spec, and
-every row of it is a test here). HashAggregate itself is tested end to end
-through quilldb.connect() -- the interesting behavior is the interaction
-between the no-GROUP-BY single-row rule and a real access-path/WHERE
-pipeline underneath it, which a hand-built child operator wouldn't exercise
-honestly (test_join.py's own reasoning for going through Connection).
+Three layers:
+
+1. AGGREGATES' init/step/final are pure functions, tested directly with
+   no Operator or database at all (the semantics table IS the spec, and
+   every row of it is a test here).
+2. HashAggregate's GROUP BY mechanics (real multi-group hashing, NULL
+   keys, zero-groups-over-zero-rows) are tested directly against a
+   hand-built child operator (_Rows below), with BoundColumn/BoundAggregate
+   built by hand -- isolates the grouping algorithm itself from the
+   cost-based access-path pipeline underneath a real quilldb.connect()
+   query, the same reasoning Filter/Project's own unit tests use elsewhere.
+3. Everything else -- aggregate-only select lists, GROUP BY with the key
+   named in the select list, HAVING, DISTINCT -- goes end to end through
+   quilldb.connect() -- the interaction between the no-GROUP-BY single-row
+   rule and a real access-path/WHERE pipeline underneath it is worth
+   exercising honestly (test_join.py's own reasoning for going through
+   Connection).
 """
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 import quilldb
 from quilldb.codec.record import Value
-from quilldb.errors import AggregateError, IntegerOverflowError
-from quilldb.exec.aggregate import AGGREGATES
+from quilldb.errors import AggregateError, IntegerOverflowError, UnsupportedFeatureError
+from quilldb.exec.aggregate import AGGREGATES, HashAggregate
+from quilldb.exec.expressions import Row
+from quilldb.exec.operators import Operator
+from quilldb.sql.ast import DataType
+from quilldb.sql.binder import BoundAggregate, BoundColumn
 
 
 def _fold(func: str, values: list[Value]) -> Value:
@@ -28,6 +43,44 @@ def _fold(func: str, values: list[Value]) -> Value:
     for value in values:
         state = spec.step(state, value)
     return spec.final(state)
+
+
+class _Rows(Operator):
+    """The smallest possible child for exercising HashAggregate directly:
+    replays a fixed list of rows, nothing else. No pins, no b-tree, no
+    binder -- see the module docstring for why that's necessary here, not
+    just convenient.
+    """
+
+    def __init__(self, rows: list[Row]) -> None:
+        self._rows = rows
+        self._iterator: Iterator[Row] | None = None
+
+    def open(self, outer: Row = ()) -> None:
+        self._iterator = iter(self._rows)
+
+    def next(self) -> Row | None:
+        assert self._iterator is not None, "open() was never called"
+        return next(self._iterator, None)
+
+    def close(self) -> None:
+        self._iterator = None
+
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        return "Rows"
+
+
+def _run(operator: Operator) -> list[Row]:
+    operator.open()
+    try:
+        rows = []
+        row = operator.next()
+        while row is not None:
+            rows.append(row)
+            row = operator.next()
+        return rows
+    finally:
+        operator.close()
 
 
 # =====================================================================
@@ -94,6 +147,53 @@ def test_sum_never_raises_once_a_real_input_has_been_seen() -> None:
     max_int64 = 2**63 - 1
     result = _fold("sum", [1.0, max_int64, max_int64])
     assert result == pytest.approx(1.0 + max_int64 + max_int64)
+
+
+# =====================================================================
+# HashAggregate's GROUP BY mechanics, against a hand-built child (_Rows)
+# -- see the module docstring for why this layer exists at all right now.
+# =====================================================================
+
+
+def test_hash_aggregate_groups_rows_by_key() -> None:
+    rows: list[Row] = [("a", 1), ("b", 2), ("a", 3), ("b", 4), ("a", 5)]
+    group_by = (BoundColumn(0, "region", DataType.TEXT),)
+    aggregates = (BoundAggregate("sum", BoundColumn(1, "amount", DataType.INTEGER)),)
+    results = _run(HashAggregate(_Rows(rows), group_by, aggregates))
+    assert {(row[0], row[1]) for row in results} == {("a", 9), ("b", 6)}
+
+
+def test_hash_aggregate_with_no_group_by_keys_still_produces_one_row_over_zero_input_rows() -> None:
+    # Session 3's rule, unaffected by session 4's real grouping: an empty
+    # group_by is the no-GROUP-BY case, always exactly one output row.
+    aggregates = (BoundAggregate("count_star", None),)
+    results = _run(HashAggregate(_Rows([]), (), aggregates))
+    assert results == [(0,)]
+
+
+def test_hash_aggregate_with_a_real_group_by_and_zero_input_rows_produces_zero_groups() -> None:
+    # A REAL GROUP BY is the opposite: zero input rows means zero groups,
+    # not one -- there is no key value to group an empty stream under.
+    group_by = (BoundColumn(0, "region", DataType.TEXT),)
+    aggregates = (BoundAggregate("count_star", None),)
+    results = _run(HashAggregate(_Rows([]), group_by, aggregates))
+    assert results == []
+
+
+def test_hash_aggregate_groups_null_keys_together() -> None:
+    rows: list[Row] = [(None, 1), (None, 2), ("x", 3)]
+    group_by = (BoundColumn(0, "region", DataType.TEXT),)
+    aggregates = (BoundAggregate("count_star", None),)
+    results = _run(HashAggregate(_Rows(rows), group_by, aggregates))
+    assert {(row[0], row[1]) for row in results} == {(None, 2), ("x", 1)}
+
+
+def test_hash_aggregate_groups_by_a_composite_key() -> None:
+    rows: list[Row] = [("a", 1, 10), ("a", 1, 20), ("a", 2, 30), ("b", 1, 40)]
+    group_by = (BoundColumn(0, "region", DataType.TEXT), BoundColumn(1, "year", DataType.INTEGER))
+    aggregates = (BoundAggregate("sum", BoundColumn(2, "amount", DataType.INTEGER)),)
+    results = _run(HashAggregate(_Rows(rows), group_by, aggregates))
+    assert {(key[:2], key[2]) for key in results} == {(("a", 1), 30), (("a", 2), 30), (("b", 1), 40)}
 
 
 # =====================================================================
@@ -193,3 +293,111 @@ def test_aggregate_query_leaves_no_pins_behind(tmp_path: Path) -> None:
 
         db.execute("SELECT COUNT(*) FROM t").fetchall()
         assert _outstanding_pins(db) == 0
+
+
+# =====================================================================
+# GROUP BY, HAVING, DISTINCT, end to end (week 7 session 4)
+# =====================================================================
+
+
+def _seed_regions(db: quilldb.Connection) -> None:
+    db.execute("CREATE TABLE t (region TEXT, amount INTEGER)")
+    db.execute("INSERT INTO t VALUES ('east', 10)")
+    db.execute("INSERT INTO t VALUES ('east', 20)")
+    db.execute("INSERT INTO t VALUES ('west', 5)")
+
+
+def test_group_by_produces_one_row_per_distinct_key(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        rows = db.execute("SELECT COUNT(*) FROM t GROUP BY region").fetchall()
+        assert sorted(rows) == [(1,), (2,)]
+
+
+def test_group_by_with_zero_rows_produces_zero_groups(tmp_path: Path) -> None:
+    # Unlike the no-GROUP-BY case, a real GROUP BY over an empty table
+    # returns no rows at all -- there is no key to group under.
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        db.execute("CREATE TABLE t (region TEXT, amount INTEGER)")
+        rows = db.execute("SELECT COUNT(*) FROM t GROUP BY region").fetchall()
+        assert rows == []
+
+
+def test_having_filters_out_groups(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        rows = db.execute("SELECT COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > 1").fetchall()
+        assert rows == [(2,)]
+
+
+def test_having_with_no_group_by_filters_the_single_row(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        assert db.execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 10").fetchall() == []
+        assert db.execute("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1").fetchall() == [(3,)]
+
+
+def test_distinct_removes_duplicate_rows(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        db.execute("CREATE TABLE t (region TEXT)")
+        db.execute("INSERT INTO t VALUES ('east')")
+        db.execute("INSERT INTO t VALUES ('east')")
+        db.execute("INSERT INTO t VALUES ('west')")
+        rows = db.execute("SELECT DISTINCT region FROM t").fetchall()
+        assert sorted(rows) == [("east",), ("west",)]
+
+
+def test_distinct_dedups_on_projected_columns_not_underlying_rows(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        # Two 'east' rows differ in `amount`, but only `region` is
+        # projected -- Distinct sits above Project, so they still collapse.
+        rows = db.execute("SELECT DISTINCT region FROM t WHERE region = 'east'").fetchall()
+        assert rows == [("east",)]
+
+
+def test_distinct_combined_with_group_by_raises(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        with pytest.raises(UnsupportedFeatureError):
+            db.execute("SELECT DISTINCT COUNT(*) FROM t GROUP BY region")
+
+
+def test_group_by_description_labels_the_aggregate(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        cursor = db.execute("SELECT COUNT(*) FROM t GROUP BY region")
+        assert cursor.description == (("COUNT(*)",),)
+
+
+def test_group_by_query_leaves_no_pins_behind(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        db.execute("SELECT COUNT(*) FROM t GROUP BY region").fetchall()
+        assert _outstanding_pins(db) == 0
+
+
+def test_headline_group_by_returns_the_key_alongside_its_aggregate(tmp_path: Path) -> None:
+    """The canonical `SELECT key, agg(...) ... GROUP BY key` shape names
+    its GROUP BY key in the select list -- exercises _group_by_key_index
+    (sql/binder.py) end to end, not just the pure grouping mechanics
+    _Rows already covers.
+    """
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        rows = db.execute("SELECT region, COUNT(*) FROM t GROUP BY region").fetchall()
+        assert sorted(rows) == [("east", 2), ("west", 1)]
+
+
+def test_group_by_key_column_name_is_case_insensitive(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        rows = db.execute("SELECT REGION, COUNT(*) FROM t GROUP BY region").fetchall()
+        assert sorted(rows) == [("east", 2), ("west", 1)]
+
+
+def test_select_list_column_not_in_group_by_still_raises(tmp_path: Path) -> None:
+    with quilldb.connect(tmp_path / "db.sqlite") as db:
+        _seed_regions(db)
+        with pytest.raises(AggregateError):
+            db.execute("SELECT amount, COUNT(*) FROM t GROUP BY region")

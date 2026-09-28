@@ -152,6 +152,15 @@ class Select:
     table: TableRef
     joins: tuple[JoinClause, ...] = ()
     where: Expression | None = None
+    group_by: tuple[Expression, ...] = ()
+    having: Expression | None = None
+    distinct: bool = False
+    """Whether GROUP BY keys are functionally determined, whether a bare
+    column outside GROUP BY is legal, and whether DISTINCT may combine
+    with an aggregate -- none of that is decided here. The parser only
+    records what the query wrote; sql/binder.py's bind_aggregate_select
+    is where those questions get answered (week7-query-processing.md §40).
+    """
 
 
 @dataclass(frozen=True)

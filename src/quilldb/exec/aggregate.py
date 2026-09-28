@@ -34,7 +34,7 @@ from quilldb.errors import IntegerOverflowError
 # the two to silently drift apart.
 from quilldb.exec.expressions import _MAX_INT64, _MIN_INT64, Row, _require_number, evaluate
 from quilldb.exec.operators import Operator, _explain_line
-from quilldb.sql.binder import BoundAggregate
+from quilldb.sql.binder import BoundAggregate, BoundExpression
 
 type AggState = Any
 type Number = int | float
@@ -136,45 +136,86 @@ AGGREGATES: dict[str, AggSpec] = {
 
 
 class HashAggregate(Operator):
-    """dict from group key -> per-aggregate state (chapter 18 §18.6);
-    session 3 has no GROUP BY yet, so there is always exactly ONE group,
-    folded eagerly rather than through an actual dict -- session 4 is where
-    this genuinely becomes hash-keyed.
+    """dict from group key -> per-aggregate state (chapter 18 §18.6).
 
+    quilldb uses a hash here where SQLite sorts, and that's a DEFENSIBLE
+    difference rather than a divergence: SQLite avoids adding a hash table
+    to a C library targeting embedded devices, and Python gives you a dict
+    for free.
+
+    `group_by` is empty for a plain aggregate query with no GROUP BY at
+    all -- see the "no GROUP BY" paragraph below. Otherwise the group key
+    is `tuple(evaluate(expr, row) for expr in group_by)`; every Value the
+    codec produces (int, float, str, bytes, bool, None) is hashable, so
+    that tuple is a legal dict key with no canonicalizing needed. NULL is
+    a valid key like any other: `GROUP BY nullable_col` puts every NULL
+    row in one group together, because `None == None` and `hash(None)` is
+    well-defined, so nothing here has to special-case it.
+
+    Each output row is the FLAT layout BoundAggregateSelect's docstring
+    describes: `(*group key values, *finished aggregate values)`, in that
+    order -- select_items/having (bound by sql/binder.py's
+    _bind_group_output) are BoundExpression trees whose BoundColumn.index
+    values point straight into this row, which is what lets build_operator
+    finish the query with an ordinary Filter/Project on top instead of a
+    special-cased evaluator.
 
     PIPELINE BREAKER, the same shape Sort will be: open() drains the child
     completely before next() can return anything, because SUM/COUNT/etc.
-    only have an answer once every row has been folded in.
+    only have an answer once every row in a group has been folded in.
 
 
-    No GROUP BY at all = exactly one group, ALWAYS -- next() returns a row
-    even when the child produced zero rows (`SELECT COUNT(*) FROM
-    empty_table` is one row containing 0, not zero rows). Seeding every
-    state via init() before the child is pulled even once is what makes
-    that fall out naturally: the loop below simply never runs its body for
-    an empty child, and final() still turns each untouched init() state
-    into a real value (0 for COUNT, NULL for SUM/AVG/MIN/MAX).
+    No GROUP BY at all (`group_by == ()`) = exactly one group, ALWAYS --
+    next() returns a row even when the child produced zero rows
+    (`SELECT COUNT(*) FROM empty_table` is one row containing 0, not zero
+    rows). Seeding that one group before the child is pulled even once is
+    what makes it fall out naturally: the loop below simply never runs its
+    body for an empty child, and final() still turns the untouched init()
+    state into a real value (0 for COUNT, NULL for SUM/AVG/MIN/MAX). A
+    REAL GROUP BY gets no such seeding -- zero input rows means zero
+    groups means zero output rows, same as any other empty result.
     """
 
-    def __init__(self, child: Operator, aggregates: tuple[BoundAggregate, ...]) -> None:
+    def __init__(
+        self, child: Operator, group_by: tuple[BoundExpression, ...], aggregates: tuple[BoundAggregate, ...]
+    ) -> None:
         self.child = child
+        self.group_by = group_by
         self.aggregates = aggregates
-        self._result: Row | None = None
+        self._results: list[Row] = []
+        self._position = 0
 
     def open(self, outer: Row = ()) -> None:
         self.child.open(outer)
-        self._result = None
+        self._results = []
+        self._position = 0
         try:
-            states = [AGGREGATES[agg.func].init() for agg in self.aggregates]
+            groups: dict[tuple[Value, ...], list[AggState]] = {}
+            if not self.group_by:
+                groups[()] = [AGGREGATES[agg.func].init() for agg in self.aggregates]
+
             row = self.child.next()
             while row is not None:
+                key = tuple(evaluate(expr, row) for expr in self.group_by)
+                states = groups.get(key)
+                if states is None:
+                    states = [AGGREGATES[agg.func].init() for agg in self.aggregates]
+                    groups[key] = states
                 for i, agg in enumerate(self.aggregates):
                     value = None if agg.arg is None else evaluate(agg.arg, row)
                     states[i] = AGGREGATES[agg.func].step(states[i], value)
                 row = self.child.next()
-            self._result = tuple(
-                AGGREGATES[agg.func].final(state) for agg, state in zip(self.aggregates, states, strict=True)
-            )
+
+            self._results = [
+                (
+                    *key,
+                    *(
+                        AGGREGATES[agg.func].final(state)
+                        for agg, state in zip(self.aggregates, states, strict=True)
+                    ),
+                )
+                for key, states in groups.items()
+            ]
         finally:
             # Drained fully above -- unlike SeqScan/IndexScan, there is no
             # standing cursor position for a later next() to resume from,
@@ -182,12 +223,17 @@ class HashAggregate(Operator):
             self.child.close()
 
     def next(self) -> Row | None:
-        row, self._result = self._result, None
+        if self._position >= len(self._results):
+            return None
+        row = self._results[self._position]
+        self._position += 1
         return row
 
     def close(self) -> None:
-        self._result = None
+        self._results = []
+        self._position = 0
         self.child.close()  # idempotent -- already closed by open() on the success path
 
     def explain(self, depth: int = 0, verbose: bool = False) -> str:
-        return _explain_line(depth, "HashAggregate") + "\n" + self.child.explain(depth + 1, verbose)
+        label = "HashAggregate" if not self.group_by else f"HashAggregate GROUP BY {len(self.group_by)} key(s)"
+        return _explain_line(depth, label) + "\n" + self.child.explain(depth + 1, verbose)

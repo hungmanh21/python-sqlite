@@ -774,6 +774,37 @@ def test_a_qualified_name_absent_from_its_table_raises_column_not_found() -> Non
         )
 
 
+def test_distinct_combined_with_a_join_is_unsupported() -> None:
+    # BoundJoinSelect has no `distinct` field and build_operator's join
+    # path never wraps its result in a Distinct -- without this check the
+    # keyword would parse and bind cleanly but silently stop deduplicating.
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.user_id",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+def test_group_by_combined_with_a_join_is_unsupported() -> None:
+    # No aggregate call anywhere in the select list means bind_join_select
+    # would otherwise bind this cleanly and silently drop GROUP BY entirely
+    # -- returning every unaggregated joined row instead of one per age.
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT users.age FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.age",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+def test_having_combined_with_a_join_is_unsupported() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id "
+            "HAVING users.name = 'ada'",
+            catalog=_JOIN_CATALOG,
+        )
+
+
 # =====================================================================
 # resolve_layout: rewriting (table_ordinal, index) to a flat row index
 # =====================================================================
@@ -799,8 +830,10 @@ def test_resolve_layout_leaves_literals_alone() -> None:
 
 
 # =====================================================================
-# bind_aggregate_select (week 7 session 3, §42): a SELECT list of nothing
-# but aggregate calls, no GROUP BY yet (session 4).
+# bind_aggregate_select (week 7 sessions 3 & 4, §40/§42): aggregate calls,
+# GROUP BY, HAVING. Tests whose select list or HAVING clause names a bare
+# column matching a GROUP BY key (validate_aggregates's real rule --
+# _group_by_key_index) are grouped at the end of this section.
 # =====================================================================
 
 _ORDERS_CATALOG = _FakeCatalog(_ORDERS)
@@ -808,7 +841,15 @@ _ORDERS_CATALOG = _FakeCatalog(_ORDERS)
 
 def test_count_star_binds_to_count_star_with_no_arg() -> None:
     bound = bind(parse("SELECT COUNT(*) FROM orders"), _ORDERS_CATALOG)
-    assert bound == BoundAggregateSelect(_ORDERS, (BoundAggregate("count_star", None),), None)
+    assert bound == BoundAggregateSelect(
+        _ORDERS,
+        (),
+        (BoundAggregate("count_star", None),),
+        (BoundColumn(0, "COUNT(*)", DataType.INTEGER),),
+        None,
+        None,
+        ("COUNT(*)",),
+    )
 
 
 def test_aggregate_call_arg_is_bound_against_the_table() -> None:
@@ -819,7 +860,15 @@ def test_aggregate_call_arg_is_bound_against_the_table() -> None:
 
 def test_aggregate_function_name_is_case_insensitive() -> None:
     bound = bind(parse("SELECT count(*) FROM orders"), _ORDERS_CATALOG)
-    assert bound == BoundAggregateSelect(_ORDERS, (BoundAggregate("count_star", None),), None)
+    assert bound == BoundAggregateSelect(
+        _ORDERS,
+        (),
+        (BoundAggregate("count_star", None),),
+        (BoundColumn(0, "COUNT(*)", DataType.INTEGER),),
+        None,
+        None,
+        ("COUNT(*)",),
+    )
 
 
 def test_multiple_aggregates_bind_in_select_list_order() -> None:
@@ -832,15 +881,6 @@ def test_aggregate_select_where_is_bound_like_a_plain_select() -> None:
     bound = bind(parse("SELECT COUNT(*) FROM orders WHERE total > 10"), _ORDERS_CATALOG)
     assert isinstance(bound, BoundAggregateSelect)
     assert bound.where is not None
-
-
-def test_bare_column_alongside_an_aggregate_with_no_group_by_raises() -> None:
-    # There is no GROUP BY key for `id` to be functionally determined by
-    # (week7-query-processing.md §40's validate_aggregates rule, specialized
-    # to zero keys) -- session 4 is what lets a query name GROUP BY keys
-    # here instead.
-    with pytest.raises(AggregateError):
-        bind(parse("SELECT id, COUNT(*) FROM orders"), _ORDERS_CATALOG)
 
 
 def test_star_argument_is_only_valid_for_count() -> None:
@@ -856,3 +896,78 @@ def test_aggregate_call_with_wrong_arity_raises() -> None:
 def test_unknown_function_name_raises_unsupported_feature() -> None:
     with pytest.raises(UnsupportedFeatureError):
         bind(parse("SELECT UPPER(total) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_select_star_combined_with_group_by_raises() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT * FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+def test_group_by_key_expression_binds_against_the_table() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.group_by == (BoundColumn(2, "total", DataType.INTEGER),)
+
+
+def test_multiple_group_by_keys_bind_in_order() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY user_id, total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.group_by == (
+        BoundColumn(1, "user_id", DataType.INTEGER),
+        BoundColumn(2, "total", DataType.INTEGER),
+    )
+    # The aggregate slot lands right after every GROUP BY key in the flat
+    # post-grouping row: 2 keys occupy positions 0-1, so COUNT(*) is at 2.
+    assert bound.select_items == (BoundColumn(2, "COUNT(*)", DataType.INTEGER),)
+
+
+def test_having_binds_over_the_flat_post_grouping_row() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY total HAVING COUNT(*) > 1"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.having == BoundBinaryOp(BoundColumn(2, "COUNT(*)", DataType.INTEGER), ">", BoundLiteral(1))
+    # No dedup: the select list's COUNT(*) and HAVING's COUNT(*) are two
+    # separate BoundAggregate entries (BoundAggregateSelect's own docstring).
+    assert len(bound.aggregates) == 2
+
+
+def test_distinct_combined_with_group_by_is_unsupported() -> None:
+    # Checked before group_by/select_items are ever bound, so this never
+    # reaches _group_by_key_index at all.
+    with pytest.raises(UnsupportedFeatureError):
+        bind(parse("SELECT DISTINCT total FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+def test_bare_column_alongside_an_aggregate_with_no_group_by_raises() -> None:
+    # With zero GROUP BY keys, _bind_group_output short-circuits before
+    # ever calling _group_by_key_index: there is no key for `id` to be
+    # functionally determined by, unconditionally, regardless of what
+    # "matches" means once keys exist (week7-query-processing.md §40's
+    # validate_aggregates rule, specialized to zero keys).
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT id, COUNT(*) FROM orders"), _ORDERS_CATALOG)
+
+
+# ---- exercises _group_by_key_index (implemented) ----
+
+
+def test_bare_column_matching_a_group_by_key_resolves_to_its_flat_row_slot() -> None:
+    bound = bind(parse("SELECT total, COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.select_items == (
+        BoundColumn(0, "total", DataType.INTEGER),  # group_by[0]'s slot
+        BoundColumn(1, "COUNT(*)", DataType.INTEGER),  # the one aggregate's slot, right after it
+    )
+    assert bound.labels == ("total", "COUNT(*)")
+
+
+def test_bare_column_matching_is_case_insensitive_like_every_other_column_lookup() -> None:
+    bound = bind(parse("SELECT TOTAL FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.select_items == (BoundColumn(0, "total", DataType.INTEGER),)
+
+
+def test_bare_column_not_matching_any_group_by_key_still_raises() -> None:
+    # `id` isn't `total` -- a non-empty group_by doesn't make every column
+    # legal, only the ones actually named in GROUP BY.
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT id, COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)

@@ -585,6 +585,48 @@ class Project(Operator):
 
 
 
+class Distinct(Operator):
+    """Drop duplicate rows from the child, streaming rather than
+    materializing the whole result: only the set of rows already returned
+    needs to be held, not the child's entire output. Every Value the codec
+    produces (int, float, str, bytes, bool, None) is hashable, and a Row
+    is a tuple of them, so a child row is a legal set member with nothing
+    to convert.
+
+    Sits ABOVE Project in build_operator() (`SELECT DISTINCT` dedups the
+    OUTPUT columns, not the underlying table row) -- so two rows differing
+    only in a column that wasn't selected still collapse to one.
+    """
+
+    def __init__(self, child: Operator) -> None:
+        self.child = child
+        self._seen: set[Row] = set()
+
+    def open(self, outer: Row = ()) -> None:
+        self.child.open(outer)
+        self._seen = set()
+
+    def next(self) -> Row | None:
+        try:
+            while True:
+                row = self.child.next()
+                if row is None:
+                    return None
+                if row not in self._seen:
+                    self._seen.add(row)
+                    return row
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        self._seen = set()
+        self.child.close()
+
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        return _explain_line(depth, "Distinct") + "\n" + self.child.explain(depth + 1, verbose)
+
+
 class Insert(Operator):
     """Insert one encoded row on the first next(); then return None forever.
 
@@ -1236,13 +1278,27 @@ def _build_aggregate_operator(
     stats: StatisticsCatalog | None,
     txn: Transaction | None,
 ) -> Operator:
+    """
+        Project                    # statement.select_items, over the flat grouped row
+        └─ Filter                  # statement.having -- only if HAVING was given
+           └─ HashAggregate        # statement.group_by / statement.aggregates
+              └─ SeqScan | IndexScan (+ Filter)   # statement.where, same as a plain SELECT
+
+    select_items and having are already BoundExpression trees over
+    HashAggregate's flat output row (sql/binder.py's _bind_group_output),
+    so the same Filter/Project operators a plain SELECT uses finish the
+    query -- no special-cased evaluator needed for the post-grouping half.
+    """
     # Deferred: exec/aggregate.py imports Operator from this module at its
     # own import time, so a module-level import here would cycle -- same
     # reasoning as _build_join_operator's deferred NestedLoopJoin import.
     from quilldb.exec.aggregate import HashAggregate
 
     source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
-    return HashAggregate(source, statement.aggregates)
+    grouped: Operator = HashAggregate(source, statement.group_by, statement.aggregates)
+    if statement.having is not None:
+        grouped = Filter(grouped, statement.having)
+    return Project(grouped, statement.select_items)
 
 
 def build_operator(
@@ -1261,9 +1317,13 @@ def build_operator(
     plan/search.py):
 
 
-        Project
-        └─ Filter       # omitted when nothing is left over to check
-           └─ SeqScan | IndexScan
+        Distinct        # only for SELECT DISTINCT
+        └─ Project
+           └─ Filter       # omitted when nothing is left over to check
+              └─ SeqScan | IndexScan
+
+    A BoundAggregateSelect (GROUP BY and/or an aggregate call) builds a
+    different shape -- see _build_aggregate_operator's own docstring.
 
 
     `stats` is where real ANALYZE numbers enter the planner (stage-5 Step
@@ -1321,4 +1381,7 @@ def build_operator(
 
 
     source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
-    return Project(source, statement.expressions)
+    projected: Operator = Project(source, statement.expressions)
+    if statement.distinct:
+        projected = Distinct(projected)
+    return projected

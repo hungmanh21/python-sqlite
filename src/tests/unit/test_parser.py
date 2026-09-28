@@ -282,3 +282,71 @@ def test_function_call_argument_can_be_an_expression() -> None:
 def test_function_call_missing_close_paren_raises() -> None:
     with pytest.raises(SQLSyntaxError):
         parse("SELECT COUNT(* FROM t")
+
+
+# =====================================================================
+# GROUP BY, HAVING, DISTINCT (week 7 session 4): syntax only -- whether a
+# select list's mix of aggregates/columns actually makes sense is
+# sql/binder.py's job (test_binder.py's bind_aggregate_select section).
+# =====================================================================
+
+
+def test_a_bare_select_has_no_group_by_or_having() -> None:
+    statement = parse("SELECT * FROM t")
+    assert isinstance(statement, Select)
+    assert statement.group_by == ()
+    assert statement.having is None
+    assert statement.distinct is False
+
+
+def test_group_by_single_key() -> None:
+    statement = parse("SELECT region, COUNT(*) FROM t GROUP BY region")
+    assert isinstance(statement, Select)
+    assert statement.group_by == (Column("region"),)
+
+
+def test_group_by_multiple_keys_in_order() -> None:
+    statement = parse("SELECT a, b FROM t GROUP BY a, b")
+    assert isinstance(statement, Select)
+    assert statement.group_by == (Column("a"), Column("b"))
+
+
+def test_group_by_key_can_be_an_expression() -> None:
+    statement = parse("SELECT COUNT(*) FROM t GROUP BY a + 1")
+    assert isinstance(statement, Select)
+    assert len(statement.group_by) == 1
+
+
+def test_group_by_without_by_raises() -> None:
+    with pytest.raises(SQLSyntaxError):
+        parse("SELECT COUNT(*) FROM t GROUP region")
+
+
+def test_having_captures_the_condition() -> None:
+    statement = parse("SELECT COUNT(*) FROM t GROUP BY region HAVING COUNT(*) > 1")
+    assert isinstance(statement, Select)
+    assert statement.having is not None
+
+
+def test_having_without_group_by_still_parses() -> None:
+    statement = parse("SELECT COUNT(*) FROM t HAVING COUNT(*) > 1")
+    assert isinstance(statement, Select)
+    assert statement.group_by == ()
+    assert statement.having is not None
+
+
+def test_distinct_sets_the_flag() -> None:
+    statement = parse("SELECT DISTINCT region FROM t")
+    assert isinstance(statement, Select)
+    assert statement.distinct is True
+    assert statement.expressions == (Column("region"),)
+
+
+def test_where_group_by_and_having_parse_together_in_order() -> None:
+    statement = parse(
+        "SELECT region, COUNT(*) FROM t WHERE total > 0 GROUP BY region HAVING COUNT(*) > 1"
+    )
+    assert isinstance(statement, Select)
+    assert statement.where is not None
+    assert statement.group_by == (Column("region"),)
+    assert statement.having is not None

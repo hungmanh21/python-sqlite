@@ -48,7 +48,6 @@ from quilldb.errors import ThreadingError, TransactionError, UnsupportedFeatureE
 from quilldb.exec.operators import ExplainResult, Operator, build_operator
 from quilldb.sql.ast import Begin, Commit, CreateIndex, CreateTable, Rollback
 from quilldb.sql.binder import (
-    BoundAggregate,
     BoundAggregateSelect,
     BoundAnalyze,
     BoundBinaryOp,
@@ -210,18 +209,6 @@ def _display_name(expression: BoundExpression) -> str:
         suffix = "IS NOT NULL" if expression.negated else "IS NULL"
         return f"{_display_name(expression.operand)} {suffix}"
     raise UnsupportedFeatureError(f"cannot describe a {type(expression).__name__}")
-
-
-def _display_name_aggregate(aggregate: BoundAggregate) -> str:
-    """`_display_name`'s counterpart for a BoundAggregate -- it isn't a
-    BoundExpression (see BoundAggregateSelect's docstring for why), so it
-    needs its own small case rather than one more branch there.
-    """
-    if aggregate.func == "count_star":
-        return "COUNT(*)"
-    assert aggregate.arg is not None, "every func but count_star always binds an arg"
-    return f"{aggregate.func.upper()}({_display_name(aggregate.arg)})"
-
 
 
 
@@ -630,7 +617,7 @@ class Connection:
                 stmt_txn.rollback()
             raise
         if isinstance(bound, BoundAggregateSelect):
-            description = tuple((_display_name_aggregate(a),) for a in bound.aggregates)
+            description = tuple((label,) for label in bound.labels)
         else:
             description = tuple((_display_name(e),) for e in bound.expressions)
         cursor = Cursor(operator, description, -1, implicit_txn=stmt_txn if owns_txn else None)

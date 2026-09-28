@@ -235,6 +235,12 @@ class Parser:
         self._expect(TokenType.SELECT, "expected SELECT")
 
 
+        distinct = False
+        if self._peek().type is TokenType.DISTINCT:
+            self._advance()
+            distinct = True
+
+
         expressions: tuple[Expression, ...] | None
         if self._peek().type is TokenType.STAR:
             self._advance()
@@ -257,7 +263,24 @@ class Parser:
             where = self._expression()
 
 
-        return Select(expressions, table, joins, where)
+        group_by: tuple[Expression, ...] = ()
+        if self._peek().type is TokenType.GROUP:
+            self._advance()
+            self._expect(TokenType.BY, "expected BY after GROUP")
+            keys = [self._expression()]
+            while self._peek().type is TokenType.COMMA:
+                self._advance()
+                keys.append(self._expression())
+            group_by = tuple(keys)
+
+
+        having: Expression | None = None
+        if self._peek().type is TokenType.HAVING:
+            self._advance()
+            having = self._expression()
+
+
+        return Select(expressions, table, joins, where, group_by, having, distinct)
 
 
     def _from_clause(self) -> tuple[TableRef, tuple[JoinClause, ...]]:
