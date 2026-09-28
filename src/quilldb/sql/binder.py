@@ -26,6 +26,7 @@ Two properties this module exists to guarantee:
 """
 
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -56,6 +57,7 @@ from quilldb.sql.ast import (
     Insert,
     IsNull,
     Literal,
+    OrderKey,
     Parameter,
     Rollback,
     Select,
@@ -151,6 +153,22 @@ type BoundExpression = BoundLiteral | BoundColumn | BoundUnaryOp | BoundBinaryOp
 
 
 @dataclass(frozen=True)
+class BoundOrderKey:
+    """One resolved `ORDER BY` key: a position in the row exec/sort.py's
+    Sort will receive, plus direction. `index` is NOT a BoundColumn --
+    Sort reads a row that's already been projected (BoundSelect.expressions
+    or BoundAggregateSelect.select_items, PLUS `hidden_order_by`), so all
+    it ever needs is "column N of that flat row", never a fresh name
+    lookup against a table.
+    """
+
+    index: int
+    descending: bool = False
+
+
+
+
+@dataclass(frozen=True)
 class BoundCreateTable:
     statement: CreateTable
     """CREATE TABLE needs no resolution -- it INTRODUCES names rather than
@@ -194,6 +212,21 @@ class BoundSelect:
     expressions: tuple[BoundExpression, ...]
     where: BoundExpression | None
     distinct: bool = False
+    order_by: tuple[BoundOrderKey, ...] = ()
+    hidden_order_by: tuple[BoundExpression, ...] = ()
+    """Extra columns Project must compute so Sort can read them, beyond
+    what the query actually selected -- `SELECT name FROM t ORDER BY age`
+    needs `age` in the row Sort sorts, but not in the row the caller gets
+    back. `hidden_order_by` entries are appended AFTER `expressions` in
+    the row build_operator()'s Project produces; a BoundOrderKey.index
+    into that combined row may therefore land past `len(expressions)`,
+    at which point a final strip (another Project, over just the first
+    len(expressions) positions) removes them again -- see
+    _resolve_order_by_key for how one ORDER BY item decides which case
+    it's in.
+    """
+    limit: int | None = None
+    offset: int = 0
 
 
 
@@ -303,6 +336,17 @@ class BoundAggregateSelect:
     having: BoundExpression | None
     where: BoundExpression | None
     labels: tuple[str, ...]
+    order_by: tuple[BoundOrderKey, ...] = ()
+    hidden_order_by: tuple[BoundExpression, ...] = ()
+    """BoundSelect.hidden_order_by's twin for the grouped case: an ORDER
+    BY item naming a fresh aggregate call nothing else selected (`ORDER BY
+    SUM(x)` with no SUM(x) in the select list or HAVING) still has to be
+    folded by HashAggregate, so it's bound through _bind_group_output --
+    exactly like `having` is -- and appended here rather than to
+    `select_items`, so it never reaches the caller's row.
+    """
+    limit: int | None = None
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -641,7 +685,18 @@ class _Binder:
 
 
         where = None if statement.where is None else self._expression(statement.where, table)
-        return BoundSelect(table, expressions, where, statement.distinct)
+
+        order_by, hidden_order_by = self._bind_order_by(
+            statement.order_by, expressions, lambda e: self._expression(e, table)
+        )
+        if statement.distinct and hidden_order_by:
+            raise UnsupportedFeatureError(
+                "DISTINCT combined with an ORDER BY expression outside the select list is not supported yet"
+            )
+        limit = self._bind_limit(statement.limit)
+        offset = self._bind_offset(statement.offset)
+
+        return BoundSelect(table, expressions, where, statement.distinct, order_by, hidden_order_by, limit, offset)
 
 
     def bind_join_select(self, statement: Select) -> BoundJoinSelect:
@@ -656,17 +711,17 @@ class _Binder:
         0..k are already assembled into one row, and it's only checking
         that its own new table fits.
 
-        `statement.distinct`/`group_by`/`having` are rejected rather than
-        silently dropped: BoundJoinSelect has none of those fields, and
-        this method never looks at them below, so an unguarded
-        `SELECT DISTINCT ... FROM a JOIN b` or `... FROM a JOIN b GROUP BY
-        ...` would parse and bind cleanly but quietly return every
+        `statement.distinct`/`group_by`/`having`/`order_by`/`limit`/`offset`
+        are rejected rather than silently dropped: BoundJoinSelect has none
+        of those fields, and this method never looks at them below, so an
+        unguarded `SELECT DISTINCT ... FROM a JOIN b` or `... FROM a JOIN b
+        GROUP BY ...` would parse and bind cleanly but quietly return every
         unaggregated joined row -- the exact "binder changes results"
         failure this codebase's error policy exists to avoid. A select
         list with a top-level aggregate call still gets caught downstream
         (`_join_expression` has no FunctionCall case), but GROUP BY/HAVING
-        with no such call, or a bare DISTINCT, would otherwise sail
-        through unnoticed (same reasoning as bind_aggregate_select's own
+        with no such call, or a bare DISTINCT/ORDER BY/LIMIT, would
+        otherwise sail through unnoticed (same reasoning as bind_aggregate_select's own
         DISTINCT check).
         """
         if statement.distinct:
@@ -675,6 +730,12 @@ class _Binder:
             raise UnsupportedFeatureError("GROUP BY combined with a JOIN is not supported yet")
         if statement.having is not None:
             raise UnsupportedFeatureError("HAVING combined with a JOIN is not supported yet")
+        if statement.order_by:
+            raise UnsupportedFeatureError("ORDER BY combined with a JOIN is not supported yet")
+        if statement.limit is not None:
+            raise UnsupportedFeatureError("LIMIT combined with a JOIN is not supported yet")
+        if statement.offset is not None:
+            raise UnsupportedFeatureError("OFFSET combined with a JOIN is not supported yet")
 
         scopes = self._build_scopes(statement)
 
@@ -817,7 +878,25 @@ class _Binder:
         )
         labels = tuple(_select_item_label(e) for e in statement.expressions)
 
-        return BoundAggregateSelect(table, group_by, tuple(aggregates), select_items, having, where, labels)
+        order_by, hidden_order_by = self._bind_order_by(
+            statement.order_by, select_items, lambda e: self._bind_group_output(e, table, group_by, aggregates)
+        )
+        limit = self._bind_limit(statement.limit)
+        offset = self._bind_offset(statement.offset)
+
+        return BoundAggregateSelect(
+            table,
+            group_by,
+            tuple(aggregates),
+            select_items,
+            having,
+            where,
+            labels,
+            order_by,
+            hidden_order_by,
+            limit,
+            offset,
+        )
 
     def _bind_group_output(
         self,
@@ -914,6 +993,105 @@ class _Binder:
             if isinstance(key, BoundColumn) and key.index == tbl_index:
                 return i
         return None
+
+    def _bind_order_by(
+        self,
+        items: tuple[OrderKey, ...],
+        produced: tuple[BoundExpression, ...],
+        bind: Callable[[Expression], BoundExpression],
+    ) -> tuple[tuple[BoundOrderKey, ...], tuple[BoundExpression, ...]]:
+        """Resolve every `ORDER BY` item against `produced` -- the select
+        list (bind_select) or select_items (bind_aggregate_select), in
+        that order -- collecting any item that isn't already one of those
+        columns into a fresh `hidden` list as it goes.
+
+        `bind` is how a NOT-already-produced expression gets resolved:
+        bind_select passes `self._expression(e, table)` (an ordinary
+        column reference), bind_aggregate_select passes
+        `self._bind_group_output(e, table, group_by, aggregates)` (so
+        `ORDER BY SUM(x)` with no SUM(x) elsewhere in the query still
+        folds through HashAggregate, appending to the SAME `aggregates`
+        list `having` and `select_items` already share). Keeping that
+        difference in the caller rather than here is what lets one
+        function serve both binding paths.
+        """
+        hidden: list[BoundExpression] = []
+        keys = tuple(self._resolve_order_by_key(item, produced, hidden, bind) for item in items)
+        return keys, tuple(hidden)
+
+    def _resolve_order_by_key(
+        self,
+        item: OrderKey,
+        produced: tuple[BoundExpression, ...],
+        hidden: list[BoundExpression],
+        bind: Callable[[Expression], BoundExpression],
+    ) -> BoundOrderKey:
+        """Resolve one `ORDER BY` item into a BoundOrderKey pointing at a
+        position in the row exec/sort.py's Sort will actually receive:
+        `(*produced, *hidden)` -- `produced` is whatever the caller already
+        computed (the select list itself), `hidden` is the running list of
+        extra columns this SELECT needs only so Sort can see them (see
+        `_bind_order_by`'s docstring and BoundSelect.hidden_order_by).
+
+        Two cases, and this is week7-query-processing.md §40's
+        `resolve_ordinal` stub plus its natural extension to a full
+        expression:
+
+          - `item.expression` is an integer Literal: an ORDINAL. SQL's
+            `ORDER BY 2` means the SECOND OUTPUT column -- 1-based, and
+            out of range (< 1 or > len(produced)) must be a clear error,
+            not silently clamped to the nearest valid position.
+          - Anything else: bind it with `bind(item.expression)`, then
+            decide whether the result is something `produced` already
+            computes (`ORDER BY name` when `name` is already selected
+            shouldn't add a second, redundant copy of the same column --
+            reuse that position) or whether it's genuinely new and has to
+            be appended to `hidden` instead.
+
+        Raises:
+            Whatever `bind` raises for an unresolvable expression,
+            propagated as-is. An out-of-range ordinal raises
+            ColumnNotFoundError -- "no such output column", the same
+            error family a name-based column lookup already uses.
+        """
+        if isinstance(item.expression, Literal) and isinstance(item.expression.value, int):
+            ordinal = item.expression.value
+            if ordinal < 1 or ordinal > len(produced):
+                raise ColumnNotFoundError(f"ORDER BY position {ordinal} is out of range")
+            return BoundOrderKey(ordinal - 1, item.descending)
+
+        bound_expr = bind(item.expression)
+        for i, expr in enumerate(produced):
+            if expr == bound_expr:
+                return BoundOrderKey(i, item.descending)
+
+        hidden.append(bound_expr)
+        return BoundOrderKey(len(produced) + len(hidden) - 1, item.descending)
+
+    def _bind_limit(self, expression: Expression | None) -> int | None:
+        """Fold a `LIMIT` clause down to a concrete count, or None for "no
+        LIMIT was given" -- reuses `_constant` (the same narrow constant
+        folder INSERT values go through) so `LIMIT ?` and `LIMIT 1 + 1`
+        both work without a second evaluator.
+        """
+        if expression is None:
+            return None
+        value = self._constant(expression)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeMismatchError("LIMIT must be a non-negative integer")
+        return value
+
+    def _bind_offset(self, expression: Expression | None) -> int:
+        """`_bind_limit`'s twin for `OFFSET`, defaulting to 0 -- "no OFFSET
+        clause" and "OFFSET 0" mean the same thing, so there's no reason
+        for callers to carry a None case OFFSET never actually needs.
+        """
+        if expression is None:
+            return 0
+        value = self._constant(expression)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TypeMismatchError("OFFSET must be a non-negative integer")
+        return value
 
     def _bind_aggregate_call(self, call: FunctionCall, table: TableSchema) -> BoundAggregate:
         name = call.name.casefold()

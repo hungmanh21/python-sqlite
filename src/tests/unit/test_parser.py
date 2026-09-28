@@ -19,6 +19,9 @@ from quilldb.sql.ast import (
     DataType,
     FunctionCall,
     JoinClause,
+    Literal,
+    OrderKey,
+    Parameter,
     Select,
     TableRef,
 )
@@ -350,3 +353,90 @@ def test_where_group_by_and_having_parse_together_in_order() -> None:
     assert statement.where is not None
     assert statement.group_by == (Column("region"),)
     assert statement.having is not None
+
+
+# =====================================================================
+# ORDER BY, LIMIT, OFFSET (week 7 session 5): syntax only -- resolving an
+# ordinal or a column ORDER BY didn't already select is sql/binder.py's
+# job (test_binder.py's ORDER BY section).
+# =====================================================================
+
+
+def test_a_bare_select_has_no_order_by_limit_or_offset() -> None:
+    statement = parse("SELECT * FROM t")
+    assert isinstance(statement, Select)
+    assert statement.order_by == ()
+    assert statement.limit is None
+    assert statement.offset is None
+
+
+def test_order_by_single_key_defaults_to_ascending() -> None:
+    statement = parse("SELECT * FROM t ORDER BY age")
+    assert isinstance(statement, Select)
+    assert statement.order_by == (OrderKey(Column("age"), descending=False),)
+
+
+def test_order_by_asc_is_the_same_as_no_direction() -> None:
+    statement = parse("SELECT * FROM t ORDER BY age ASC")
+    assert isinstance(statement, Select)
+    assert statement.order_by == (OrderKey(Column("age"), descending=False),)
+
+
+def test_order_by_desc_sets_the_flag() -> None:
+    statement = parse("SELECT * FROM t ORDER BY age DESC")
+    assert isinstance(statement, Select)
+    assert statement.order_by == (OrderKey(Column("age"), descending=True),)
+
+
+def test_order_by_multiple_keys_with_mixed_directions() -> None:
+    statement = parse("SELECT * FROM t ORDER BY region ASC, age DESC")
+    assert isinstance(statement, Select)
+    assert statement.order_by == (
+        OrderKey(Column("region"), descending=False),
+        OrderKey(Column("age"), descending=True),
+    )
+
+
+def test_order_by_an_ordinal() -> None:
+    statement = parse("SELECT name, age FROM t ORDER BY 2")
+    assert isinstance(statement, Select)
+    assert statement.order_by == (OrderKey(Literal(2), descending=False),)
+
+
+def test_order_by_without_by_raises() -> None:
+    with pytest.raises(SQLSyntaxError):
+        parse("SELECT * FROM t ORDER age")
+
+
+def test_limit_captures_the_value() -> None:
+    statement = parse("SELECT * FROM t LIMIT 10")
+    assert isinstance(statement, Select)
+    assert statement.limit == Literal(10)
+    assert statement.offset is None
+
+
+def test_limit_with_offset() -> None:
+    statement = parse("SELECT * FROM t LIMIT 10 OFFSET 5")
+    assert isinstance(statement, Select)
+    assert statement.limit == Literal(10)
+    assert statement.offset == Literal(5)
+
+
+def test_limit_accepts_a_parameter() -> None:
+    statement = parse("SELECT * FROM t LIMIT ?")
+    assert isinstance(statement, Select)
+    assert statement.limit == Parameter(0)
+
+
+def test_where_group_by_having_order_by_limit_offset_parse_together_in_order() -> None:
+    statement = parse(
+        "SELECT region, COUNT(*) FROM t WHERE total > 0 GROUP BY region "
+        "HAVING COUNT(*) > 1 ORDER BY 2 DESC LIMIT 10 OFFSET 5"
+    )
+    assert isinstance(statement, Select)
+    assert statement.where is not None
+    assert statement.group_by == (Column("region"),)
+    assert statement.having is not None
+    assert statement.order_by == (OrderKey(Literal(2), descending=True),)
+    assert statement.limit == Literal(10)
+    assert statement.offset == Literal(5)

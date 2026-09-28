@@ -29,6 +29,7 @@ from quilldb.sql.ast import (
     IsNull,
     JoinClause,
     Literal,
+    OrderKey,
     Parameter,
     Rollback,
     Select,
@@ -280,7 +281,41 @@ class Parser:
             having = self._expression()
 
 
-        return Select(expressions, table, joins, where, group_by, having, distinct)
+        order_by: tuple[OrderKey, ...] = ()
+        if self._peek().type is TokenType.ORDER:
+            self._advance()
+            self._expect(TokenType.BY, "expected BY after ORDER")
+            order_keys = [self._order_key()]
+            while self._peek().type is TokenType.COMMA:
+                self._advance()
+                order_keys.append(self._order_key())
+            order_by = tuple(order_keys)
+
+
+        limit: Expression | None = None
+        if self._peek().type is TokenType.LIMIT:
+            self._advance()
+            limit = self._expression()
+
+
+        offset: Expression | None = None
+        if self._peek().type is TokenType.OFFSET:
+            self._advance()
+            offset = self._expression()
+
+
+        return Select(expressions, table, joins, where, group_by, having, distinct, order_by, limit, offset)
+
+
+    def _order_key(self) -> OrderKey:
+        expression = self._expression()
+        descending = False
+        if self._peek().type is TokenType.ASC:
+            self._advance()
+        elif self._peek().type is TokenType.DESC:
+            self._advance()
+            descending = True
+        return OrderKey(expression, descending)
 
 
     def _from_clause(self) -> tuple[TableRef, tuple[JoinClause, ...]]:

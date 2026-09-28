@@ -39,6 +39,7 @@ from quilldb.sql.binder import (
     BoundIsNull,
     BoundJoinSelect,
     BoundLiteral,
+    BoundOrderKey,
     BoundSelect,
     BoundUnaryOp,
     BoundUpdate,
@@ -971,3 +972,145 @@ def test_bare_column_not_matching_any_group_by_key_still_raises() -> None:
     # legal, only the ones actually named in GROUP BY.
     with pytest.raises(AggregateError):
         bind(parse("SELECT id, COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+# =====================================================================
+# ORDER BY, LIMIT, OFFSET (week 7 session 5)
+# =====================================================================
+
+
+_USERS_CATALOG = _FakeCatalog(_USERS)
+
+
+def test_a_bare_select_has_no_order_by_or_limit() -> None:
+    bound = bind(parse("SELECT * FROM users"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == ()
+    assert bound.hidden_order_by == ()
+    assert bound.limit is None
+    assert bound.offset == 0
+
+
+def test_limit_folds_a_literal_to_an_int() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 10
+    assert bound.offset == 0
+
+
+def test_offset_folds_a_literal_to_an_int() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10 OFFSET 5"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 10
+    assert bound.offset == 5
+
+
+def test_limit_accepts_a_parameter() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT ?"), _USERS_CATALOG, (3,))
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 3
+
+
+def test_no_offset_clause_defaults_to_zero_not_none() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.offset == 0
+
+
+def test_negative_limit_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT -1"), _USERS_CATALOG)
+
+
+def test_non_integer_limit_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT 'ten'"), _USERS_CATALOG)
+
+
+def test_negative_offset_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT 10 OFFSET -1"), _USERS_CATALOG)
+
+
+def test_order_by_combined_with_join_is_unsupported() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        bind(
+            parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.id"),
+            _JOIN_CATALOG,
+        )
+
+
+def test_limit_combined_with_join_is_unsupported() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        bind(parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1"), _JOIN_CATALOG)
+
+
+def test_offset_combined_with_join_is_unsupported() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        bind(
+            parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1 OFFSET 1"),
+            _JOIN_CATALOG,
+        )
+
+
+# ---- exercises _resolve_order_by_key (implemented) ----
+
+
+def test_order_by_column_already_selected_reuses_its_position() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY age"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    # `age` is expressions[1] -- no hidden column needed, no duplicate copy.
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_column_matching_is_case_insensitive() -> None:
+    bound = bind(parse("SELECT NAME FROM users ORDER BY name"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(0, descending=False),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_column_not_selected_becomes_a_hidden_column() -> None:
+    bound = bind(parse("SELECT name FROM users ORDER BY age"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    # `age` isn't in the select list -- appended after it, at index 1.
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == (BoundColumn(2, "age", DataType.INTEGER),)
+
+
+def test_order_by_ordinal_refers_to_the_nth_output_column() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY 2 DESC"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(1, descending=True),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_ordinal_zero_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        bind(parse("SELECT name FROM users ORDER BY 0"), _USERS_CATALOG)
+
+
+def test_order_by_ordinal_past_the_select_list_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        bind(parse("SELECT name FROM users ORDER BY 5"), _USERS_CATALOG)
+
+
+def test_order_by_multiple_keys_resolve_independently() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY age DESC, name"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(1, descending=True), BoundOrderKey(0, descending=False))
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_on_a_fresh_aggregate_folds_through_hash_aggregate() -> None:
+    # SUM(total) appears nowhere else in the query -- _bind_order_by's
+    # `bind` callback routes it through _bind_group_output (same as
+    # HAVING), appending a THIRD BoundAggregate onto the same list
+    # select_items' COUNT(*) already populated, and the hidden column
+    # points at that aggregate's own flat-row slot.
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY user_id ORDER BY SUM(total)"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert [agg.func for agg in bound.aggregates] == ["count_star", "sum"]
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == (BoundColumn(2, "SUM(total)", DataType.INTEGER),)

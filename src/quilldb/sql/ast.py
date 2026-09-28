@@ -102,6 +102,20 @@ type Expression = Literal | Column | Parameter | UnaryOp | BinaryOp | IsNull | F
 
 
 @dataclass(frozen=True)
+class OrderKey:
+    """One `ORDER BY` key: an expression (an ordinary Expression, OR an
+    integer Literal meaning "the Nth output column" -- deciding which is
+    the binder's job, same policy as every other node here) plus its
+    direction. `descending=False` covers both a bare key and an explicit
+    `ASC` -- the parser doesn't distinguish them, since neither SQL nor
+    quilldb gives them different meaning.
+    """
+
+    expression: "Expression"
+    descending: bool = False
+
+
+@dataclass(frozen=True)
 class CreateTable:
     name: str
     columns: tuple[ColumnDef, ...]
@@ -155,11 +169,22 @@ class Select:
     group_by: tuple[Expression, ...] = ()
     having: Expression | None = None
     distinct: bool = False
+    order_by: tuple[OrderKey, ...] = ()
+    limit: Expression | None = None
+    offset: Expression | None = None
     """Whether GROUP BY keys are functionally determined, whether a bare
     column outside GROUP BY is legal, and whether DISTINCT may combine
     with an aggregate -- none of that is decided here. The parser only
     records what the query wrote; sql/binder.py's bind_aggregate_select
     is where those questions get answered (week7-query-processing.md §40).
+
+    `limit`/`offset` are Expression rather than a bare int so `LIMIT ?`
+    parses -- folding either down to a concrete non-negative int (and
+    rejecting anything else) is the binder's job, same as every other
+    Expression here. An ORDER BY key naming a column the SELECT list
+    didn't ask for, or an ordinal referring to one of those columns by
+    position, is also unresolved at this level -- see BoundSelect's
+    `hidden_order_by` in sql/binder.py.
     """
 
 

@@ -62,14 +62,17 @@ from quilldb.plan.statistics import (
     default_table_stats,
     estimate_row_counts,
 )
+from quilldb.sql.ast import DataType
 from quilldb.sql.binder import (
     BoundAggregateSelect,
     BoundAssignment,
     BoundBinaryOp,
+    BoundColumn,
     BoundDelete,
     BoundExpression,
     BoundInsert,
     BoundJoinSelect,
+    BoundOrderKey,
     BoundSelect,
     BoundUpdate,
     resolve_layout,
@@ -625,6 +628,60 @@ class Distinct(Operator):
 
     def explain(self, depth: int = 0, verbose: bool = False) -> str:
         return _explain_line(depth, "Distinct") + "\n" + self.child.explain(depth + 1, verbose)
+
+
+class Limit(Operator):
+    """Skip `offset` rows, then yield at most `limit` more (None = every
+    remaining row).
+
+    Pulls from `child` lazily, one row at a time, exactly like every other
+    operator here -- which is what makes `LIMIT 1` over a million-row
+    SeqScan/IndexScan read only a handful of pages instead of the whole
+    table (the pull model's whole justification, chapter 09 -- and
+    week7-query-processing.md §44's short-circuit tests exist to prove it
+    stays true through this operator too).
+    """
+
+    def __init__(self, child: Operator, limit: int | None, offset: int = 0) -> None:
+        self.child = child
+        self.limit = limit
+        self.offset = offset
+        self._skipped = 0
+        self._returned = 0
+
+    def open(self, outer: Row = ()) -> None:
+        self.child.open(outer)
+        self._skipped = 0
+        self._returned = 0
+
+    def next(self) -> Row | None:
+        try:
+            while self._skipped < self.offset:
+                row = self.child.next()
+                if row is None:
+                    return None
+                self._skipped += 1
+            if self.limit is not None and self._returned >= self.limit:
+                return None
+            row = self.child.next()
+            if row is None:
+                return None
+            self._returned += 1
+            return row
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        self.child.close()
+
+    def explain(self, depth: int = 0, verbose: bool = False) -> str:
+        label = "Limit"
+        if self.limit is not None:
+            label += f" {self.limit}"
+        if self.offset:
+            label += f" OFFSET {self.offset}"
+        return _explain_line(depth, label) + "\n" + self.child.explain(depth + 1, verbose)
 
 
 class Insert(Operator):
@@ -1270,6 +1327,51 @@ def _build_single_table_source(
     return source
 
 
+def _strip_hidden_columns(source: Operator, visible_count: int) -> Operator:
+    """Project a row back down to just its first `visible_count` columns --
+    the final step for a query whose ORDER BY needed a hidden trailing
+    column (BoundSelect.hidden_order_by / BoundAggregateSelect's own field)
+    Sort could see but the caller never asked for. An ordinary Project
+    works unchanged here: a BoundColumn's `index` is just a position in
+    whatever row it's handed, and Sort's output row has the exact same
+    shape as the Project below it -- only the ROW ORDER changed, not which
+    column lives where.
+    """
+    expressions = tuple(BoundColumn(i, "", DataType.INTEGER) for i in range(visible_count))
+    return Project(source, expressions)
+
+
+def _apply_order_limit(
+    source: Operator,
+    visible_count: int,
+    order_by: tuple[BoundOrderKey, ...],
+    hidden_order_by: tuple[BoundExpression, ...],
+    limit: int | None,
+    offset: int,
+) -> Operator:
+    """The tail every SELECT shares once its own rows are ready: sort (if
+    ORDER BY was given), strip any hidden columns Sort needed but the
+    caller didn't ask for, then apply LIMIT/OFFSET. Shared between
+    build_operator()'s plain-SELECT path and _build_aggregate_operator()
+    so the two don't duplicate this sequencing.
+
+    No bounded top-K heap: Sort always fully materializes and sorts, and
+    LIMIT/OFFSET are applied strictly on top by Limit -- see exec/sort.py's
+    module docstring for why that's a documented gap rather than what the
+    roadmap's stretch goal describes.
+    """
+    from quilldb.exec.sort import Sort
+
+    result = source
+    if order_by:
+        result = Sort(result, order_by)
+        if hidden_order_by:
+            result = _strip_hidden_columns(result, visible_count)
+    if limit is not None or offset:
+        result = Limit(result, limit, offset)
+    return result
+
+
 def _build_aggregate_operator(
     statement: BoundAggregateSelect,
     pager: Pager,
@@ -1279,15 +1381,19 @@ def _build_aggregate_operator(
     txn: Transaction | None,
 ) -> Operator:
     """
-        Project                    # statement.select_items, over the flat grouped row
-        └─ Filter                  # statement.having -- only if HAVING was given
-           └─ HashAggregate        # statement.group_by / statement.aggregates
-              └─ SeqScan | IndexScan (+ Filter)   # statement.where, same as a plain SELECT
+        Limit / Offset              # only when LIMIT or OFFSET was given
+        └─ Project                  # strips hidden_order_by, if any were added
+           └─ Sort                  # statement.order_by -- only if ORDER BY was given
+              └─ Project                    # statement.select_items + hidden_order_by, over the flat grouped row
+                 └─ Filter                  # statement.having -- only if HAVING was given
+                    └─ HashAggregate        # statement.group_by / statement.aggregates
+                       └─ SeqScan | IndexScan (+ Filter)   # statement.where, same as a plain SELECT
 
-    select_items and having are already BoundExpression trees over
-    HashAggregate's flat output row (sql/binder.py's _bind_group_output),
-    so the same Filter/Project operators a plain SELECT uses finish the
-    query -- no special-cased evaluator needed for the post-grouping half.
+    select_items, having, and hidden_order_by are already BoundExpression
+    trees over HashAggregate's flat output row (sql/binder.py's
+    _bind_group_output), so the same Filter/Project operators a plain
+    SELECT uses finish the pre-sort half of the query -- no special-cased
+    evaluator needed for the post-grouping half.
     """
     # Deferred: exec/aggregate.py imports Operator from this module at its
     # own import time, so a module-level import here would cycle -- same
@@ -1298,7 +1404,15 @@ def _build_aggregate_operator(
     grouped: Operator = HashAggregate(source, statement.group_by, statement.aggregates)
     if statement.having is not None:
         grouped = Filter(grouped, statement.having)
-    return Project(grouped, statement.select_items)
+    projected: Operator = Project(grouped, statement.select_items + statement.hidden_order_by)
+    return _apply_order_limit(
+        projected,
+        len(statement.select_items),
+        statement.order_by,
+        statement.hidden_order_by,
+        statement.limit,
+        statement.offset,
+    )
 
 
 def build_operator(
@@ -1317,10 +1431,13 @@ def build_operator(
     plan/search.py):
 
 
-        Distinct        # only for SELECT DISTINCT
-        └─ Project
-           └─ Filter       # omitted when nothing is left over to check
-              └─ SeqScan | IndexScan
+        Limit / Offset  # only when LIMIT or OFFSET was given
+        └─ Project       # strips hidden_order_by, if any were added
+           └─ Sort          # only if ORDER BY was given
+              └─ Distinct      # only for SELECT DISTINCT
+                 └─ Project
+                    └─ Filter       # omitted when nothing is left over to check
+                       └─ SeqScan | IndexScan
 
     A BoundAggregateSelect (GROUP BY and/or an aggregate call) builds a
     different shape -- see _build_aggregate_operator's own docstring.
@@ -1381,7 +1498,14 @@ def build_operator(
 
 
     source = _build_single_table_source(statement.table, statement.where, pager, pool, catalog, stats, txn)
-    projected: Operator = Project(source, statement.expressions)
+    projected: Operator = Project(source, statement.expressions + statement.hidden_order_by)
     if statement.distinct:
         projected = Distinct(projected)
-    return projected
+    return _apply_order_limit(
+        projected,
+        len(statement.expressions),
+        statement.order_by,
+        statement.hidden_order_by,
+        statement.limit,
+        statement.offset,
+    )
