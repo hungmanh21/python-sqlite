@@ -165,6 +165,64 @@ def encode_stat1_row(stats: IndexStats) -> str:
     return " ".join(str(n) for n in (stats.row_count, *stats.rows_per_prefix))
 
 
+def index_ndv(index_stats: IndexStats) -> int:
+    """The leading column's distinct-value count, derived rather than
+    stored: `quill_stat1` gives rows-per-value directly, not value counts,
+    so `NDV = row_count / rows_per_prefix[0]` (week7-query-processing.md
+    §43's "Join ordering"). Clamped to at least 1 for the same reason every
+    other stage-2/3 count is -- a column can't have fewer than one distinct
+    value among its rows.
+
+    Called only when the join column actually LEADS some index on that
+    table -- callers decide "known vs. unknown" by whether such an index
+    exists, real ANALYZE stats or the documented default alike (see
+    estimate_equijoin_rows's docstring for why a defaulted index still
+    counts as "known").
+    """
+    return max(1, index_stats.row_count // index_stats.rows_per_prefix[0])
+
+
+def _assumed_ndv(rows: int, ndv: int | None) -> int:
+    """An unknown side's NDV, assumed rather than measured: the same
+    "1 distinct value per _DEFAULT_ROWS_PER_VALUE rows" story
+    default_index_stats() already tells for a single unanalyzed index,
+    reused here so a missing NDV degrades the join formula gracefully
+    instead of switching to an unrelated one. Deriving it FROM `rows`
+    (rather than reusing _DEFAULT_ROWS_PER_VALUE as the join divisor
+    directly) matters: a flat constant divisor would make the estimate
+    grow quadratically with table size (`rows^2 / 10`), while an assumed
+    NDV that scales with `rows` keeps it closer to linear, the same shape
+    the both-known case already has.
+    """
+    return ndv if ndv is not None else max(1, rows // _DEFAULT_ROWS_PER_VALUE)
+
+
+def estimate_equijoin_rows(
+    left_rows: int, right_rows: int, left_ndv: int | None, right_ndv: int | None
+) -> int:
+    """Estimate the row count of `R JOIN S ON R.a = S.b`, from each side's
+    OWN row count (not yet joined to anything) and each side's NDV for the
+    join column (index_ndv() above), or None when that column doesn't lead
+    any index on its table (week7-query-processing.md §43).
+
+
+    Selinger's 1979 selectivity for `column1 = column2`,
+    `1/MAX(ICARD1, ICARD2)` (cited, not invented):
+
+
+        join_rows ~= |R| x |S| / max(NDV(R.a), NDV(S.b))
+
+
+    Both known: NDV(R.a) and NDV(S.b) are used directly. Exactly one known,
+    or neither: the missing side's NDV is ASSUMED via _assumed_ndv() rather
+    than dropped from the formula, so all three cases share one calculation
+    and degrade gracefully into each other instead of being three unrelated
+    rules.
+    """
+    max_ndv = max(_assumed_ndv(left_rows, left_ndv), _assumed_ndv(right_rows, right_ndv))
+    return max(1, (left_rows * right_rows) // max_ndv)
+
+
 def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats: TableStats) -> AccessPath:
     """Fill in `rows_fetched` and `est_rows` (chapter 12 §12.6 stage 2).
 
@@ -216,13 +274,21 @@ def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats:
     into `rows_per_prefix`.
     """
     # get the distinct columns in seek_terms of AccessPath
-    if path.kind == "index_scan":
+    if path.kind == "index_scan" and path.seek_terms:
         columns = {predicate.column for predicate in path.seek_terms}
         if stats:
             rows_fetched = max(1, stats.rows_per_prefix[len(columns) - 1])
         else:
             rows_fetched = 1
     else:
+        # A seq_scan, OR an index_scan with no seek_terms at all -- the
+        # full-index-order path session 0.2 adds (planner.py's
+        # _index_order_path). `columns` would be the empty set there, and
+        # `rows_per_prefix[len(columns) - 1]` is `rows_per_prefix[-1]`:
+        # Python's negative-index wraparound silently grabs the stat for
+        # the FULLY specified key -- the narrowest, smallest count in the
+        # array -- making an unfiltered full scan look nearly free. A scan
+        # that seeks on nothing fetches the same rows a SeqScan would.
         rows_fetched = table_stats.row_count
    
     value = rows_fetched * (1 / 3) ** len(path.residual)
@@ -234,5 +300,7 @@ def estimate_row_counts(path: AccessPath, stats: IndexStats | None, table_stats:
         seek_terms=path.seek_terms,
         residual=path.residual,
         rows_fetched=rows_fetched,
-        est_rows=est_rows
+        est_rows=est_rows,
+        output_order=path.output_order,
+        reverse=path.reverse,
     )

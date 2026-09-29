@@ -13,9 +13,23 @@ supposed to agree on.
 
 Both engines run entirely in :memory: -- this is about answer agreement,
 not durability (tests/integration/test_vertical_slice.py owns durability).
-Rows are compared with plain equality, which is only safe because Week 3
-has exactly one access path (SeqScan, rowid order, no ORDER BY); revisit
-if a later week's planner can return rows in a different order.
+Rows are compared with plain equality: safe for a hand-written case as
+long as its query result is unambiguously ordered (either exactly one row,
+or an explicit `ORDER BY` with a deterministic tiebreak) -- with a
+multi-access-path planner (week 7+), a query with NO `ORDER BY` has no
+guaranteed row order in EITHER engine, so a case without one is only safe
+here by accident. test_null_matrix.py's generator (session 8) is why this
+matters starting week 7: every generated query pins its own order rather
+than relying on either engine's incidental scan order.
+
+
+`Case` and the actual comparison (`assert_matches_sqlite`) live in
+`_util.py` (imported bare, `from _util import ...`, not dotted -- this
+directory has no `__init__.py`, matching the rest of `src/tests/`, and
+pytest/mypy both resolve a same-directory import that way) so
+test_null_matrix.py's generated cases run through the exact same
+real-sqlite3-vs-quilldb comparison as these hand-written ones, instead of
+a second reimplementation that could quietly drift from this one.
 
 
 Meant to grow, not stay at ~20: every week from here adds cases as new
@@ -24,23 +38,10 @@ for free.
 """
 
 
-import sqlite3
-from typing import NamedTuple
-
 import pytest
-
-import quilldb
-from quilldb.codec.record import Value
+from _util import Case, assert_matches_sqlite
 
 _USERS = "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)"
-
-
-
-
-class Case(NamedTuple):
-    name: str
-    script: list[tuple[str, tuple[Value, ...]]]
-    query: tuple[str, tuple[Value, ...]]
 
 
 
@@ -192,27 +193,4 @@ CASES: list[Case] = [
 
 @pytest.mark.parametrize("case", CASES, ids=[c.name for c in CASES])
 def test_matches_sqlite(case: Case) -> None:
-    sqlite_conn = sqlite3.connect(":memory:")
-    quill_conn = quilldb.connect(":memory:")
-    try:
-        for sql, params in case.script:
-            sqlite_conn.execute(sql, params)
-            quill_conn.execute(sql, params)
-
-
-        query_sql, query_params = case.query
-        sqlite_cursor = sqlite_conn.execute(query_sql, query_params)
-        quill_cursor = quill_conn.execute(query_sql, query_params)
-
-
-        sqlite_description = sqlite_cursor.description
-        quill_description = quill_cursor.description
-        assert sqlite_description is not None
-        assert quill_description is not None
-        assert [c[0] for c in sqlite_description] == [c[0] for c in quill_description]
-
-
-        assert sqlite_cursor.fetchall() == quill_cursor.fetchall()
-    finally:
-        sqlite_conn.close()
-        quill_conn.close()
+    assert_matches_sqlite(case)

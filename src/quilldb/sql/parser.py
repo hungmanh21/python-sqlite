@@ -24,13 +24,17 @@ from quilldb.sql.ast import (
     Delete,
     Explain,
     Expression,
+    FunctionCall,
     Insert,
     IsNull,
+    JoinClause,
     Literal,
+    OrderKey,
     Parameter,
     Rollback,
     Select,
     Statement,
+    TableRef,
     UnaryOp,
     Update,
 )
@@ -232,6 +236,12 @@ class Parser:
         self._expect(TokenType.SELECT, "expected SELECT")
 
 
+        distinct = False
+        if self._peek().type is TokenType.DISTINCT:
+            self._advance()
+            distinct = True
+
+
         expressions: tuple[Expression, ...] | None
         if self._peek().type is TokenType.STAR:
             self._advance()
@@ -245,7 +255,7 @@ class Parser:
 
 
         self._expect(TokenType.FROM, "expected FROM")
-        table = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        table, joins = self._from_clause()
 
 
         where: Expression | None = None
@@ -254,7 +264,119 @@ class Parser:
             where = self._expression()
 
 
-        return Select(expressions, table, where)
+        group_by: tuple[Expression, ...] = ()
+        if self._peek().type is TokenType.GROUP:
+            self._advance()
+            self._expect(TokenType.BY, "expected BY after GROUP")
+            keys = [self._expression()]
+            while self._peek().type is TokenType.COMMA:
+                self._advance()
+                keys.append(self._expression())
+            group_by = tuple(keys)
+
+
+        having: Expression | None = None
+        if self._peek().type is TokenType.HAVING:
+            self._advance()
+            having = self._expression()
+
+
+        order_by: tuple[OrderKey, ...] = ()
+        if self._peek().type is TokenType.ORDER:
+            self._advance()
+            self._expect(TokenType.BY, "expected BY after ORDER")
+            order_keys = [self._order_key()]
+            while self._peek().type is TokenType.COMMA:
+                self._advance()
+                order_keys.append(self._order_key())
+            order_by = tuple(order_keys)
+
+
+        limit: Expression | None = None
+        if self._peek().type is TokenType.LIMIT:
+            self._advance()
+            limit = self._expression()
+
+
+        offset: Expression | None = None
+        if self._peek().type is TokenType.OFFSET:
+            self._advance()
+            offset = self._expression()
+
+
+        return Select(expressions, table, joins, where, group_by, having, distinct, order_by, limit, offset)
+
+
+    def _order_key(self) -> OrderKey:
+        expression = self._expression()
+        descending = False
+        if self._peek().type is TokenType.ASC:
+            self._advance()
+        elif self._peek().type is TokenType.DESC:
+            self._advance()
+            descending = True
+        return OrderKey(expression, descending)
+
+
+    def _from_clause(self) -> tuple[TableRef, tuple[JoinClause, ...]]:
+        """The first table, then zero or more comma joins and/or `JOIN ...
+        ON` steps, in the order they appear -- that order is `table_ordinal`
+        in the binder (sql/binder.py's TableScope), so it isn't just parsed
+        and discarded.
+        """
+        first = self._table_ref()
+
+
+        joins: list[JoinClause] = []
+        while True:
+            if self._peek().type is TokenType.COMMA:
+                self._advance()
+                joins.append(JoinClause("INNER", self._table_ref(), on=None))
+                continue
+
+
+            join_type = self._join_type()
+            if join_type is None:
+                break
+            table = self._table_ref()
+            self._expect(TokenType.ON, "expected ON after JOIN")
+            on = self._expression()
+            joins.append(JoinClause(join_type, table, on))
+
+
+        return first, tuple(joins)
+
+
+    def _join_type(self) -> str | None:
+        token = self._peek()
+        if token.type is TokenType.JOIN:
+            self._advance()
+            return "INNER"
+        if token.type is TokenType.INNER:
+            self._advance()
+            self._expect(TokenType.JOIN, "expected JOIN after INNER")
+            return "INNER"
+        if token.type is TokenType.LEFT:
+            self._advance()
+            if self._peek().type is TokenType.OUTER:
+                self._advance()
+            self._expect(TokenType.JOIN, "expected JOIN after LEFT [OUTER]")
+            return "LEFT"
+        return None
+
+
+    def _table_ref(self) -> TableRef:
+        name = self._expect(TokenType.IDENTIFIER, "expected a table name").lexeme
+        alias: str | None = None
+        if self._peek().type is TokenType.AS:
+            self._advance()
+            alias = self._expect(TokenType.IDENTIFIER, "expected an alias after AS").lexeme
+        elif self._peek().type is TokenType.IDENTIFIER:
+            # Bare alias, no AS -- legal in SQL ("FROM orders o"), and
+            # unambiguous here only because JOIN/ON/WHERE/comma are their
+            # own reserved token types, not IDENTIFIER (session 0, B6-9).
+            alias = self._advance().lexeme
+        return TableRef(name, alias)
 
 
     def _delete(self) -> Delete:
@@ -419,6 +541,12 @@ class Parser:
 
         if token.type is TokenType.IDENTIFIER:
             self._advance()
+            if self._peek().type is TokenType.LEFT_PAREN:
+                return self._function_call(token.lexeme)
+            if self._peek().type is TokenType.DOT:
+                self._advance()
+                column_name = self._expect(TokenType.IDENTIFIER, "expected a column name after '.'").lexeme
+                return Column(column_name, table=token.lexeme)
             return Column(token.lexeme)
 
 
@@ -437,6 +565,35 @@ class Parser:
 
 
         raise SQLSyntaxError(f"expected an expression, found {token.lexeme!r} at position {token.position}")
+
+
+    def _function_call(self, name: str) -> FunctionCall:
+        """`name(` was just consumed up to (not including) the `(` -- called
+        from _atom() the moment an identifier is immediately followed by
+        `LEFT_PAREN`, which is unambiguous here: no other atom starts that
+        way (a parenthesized expression, `_atom`'s own LEFT_PAREN case,
+        never has an IDENTIFIER directly in front of it).
+
+        `COUNT(*)` is the one special form: `*` alone is not a general
+        expression (see FunctionCall.star's docstring), so it's checked for
+        explicitly before falling into ordinary comma-separated argument
+        parsing. Whether `*` is actually valid for THIS function name is
+        the binder's call, not the parser's -- same "syntax now, meaning
+        later" split as an unresolved Column.
+        """
+        self._expect(TokenType.LEFT_PAREN, "expected '(' after function name")
+
+        if self._peek().type is TokenType.STAR:
+            self._advance()
+            self._expect(TokenType.RIGHT_PAREN, "expected ')' after '*'")
+            return FunctionCall(name, (), star=True)
+
+        args = [self._expression()]
+        while self._peek().type is TokenType.COMMA:
+            self._advance()
+            args.append(self._expression())
+        self._expect(TokenType.RIGHT_PAREN, "expected ')' to close a function call")
+        return FunctionCall(name, tuple(args))
 
 
     def _peek(self) -> Token:

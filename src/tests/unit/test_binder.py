@@ -16,6 +16,8 @@ import pytest
 
 from quilldb.catalog.schema import ColumnSchema, TableSchema
 from quilldb.errors import (
+    AggregateError,
+    AmbiguousColumnError,
     ColumnCountError,
     ColumnNotFoundError,
     ParameterCountError,
@@ -25,6 +27,8 @@ from quilldb.errors import (
 )
 from quilldb.sql.ast import CreateIndex, CreateTable, DataType
 from quilldb.sql.binder import (
+    BoundAggregate,
+    BoundAggregateSelect,
     BoundAssignment,
     BoundBinaryOp,
     BoundColumn,
@@ -33,11 +37,15 @@ from quilldb.sql.binder import (
     BoundDelete,
     BoundInsert,
     BoundIsNull,
+    BoundJoinSelect,
     BoundLiteral,
+    BoundOrderKey,
     BoundSelect,
     BoundUnaryOp,
     BoundUpdate,
+    JoinOrderKey,
     bind,
+    resolve_layout,
 )
 from quilldb.sql.parser import parse
 
@@ -63,6 +71,18 @@ _TYPES = TableSchema(
     ),
     root_page=3,
     sql="CREATE TABLE types (i INTEGER, r REAL, t TEXT, b BLOB)",
+)
+
+
+_ORDERS = TableSchema(
+    "orders",
+    (
+        ColumnSchema("id", DataType.INTEGER),
+        ColumnSchema("user_id", DataType.INTEGER),
+        ColumnSchema("total", DataType.INTEGER),
+    ),
+    root_page=4,
+    sql="CREATE TABLE orders (id INTEGER, user_id INTEGER, total INTEGER)",
 )
 
 
@@ -653,3 +673,473 @@ def test_update_substitutes_parameters_across_set_and_where() -> None:
     assert isinstance(bound, BoundUpdate)
     assert bound.assignments == (BoundAssignment(2, BoundLiteral(37)),)
     assert bound.where == BoundBinaryOp(BoundColumn(0, "id", DataType.INTEGER), "=", BoundLiteral(1))
+
+
+# =====================================================================
+# SELECT with JOIN: scopes, qualified names, ambiguity
+# (week7-query-processing.md session 1)
+# =====================================================================
+
+
+_JOIN_CATALOG = _FakeCatalog(_USERS, _ORDERS)
+
+
+def test_a_comma_join_produces_a_scope_per_table_in_from_order() -> None:
+    bound = _bind("SELECT * FROM users, orders", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert [s.table.name for s in bound.scopes] == ["users", "orders"]
+    assert [s.ordinal for s in bound.scopes] == [0, 1]
+    assert [s.alias for s in bound.scopes] == ["users", "orders"]
+
+
+def test_a_comma_join_has_no_on_condition() -> None:
+    bound = _bind("SELECT * FROM users, orders", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert len(bound.joins) == 1
+    assert bound.joins[0].join_type == "INNER"
+    assert bound.joins[0].on is None
+
+
+def test_inner_join_on_binds_the_condition_against_both_scopes() -> None:
+    bound = _bind(
+        "SELECT * FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.joins[0].join_type == "INNER"
+    assert bound.joins[0].on == BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        "=",
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_left_join_is_recorded_as_such() -> None:
+    bound = _bind(
+        "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.joins[0].join_type == "LEFT"
+
+
+def test_aliases_are_the_scope_key_not_the_table_name() -> None:
+    bound = _bind(
+        "SELECT u.id, o.total FROM users u JOIN orders o ON u.id = o.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert [s.alias for s in bound.scopes] == ["u", "o"]
+    assert bound.expressions == (
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_select_star_across_a_join_expands_every_table_in_from_order() -> None:
+    bound = _bind("SELECT * FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.expressions == (
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(1, "name", DataType.TEXT, table_ordinal=0),
+        BoundColumn(2, "age", DataType.INTEGER, table_ordinal=0),
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=1),
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+        BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),
+    )
+
+
+def test_an_unqualified_name_present_in_only_one_scope_still_resolves() -> None:
+    bound = _bind(
+        "SELECT total FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.expressions == (BoundColumn(2, "total", DataType.INTEGER, table_ordinal=1),)
+
+
+def test_an_unqualified_name_in_two_scopes_is_ambiguous() -> None:
+    # Both users and orders have an `id` column -- bare `id` must not
+    # silently pick one (AmbiguousColumnError's docstring).
+    with pytest.raises(AmbiguousColumnError):
+        _bind("SELECT id FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG)
+
+
+def test_a_qualifier_naming_no_scope_raises_column_not_found() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind(
+            "SELECT ghost.id FROM users JOIN orders ON users.id = orders.user_id", catalog=_JOIN_CATALOG
+        )
+
+
+def test_a_qualified_name_absent_from_its_table_raises_column_not_found() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        _bind(
+            "SELECT users.total FROM users JOIN orders ON users.id = orders.user_id",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+def test_distinct_combined_with_a_join_is_unsupported() -> None:
+    # BoundJoinSelect has no `distinct` field and build_operator's join
+    # path never wraps its result in a Distinct -- without this check the
+    # keyword would parse and bind cleanly but silently stop deduplicating.
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT DISTINCT users.name FROM users JOIN orders ON users.id = orders.user_id",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+def test_group_by_combined_with_a_join_is_unsupported() -> None:
+    # No aggregate call anywhere in the select list means bind_join_select
+    # would otherwise bind this cleanly and silently drop GROUP BY entirely
+    # -- returning every unaggregated joined row instead of one per age.
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT users.age FROM users JOIN orders ON users.id = orders.user_id GROUP BY users.age",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+def test_having_combined_with_a_join_is_unsupported() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        _bind(
+            "SELECT users.name FROM users JOIN orders ON users.id = orders.user_id "
+            "HAVING users.name = 'ada'",
+            catalog=_JOIN_CATALOG,
+        )
+
+
+# =====================================================================
+# resolve_layout: rewriting (table_ordinal, index) to a flat row index
+# =====================================================================
+
+
+def test_resolve_layout_offsets_each_table_ordinal() -> None:
+    expr = BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER, table_ordinal=0),
+        "=",
+        BoundColumn(1, "user_id", DataType.INTEGER, table_ordinal=1),
+    )
+    # users has 3 columns (0, 1, 2), so orders starts at flat offset 3.
+    flat = resolve_layout(expr, {0: 0, 1: 3})
+    assert flat == BoundBinaryOp(
+        BoundColumn(0, "id", DataType.INTEGER),
+        "=",
+        BoundColumn(4, "user_id", DataType.INTEGER),
+    )
+
+
+def test_resolve_layout_leaves_literals_alone() -> None:
+    assert resolve_layout(BoundLiteral(5), {0: 0}) == BoundLiteral(5)
+
+
+# =====================================================================
+# bind_aggregate_select (week 7 sessions 3 & 4, §40/§42): aggregate calls,
+# GROUP BY, HAVING. Tests whose select list or HAVING clause names a bare
+# column matching a GROUP BY key (validate_aggregates's real rule --
+# _group_by_key_index) are grouped at the end of this section.
+# =====================================================================
+
+_ORDERS_CATALOG = _FakeCatalog(_ORDERS)
+
+
+def test_count_star_binds_to_count_star_with_no_arg() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders"), _ORDERS_CATALOG)
+    assert bound == BoundAggregateSelect(
+        _ORDERS,
+        (),
+        (BoundAggregate("count_star", None),),
+        (BoundColumn(0, "COUNT(*)", DataType.INTEGER),),
+        None,
+        None,
+        ("COUNT(*)",),
+    )
+
+
+def test_aggregate_call_arg_is_bound_against_the_table() -> None:
+    bound = bind(parse("SELECT SUM(total) FROM orders"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.aggregates == (BoundAggregate("sum", BoundColumn(2, "total", DataType.INTEGER)),)
+
+
+def test_aggregate_function_name_is_case_insensitive() -> None:
+    bound = bind(parse("SELECT count(*) FROM orders"), _ORDERS_CATALOG)
+    assert bound == BoundAggregateSelect(
+        _ORDERS,
+        (),
+        (BoundAggregate("count_star", None),),
+        (BoundColumn(0, "COUNT(*)", DataType.INTEGER),),
+        None,
+        None,
+        ("COUNT(*)",),
+    )
+
+
+def test_multiple_aggregates_bind_in_select_list_order() -> None:
+    bound = bind(parse("SELECT COUNT(*), MIN(total), MAX(total) FROM orders"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert [agg.func for agg in bound.aggregates] == ["count_star", "min", "max"]
+
+
+def test_aggregate_select_where_is_bound_like_a_plain_select() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders WHERE total > 10"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.where is not None
+
+
+def test_star_argument_is_only_valid_for_count() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT SUM(*) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_aggregate_call_with_wrong_arity_raises() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT COUNT(id, total) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_unknown_function_name_raises_unsupported_feature() -> None:
+    with pytest.raises(UnsupportedFeatureError):
+        bind(parse("SELECT UPPER(total) FROM orders"), _ORDERS_CATALOG)
+
+
+def test_select_star_combined_with_group_by_raises() -> None:
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT * FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+def test_group_by_key_expression_binds_against_the_table() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.group_by == (BoundColumn(2, "total", DataType.INTEGER),)
+
+
+def test_multiple_group_by_keys_bind_in_order() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY user_id, total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.group_by == (
+        BoundColumn(1, "user_id", DataType.INTEGER),
+        BoundColumn(2, "total", DataType.INTEGER),
+    )
+    # The aggregate slot lands right after every GROUP BY key in the flat
+    # post-grouping row: 2 keys occupy positions 0-1, so COUNT(*) is at 2.
+    assert bound.select_items == (BoundColumn(2, "COUNT(*)", DataType.INTEGER),)
+
+
+def test_having_binds_over_the_flat_post_grouping_row() -> None:
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY total HAVING COUNT(*) > 1"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.having == BoundBinaryOp(BoundColumn(2, "COUNT(*)", DataType.INTEGER), ">", BoundLiteral(1))
+    # No dedup: the select list's COUNT(*) and HAVING's COUNT(*) are two
+    # separate BoundAggregate entries (BoundAggregateSelect's own docstring).
+    assert len(bound.aggregates) == 2
+
+
+def test_distinct_combined_with_group_by_is_unsupported() -> None:
+    # Checked before group_by/select_items are ever bound, so this never
+    # reaches _group_by_key_index at all.
+    with pytest.raises(UnsupportedFeatureError):
+        bind(parse("SELECT DISTINCT total FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+def test_bare_column_alongside_an_aggregate_with_no_group_by_raises() -> None:
+    # With zero GROUP BY keys, _bind_group_output short-circuits before
+    # ever calling _group_by_key_index: there is no key for `id` to be
+    # functionally determined by, unconditionally, regardless of what
+    # "matches" means once keys exist (week7-query-processing.md §40's
+    # validate_aggregates rule, specialized to zero keys).
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT id, COUNT(*) FROM orders"), _ORDERS_CATALOG)
+
+
+# ---- exercises _group_by_key_index (implemented) ----
+
+
+def test_bare_column_matching_a_group_by_key_resolves_to_its_flat_row_slot() -> None:
+    bound = bind(parse("SELECT total, COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.select_items == (
+        BoundColumn(0, "total", DataType.INTEGER),  # group_by[0]'s slot
+        BoundColumn(1, "COUNT(*)", DataType.INTEGER),  # the one aggregate's slot, right after it
+    )
+    assert bound.labels == ("total", "COUNT(*)")
+
+
+def test_bare_column_matching_is_case_insensitive_like_every_other_column_lookup() -> None:
+    bound = bind(parse("SELECT TOTAL FROM orders GROUP BY total"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert bound.select_items == (BoundColumn(0, "total", DataType.INTEGER),)
+
+
+def test_bare_column_not_matching_any_group_by_key_still_raises() -> None:
+    # `id` isn't `total` -- a non-empty group_by doesn't make every column
+    # legal, only the ones actually named in GROUP BY.
+    with pytest.raises(AggregateError):
+        bind(parse("SELECT id, COUNT(*) FROM orders GROUP BY total"), _ORDERS_CATALOG)
+
+
+# =====================================================================
+# ORDER BY, LIMIT, OFFSET (week 7 session 5)
+# =====================================================================
+
+
+_USERS_CATALOG = _FakeCatalog(_USERS)
+
+
+def test_a_bare_select_has_no_order_by_or_limit() -> None:
+    bound = bind(parse("SELECT * FROM users"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == ()
+    assert bound.hidden_order_by == ()
+    assert bound.limit is None
+    assert bound.offset == 0
+
+
+def test_limit_folds_a_literal_to_an_int() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 10
+    assert bound.offset == 0
+
+
+def test_offset_folds_a_literal_to_an_int() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10 OFFSET 5"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 10
+    assert bound.offset == 5
+
+
+def test_limit_accepts_a_parameter() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT ?"), _USERS_CATALOG, (3,))
+    assert isinstance(bound, BoundSelect)
+    assert bound.limit == 3
+
+
+def test_no_offset_clause_defaults_to_zero_not_none() -> None:
+    bound = bind(parse("SELECT * FROM users LIMIT 10"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.offset == 0
+
+
+def test_negative_limit_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT -1"), _USERS_CATALOG)
+
+
+def test_non_integer_limit_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT 'ten'"), _USERS_CATALOG)
+
+
+def test_negative_offset_raises() -> None:
+    with pytest.raises(TypeMismatchError):
+        bind(parse("SELECT * FROM users LIMIT 10 OFFSET -1"), _USERS_CATALOG)
+
+
+def test_order_by_on_a_join_binds_as_a_join_order_key() -> None:
+    """Session 7: ORDER BY combined with a JOIN is no longer rejected --
+    it binds to JoinOrderKey (expression-shaped, table-scope), not the
+    position-based BoundOrderKey a single-table/aggregate SELECT gets,
+    since a join's row layout isn't decided until a PlanCandidate is
+    chosen (see JoinOrderKey's own docstring).
+    """
+    bound = bind(
+        parse("SELECT users.id FROM users JOIN orders ON users.id = orders.user_id ORDER BY users.id DESC"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.order_by == (JoinOrderKey(BoundColumn(0, "id", DataType.INTEGER, 0), descending=True),)
+
+
+def test_order_by_ordinal_on_a_join_resolves_against_the_select_list() -> None:
+    bound = bind(
+        parse("SELECT users.id, orders.total FROM users JOIN orders ON users.id = orders.user_id ORDER BY 2"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.order_by == (JoinOrderKey(bound.expressions[1], descending=False),)
+
+
+def test_order_by_ordinal_past_the_select_list_on_a_join_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        bind(
+            parse("SELECT users.id FROM users JOIN orders ON users.id = orders.user_id ORDER BY 5"),
+            _JOIN_CATALOG,
+        )
+
+
+def test_limit_on_a_join_binds() -> None:
+    bound = bind(parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1"), _JOIN_CATALOG)
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.limit == 1
+    assert bound.offset == 0
+
+
+def test_offset_on_a_join_binds() -> None:
+    bound = bind(
+        parse("SELECT * FROM users JOIN orders ON users.id = orders.user_id LIMIT 1 OFFSET 1"),
+        _JOIN_CATALOG,
+    )
+    assert isinstance(bound, BoundJoinSelect)
+    assert bound.limit == 1
+    assert bound.offset == 1
+
+
+# ---- exercises _resolve_order_by_key (implemented) ----
+
+
+def test_order_by_column_already_selected_reuses_its_position() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY age"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    # `age` is expressions[1] -- no hidden column needed, no duplicate copy.
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_column_matching_is_case_insensitive() -> None:
+    bound = bind(parse("SELECT NAME FROM users ORDER BY name"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(0, descending=False),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_column_not_selected_becomes_a_hidden_column() -> None:
+    bound = bind(parse("SELECT name FROM users ORDER BY age"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    # `age` isn't in the select list -- appended after it, at index 1.
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == (BoundColumn(2, "age", DataType.INTEGER),)
+
+
+def test_order_by_ordinal_refers_to_the_nth_output_column() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY 2 DESC"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(1, descending=True),)
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_ordinal_zero_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        bind(parse("SELECT name FROM users ORDER BY 0"), _USERS_CATALOG)
+
+
+def test_order_by_ordinal_past_the_select_list_raises() -> None:
+    with pytest.raises(ColumnNotFoundError):
+        bind(parse("SELECT name FROM users ORDER BY 5"), _USERS_CATALOG)
+
+
+def test_order_by_multiple_keys_resolve_independently() -> None:
+    bound = bind(parse("SELECT name, age FROM users ORDER BY age DESC, name"), _USERS_CATALOG)
+    assert isinstance(bound, BoundSelect)
+    assert bound.order_by == (BoundOrderKey(1, descending=True), BoundOrderKey(0, descending=False))
+    assert bound.hidden_order_by == ()
+
+
+def test_order_by_on_a_fresh_aggregate_folds_through_hash_aggregate() -> None:
+    # SUM(total) appears nowhere else in the query -- _bind_order_by's
+    # `bind` callback routes it through _bind_group_output (same as
+    # HAVING), appending a THIRD BoundAggregate onto the same list
+    # select_items' COUNT(*) already populated, and the hidden column
+    # points at that aggregate's own flat-row slot.
+    bound = bind(parse("SELECT COUNT(*) FROM orders GROUP BY user_id ORDER BY SUM(total)"), _ORDERS_CATALOG)
+    assert isinstance(bound, BoundAggregateSelect)
+    assert [agg.func for agg in bound.aggregates] == ["count_star", "sum"]
+    assert bound.order_by == (BoundOrderKey(1, descending=False),)
+    assert bound.hidden_order_by == (BoundColumn(2, "SUM(total)", DataType.INTEGER),)

@@ -23,6 +23,7 @@ class TokenType(Enum):
     RIGHT_PAREN = auto()
     COMMA = auto()
     SEMICOLON = auto()
+    DOT = auto()
     STAR = auto()
     PLUS = auto()
     MINUS = auto()
@@ -66,6 +67,21 @@ class TokenType(Enum):
     NOT = auto()
     IS = auto()
     LIKE = auto()
+
+    JOIN = auto()
+    LEFT = auto()
+    INNER = auto()
+    OUTER = auto()
+    GROUP = auto()
+    BY = auto()
+    HAVING = auto()
+    ORDER = auto()
+    ASC = auto()
+    DESC = auto()
+    LIMIT = auto()
+    OFFSET = auto()
+    DISTINCT = auto()
+    AS = auto()
 
 
 @dataclass(frozen=True)
@@ -115,4 +131,18 @@ KEYWORDS: dict[str, TokenType] = {
     "not": TokenType.NOT,
     "is": TokenType.IS,
     "like": TokenType.LIKE,
+    "join": TokenType.JOIN,
+    "left": TokenType.LEFT,
+    "inner": TokenType.INNER,
+    "outer": TokenType.OUTER,
+    "group": TokenType.GROUP,
+    "by": TokenType.BY,
+    "having": TokenType.HAVING,
+    "order": TokenType.ORDER,
+    "asc": TokenType.ASC,
+    "desc": TokenType.DESC,
+    "limit": TokenType.LIMIT,
+    "offset": TokenType.OFFSET,
+    "distinct": TokenType.DISTINCT,
+    "as": TokenType.AS,
 }

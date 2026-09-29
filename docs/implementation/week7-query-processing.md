@@ -49,7 +49,7 @@ Supported:
 - `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, with and without `GROUP BY`
 - `HAVING`, `DISTINCT`, `ORDER BY` with multiple keys and mixed `ASC`/`DESC`, `LIMIT` / `OFFSET`
 - ordinal `ORDER BY 2`, referring to the second output column
-- a compiled-plan cache keyed by SQL text
+- a compiled-plan cache keyed by SQL text — caching the *planning decision*, not the operator tree (§43)
 
 
 Not supported, rejected with a typed error:
@@ -73,6 +73,38 @@ Not supported, rejected with a typed error:
    chapter 17 §17.8.
 
 
+### The operator pipeline, top to bottom
+
+
+Every clause has one fixed place in the tree. Write this down before session 4, because `HAVING` and
+`ORDER BY` can both mention things the `SELECT` list doesn't:
+
+
+```
+Limit / Offset          # only when there's no ORDER BY; otherwise folded into Sort's `limit`
+└─ Sort                 # ORDER BY; limit = LIMIT + OFFSET when both are present
+   └─ Distinct          # SELECT DISTINCT
+      └─ Project        # SELECT list, PLUS hidden ORDER BY keys that aren't selected
+         └─ Filter      # HAVING
+            └─ HashAggregate   # GROUP BY keys + every aggregate call found in SELECT/HAVING/ORDER BY
+               └─ Filter       # the part of WHERE that couldn't be pushed down (§43, pushdown)
+                  └─ NestedLoopJoin ... / SeqScan / IndexScan
+```
+
+
+Two consequences:
+
+
+- **Aggregate calls are collected, not evaluated in place.** `SELECT age, COUNT(*) ... HAVING SUM(x) > 5
+  ORDER BY AVG(y)` needs three aggregates even though only one is selected. The binder collects every
+  distinct aggregate call from `SELECT`, `HAVING` and `ORDER BY`; `HashAggregate` outputs
+  `(group keys..., aggregate results...)`; everything above it is bound against *that* row layout, not
+  the table's.
+- **`ORDER BY` a non-selected column** (`SELECT name FROM t ORDER BY age`) means `Project` carries `age`
+  as a hidden trailing column, `Sort` uses it, and a final strip removes it. An ordinal (`ORDER BY 2`)
+  never needs this — it refers to an output column by definition.
+
+
 ---
 
 
@@ -81,20 +113,100 @@ Not supported, rejected with a typed error:
 
 ```
 src/quilldb/
+├── btree/
+│   └── index.py         ~ seek_eq/seek_range/scan return lazy iterators; + reverse traversal   (session 0)
 ├── exec/
 │   ├── join.py          NEW — NestedLoopJoin (inner + left)
 │   ├── aggregate.py     NEW — HashAggregate, aggregate functions
 │   ├── sort.py          NEW — Sort (in-memory, documented limit), Limit
-│   └── operators.py     + Distinct
+│   └── operators.py     ~ open(outer_row) threaded through every operator                     (session 0)
+│                        + index-order full scan, Distinct
 ├── sql/
+│   ├── tokens.py        + DOT, JOIN/LEFT/INNER/OUTER/GROUP/BY/HAVING/ORDER/ASC/DESC/LIMIT/
+│   │                      OFFSET/DISTINCT/AS (decide which are reserved — see NOTES.md B6-9)
 │   ├── ast.py           + JoinClause, GroupBy, Having, OrderBy, Limit, FunctionCall
 │   ├── parser.py        + all of the above, aliases, qualified names
-│   └── binder.py        + resolve qualified names, aggregate/group validation
+│   └── binder.py        + scopes, (table, column) references, aggregate/group validation
 ├── plan/
-│   ├── planner.py       + join ordering, index-join selection, sort avoidance
-│   └── cache.py         NEW — compiled-plan cache
-└── errors.py            + AggregateError, SortLimitExceededError
+│   ├── predicates.py    ~ Predicate carries its table; "column-free" becomes "free of this table"
+│   ├── planner.py       + ordered full-index path, pushdown, join ordering, index-join selection
+│   ├── search.py        + total_cost_with_ordering
+│   ├── analyze.py       ~ ANALYZE bumps the schema cookie                                     (session 0)
+│   └── cache.py         NEW — plan cache (held per Connection)
+└── errors.py            + AmbiguousColumnError, AggregateError, SortLimitExceededError
 ```
+
+
+`~` marks a change to something weeks 3–6 built, `+` an addition. Every `~` line is one of the things the
+roadmap asked you to watch for — "if adding a join requires touching the cursor or the binder, the
+executor interface leaked something." Some of them do. Record which in `NOTES.md`; that's the finding,
+not a failure.
+
+
+---
+
+
+## Session 0 — what weeks 3–6 fixed in place that week 7 needs to vary
+
+
+Week 5 opened with a retrofit session and this week needs one too. Every item below is a value that
+earlier weeks **fixed at bind time or open time**, because until now nothing needed it to change between
+runs. Joins and plan caching are the first features that do. Do these first, with the existing suite
+green after each one, so session 1 onwards builds on a base that already has the right shape.
+
+
+**0.1 Index iterators must stream.** `IndexBTree.seek_eq`, `seek_range` and `scan` currently build the
+complete rowid list before returning (`btree/index.py`). That hides nothing today, but it breaks two
+week-7 claims outright: `ORDER BY indexed_col LIMIT 10` would read the entire index before the first
+row, and a no-Sort candidate would be costed as streaming when it isn't. Return the generator instead.
+`_scan_forward` already unpins each page before every `yield`, so no pin is held between rows — the change
+is removing the list, not adding pin management.
+
+> The `LIMIT 1` test in §44 uses a `SeqScan`, which already streams, so it passes either way. It will
+> not catch this. Add `test_index_order_limit_reads_few_pages` alongside it.
+
+**0.2 An ordered access path that needs no `WHERE`.** `_match_index_prefix` returns `None` when an
+index's leading column has no predicate, so `SELECT * FROM t ORDER BY indexed_col` never produces an
+index candidate at all — there is nothing for sort avoidance to choose. Add an access-path kind for a
+full scan in index order: cost = the whole index's leaf pages sequentially plus one table lookup per row,
+which is exactly why it usually *loses* without a `LIMIT`, and why §43 must compare it rather than prefer
+it.
+
+**0.3 Reverse traversal, or cut `DESC` avoidance.** `IndexBTree` only walks forwards. `ORDER BY
+indexed_col DESC` avoiding the sort needs a backward in-order walk (mirror `_scan_forward`: right child
+first, a separator emitted on the way back up out of the subtree to its *right*). If the week is tight,
+drop that one definition-of-done line and let `DESC` always sort — correct, just slower.
+
+**0.4 `open(outer_row)`.** `Operator.open()` takes nothing, and `IndexScan` evaluates its seek values
+against an empty row (`_seek_value` → `evaluate(predicate.value, ())`). A correlated inner seek needs the
+current outer row's values. Change the contract to `open(self, outer: Row = ()) -> None`, pass `outer`
+through `Filter`/`Project` to their child, and have `IndexScan` evaluate seek values against it. The
+default `()` keeps every existing call site working unchanged.
+
+> This is the answer to the roadmap's question. The iterator model *almost* held: joining needs no change
+> to `next()`, but it needs `open()` to take a parameter. That's a real, specific, discussable finding.
+
+**0.5 `ANALYZE` bumps the schema cookie.** Right now only `create_table`/`create_index` call
+`pager.bump_schema_cookie()`. §43's plan cache relies on the cookie to notice new statistics, so bump it
+inside `ANALYZE`'s own transaction (a rolled-back `ANALYZE` must not leave it bumped). One side effect,
+expected: every other `Connection` then reloads its catalog on its next statement through the week-6
+resync path in `Connection.execute()`. Real SQLite's `ANALYZE` changes the cookie too.
+
+**0.6 Errors and tokens.** Add `AmbiguousColumnError`, `AggregateError` and `SortLimitExceededError` to
+`errors.py` — all three are the caller's fault, so they derive from `SQLError`, never
+`CorruptDatabaseError`. Unknown column stays the existing `ColumnNotFoundError`; don't add a second name
+for it. Add a `DOT` token (only when not followed by a digit — `.5` is still a number) and the new
+keywords. Every newly reserved word can break an existing identifier, which is exactly bug B6-9; keep
+`ASC`/`DESC`/`OFFSET` reserved only if you check no test fixture uses them as column names.
+
+| Item | Done when |
+|---|---|
+| 0.1 | pulling the first rowid from an unbounded `seek_range` on a multi-level index reads ≤ its height in pages |
+| 0.2 | `enumerate_access_paths` offers an index-order candidate with no seek terms |
+| 0.3 | backward scan yields `reversed(forward scan)` on a tree deep enough to have interior cells (or: `DESC` cut, recorded) |
+| 0.4 | whole suite green with the new `open()` signature |
+| 0.5 | cookie differs before/after `ANALYZE`; unchanged after a rolled-back one |
+| 0.6 | `mypy` strict and `ruff` clean |
 
 
 ---
@@ -116,7 +228,7 @@ responsibilities, and each has a specific error to raise:
             AmbiguousColumnError: bare name present in more than one table. This
                 is the error people forget, and it must NOT silently pick the
                 first match — that's how a query returns plausible wrong data.
-            UnknownColumnError
+            ColumnNotFoundError: the existing week-3 error; reuse it.
         """
 
 
@@ -154,6 +266,36 @@ That `validate_aggregates` note is a real decision, so make it deliberately: SQL
 an aggregate query (a documented extension), most other engines reject it, and your differential tests
 *will* hit it. Choose "reject," write it in the README's deviations list, and add a test asserting the
 error. A known, documented, tested deviation is a sign of care; an undocumented one is a bug.
+
+
+> The README has no deviations section yet — the earlier ones (strict declared types, `1 + 'a'` raising,
+> `WHERE '1'` being false) live only in docstrings in `binder.py` and `expressions.py`. Create a
+> "Deviations from SQLite" section this week and move those in alongside the new ones.
+
+
+### Where does `o.total` live in the row? Decide before binding anything
+
+
+`BoundColumn.index` today is a position inside *one* table's row. With a join, the row an expression sees
+is several tables' rows concatenated — and the planner may reorder the tables *after* binding (§43), so
+the binder cannot know that `o.total` ends up at position 5 rather than 2.
+
+
+Make the binder emit a reference that doesn't depend on order — `(table_ordinal, column_index)`, where
+`table_ordinal` is the table's position in the `FROM` clause — and add one pure function that runs
+*after* the planner has chosen an order:
+
+
+```python
+def resolve_layout(expr: BoundExpression, offsets: dict[int, int]) -> BoundExpression:
+    """Rewrite every (table_ordinal, column) reference to a flat row index,
+    offsets[table_ordinal] + column, for the join order actually chosen."""
+```
+
+
+The alternative — the join always assembles rows in `FROM` order whatever the execution order — breaks
+down on partial rows: an `ON` predicate evaluated after two of three tables sees a row with only two
+tables in it. One rewrite pass handles every intermediate layout; a canonical layout doesn't.
 
 
 ---
@@ -197,8 +339,9 @@ class NestedLoopJoin(Operator):
    unreleased pin makes a page permanently unevictable.
 2. **The `matched` flag is per outer row.** Reset it when you advance the outer, not when you open.
 3. **Pass the correlated value explicitly.** The inner `IndexScan` needs the *current* outer row's join
-   value each re-open. Thread it as a parameter; don't reach into shared mutable state, which breaks the
-   moment two joins nest.
+   value each re-open. Thread it as a parameter — `inner.open(outer_row)`, Session 0.4 — and don't reach
+   into shared mutable state, which breaks the moment two joins nest. The seek value is an expression over
+   *outer* columns (`u.id`), bound against the outer row's layout, never the combined one.
 4. **NULL is not a match.** `on()` returning `NULL` means skip — and for a `LEFT JOIN`, that outer row is
    still unmatched and must be NULL-extended.
 
@@ -252,9 +395,24 @@ AGGREGATES = {
 | `COUNT(*)` with NULLs | counts rows | doesn't look at values |
 | `AVG` of integers | real | `AVG(1,2)` is `1.5`, not `1` |
 | `AVG`, `SUM`, `MIN`, `MAX` | skip NULLs | NULL is absence, not zero |
+| `SUM` of all-integer input overflowing int64 | **error** (`integer overflow`) | unlike `+`, which falls back to REAL |
+| `MIN`/`MAX` over mixed types | SQLite's cross-type order | NULL < numbers < text < blob |
 
 
 `avg` keeps `(sum, count)` and divides in `final` — never a running average (§18.5).
+
+
+Two of those rows are traps specific to this codebase:
+
+
+- **Don't build `_sum_step` on the evaluator's `+`.** `exec/expressions.py` routes integer results through
+  `_fit_int64`, which quietly turns an overflow into a REAL — correct for `+`, and verified against
+  sqlite3. But SQLite's `SUM()` raises `integer overflow` when every input is an integer, and only returns
+  a REAL once a REAL input has been seen. Reusing `+` gives a differential mismatch that looks like a
+  precision bug.
+- **Don't compare with Python's `<`.** `min(1, 'a')` raises `TypeError`. `compare_keys` in
+  `btree/index.py` already implements SQLite's cross-type order, NULL included — reuse it for `MIN`,
+  `MAX`, and every `Sort` key rather than writing a third copy of that ordering.
 
 
 ```python
@@ -312,7 +470,8 @@ class Sort(Operator):
 
     If `limit` is set, use a bounded heap instead: O(N log K) time, O(K) memory
     (§18.4). Then the limit above doesn't apply, which is worth noting in the
-    message.
+    message. With an OFFSET, K is LIMIT + OFFSET — the skipped rows still have
+    to be the right ones.
     """
     def __init__(self, child, keys: list[tuple[Expression, bool]], limit: int | None = None): ...
 ```
@@ -335,7 +494,10 @@ access path:
 
 
         Mixed ASC/DESC cannot be satisfied by one traversal. Sort.
-        ORDER BY rowid on a rowid table needs nothing — the table IS in that order.
+
+        (Chapter 18 §18.3's "ORDER BY rowid is free" doesn't apply yet: quilldb
+        has no INTEGER PRIMARY KEY and no way to name the rowid in SQL, so no
+        query can ask for that order.)
         """
 
 
@@ -359,6 +521,40 @@ access path:
 > `ordered index scan` — and never prefer sort avoidance as a rule.
 
 
+### Predicates: which table, and where they go
+
+
+Two week-4 assumptions stop holding once there's more than one table:
+
+
+- **`Predicate.column` is a bare name** (`plan/predicates.py`), and `enumerate_access_paths` groups
+  predicates by that name. With `users` and `orders` both having an `id`, their predicates merge into one
+  bucket. `Predicate` must carry its table.
+- **Sargable meant "the other side is column-free."** `o.user_id = u.id` has columns on both sides, so
+  `classify_predicate` rejects it — and that's the one predicate an index join needs. The test becomes
+  *relative to a table*: when planning `orders` as the inner, `o.user_id = u.id` is a seek on `user_id`
+  because the right side is free of *`orders`'* columns. Its value is then supplied by `open(outer_row)`.
+
+
+**Pushdown** — which conjunct goes where — has to be explicit, because the costs depend on it (chapter 12
+stage 4's worked example only works because `region = 'US'` became an index seek on `customers`):
+
+
+| Conjunct | Inner join | `LEFT JOIN`, left (preserved) side | `LEFT JOIN`, right (nullable) side |
+|---|---|---|---|
+| `WHERE`, mentions one table | that table's access path | that table's access path | **stays above the join** |
+| `ON`, mentions one table | that table's access path | stays in the join's `ON` | that table's access path |
+| mentions several tables | join predicate | join predicate | join predicate (in `ON`) |
+
+
+The bold cell is §17.8's trap in reverse. Pushing `WHERE o.region = 'APAC'` below a `LEFT JOIN`
+filters *before* NULL extension, so every customer without an APAC order comes back NULL-extended instead
+of being dropped — faster **and** wrong. The differential tests catch it; the table above prevents it.
+
+
+### Join ordering
+
+
 Join ordering uses the same candidate → estimate → cost → search pipeline introduced in week 4:
 
 
@@ -366,7 +562,7 @@ Join ordering uses the same candidate → estimate → cost → search pipeline 
 @dataclass(frozen=True)
 class PlanCandidate:
     relations: frozenset[TableId]
-    root: OperatorSpec
+    root: OperatorSpec               # enough to BUILD the tree: order + one AccessPath per table
     est_rows: int
     cost: PlanCost                   # the join tree only — NOT including any Sort above it
     output_order: tuple[OrderKey, ...]
@@ -408,12 +604,20 @@ knowing you're citing it rather than inventing it.
 index on R**. For an unindexed join key there is no distinct count at all.
 
 
+Note what "known" means in this codebase: an index that has *never* been `ANALYZE`d still gets
+`default_index_stats()`, i.e. `rows_per_prefix[0] = _DEFAULT_ROWS_PER_VALUE = 10`
+(`plan/statistics.py`). So a column that leads *any* index always has an NDV, real or defaulted. "Unknown"
+means precisely: the join column doesn't lead an index on that table.
+
+
 ```text
 TODO(human): define the equijoin fallback when NDV is unknown on one or both sides.
 
 
-Add the constant(s) to plan/cost.py alongside DEFAULT_EQUALITY_SELECTIVITY, and state the rule for
-each of the three cases: both NDVs known, one known, neither known.
+Add the constant(s) to plan/statistics.py alongside _DEFAULT_ROWS_PER_VALUE (the existing
+flat 1-in-10 fallback -- week 4's spec called the same idea DEFAULT_EQUALITY_SELECTIVITY, but that
+name never made it into code), and state the rule for each of the three cases: both NDVs known, one
+known, neither known.
 ```
 
 
@@ -473,10 +677,50 @@ invisible: every result is correct, every other test passes, and the only sympto
 is mediocre in a way you can't see from the outside.
 
 
-Also, per the roadmap, a **compiled-plan cache** keyed by SQL text — a dict from the exact statement string
-to the bound, planned operator tree. Invalidate it whenever the schema cookie changes. `ANALYZE` also
-bumps that cookie: otherwise a cached plan keeps using the decision made from old statistics even after
-the statistics table changes.
+**Making those tests runnable.** `measure_pages`, `enumerate_for`, `plan_for`, `with_sort` and
+`most_expensive` are pseudo-code; none exist yet. What they require of the real code:
+
+
+- **A candidate must be executable, not just comparable.** Measuring the *expensive* order means running
+  a plan the planner didn't pick, so expose one entry point that builds an operator tree from a given
+  `PlanCandidate` — `build_operator` then becomes "choose a candidate, then call that."
+- **Measure cold.** `pages_read` counts buffer-pool misses, so a warm pool reads nothing. Use a fresh
+  `quilldb.connect()` per measurement, as `benchmarks/index_lookup.py` already does.
+- **Planning reads pages too.** `StatisticsCatalog.table_stats()`/`index_stats()` walk `quill_stat1`
+  with a real cursor, so a three-table plan's statistics lookups land in `pages_read`. Measure from after
+  the plan is built (or report both numbers and say which is which).
+- **Size.** 100,000 rows here and the million-row table in §44 take minutes to insert in pure Python.
+  Mark both `@pytest.mark.slow`.
+
+
+### The plan cache
+
+
+Per the roadmap, a **compiled-plan cache** keyed by SQL text. What it must *not* cache is the bound,
+planned operator tree, for two reasons that come from earlier weeks:
+
+
+1. **Parameters are already baked in.** `bind()` substitutes every `?` as a `BoundLiteral`. A cached bound
+   tree for `SELECT ... WHERE id = ?` would answer every later call with the *first* call's `id`.
+2. **Operators are stateful.** They hold open cursors and, since week 6, the `Transaction` that took
+   their locks. An operator tree belongs to exactly one execution.
+
+
+So cache the **decision**: the parsed statement plus the chosen `PlanCandidate` (join order and one access
+path per table). Each `execute()` re-binds the parameters and rebuilds operators from that decision,
+skipping parse, enumeration, and the `quill_stat1` reads.
+
+
+Reusing a plan across different parameter values is only safe because quilldb's cost model never looks at
+a literal's value — row estimates come from `rows_per_prefix` and a flat 1/3 residual selectivity, never
+from *which* value is being sought. Write that assumption next to the cache. A future histogram-based
+estimate would break it, and that is exactly the problem SQLite's `sqlite_stat4` re-planning exists
+to solve.
+
+
+Hold the cache on `Connection`: a `Connection` is single-threaded (week 6), so it needs no latch, where a
+`Database`-wide cache would. Invalidate it whenever the schema cookie changes. After Session 0.5,
+`ANALYZE` bumps that cookie too, so a cached plan can't outlive the statistics it was chosen from.
 
 
 ---
@@ -508,11 +752,22 @@ def test_differential_against_sqlite3(tmp_path, query):
 
 
 
+@pytest.mark.slow
 def test_limit_short_circuits(db):
     """LIMIT 1 over a million rows must not read a million rows' worth of pages.
     Prove it with the page-read counter — the pull model's whole justification
     (chapter 09)."""
     pages = measure_pages(db, "SELECT * FROM million LIMIT 1")
+    assert pages < 10
+
+
+@pytest.mark.slow
+def test_index_order_limit_short_circuits(db):
+    """The same claim through an INDEX, which the test above never exercises —
+    it runs a SeqScan, whose TableCursor already streams. This is the one that
+    fails if Session 0.1 (lazy index iterators) was skipped: the ordered scan
+    would read every leaf of the index before producing row 1."""
+    pages = measure_pages(db, "SELECT * FROM million ORDER BY indexed_col LIMIT 1")
     assert pages < 10
 ```
 
@@ -529,16 +784,18 @@ differs from SQL's actual semantics, and each is one generated example away from
 
 | # | 2 hours on | Done when |
 |---|---|---|
-| 1 | Parse `JOIN ... ON`, comma joins, aliases, qualified names; `AmbiguousColumnError` | the week's headline query parses |
+| 0 | The retrofit: lazy index iterators, ordered full-index path, reverse traversal, `open(outer_row)`, `ANALYZE` cookie, errors + tokens | the Session 0 table is green; existing suite still green |
+| 1 | Parse `JOIN ... ON`, comma joins, aliases, qualified names; `(table, column)` binding + `resolve_layout`; `AmbiguousColumnError` | the week's headline query parses and binds |
 | 2 | `NestedLoopJoin` inner + left, NULL-extension, cursor discipline | left-join and NULL-key tests green |
-| 3 | Aggregate functions + `HashAggregate`, no-`GROUP BY` single-row case | the six-row semantics table is green |
-| 4 | `GROUP BY`, `HAVING`, `DISTINCT`, `validate_aggregates` | headline query returns correct rows |
-| 5 | `Sort` with multi-key mixed direction, `Limit`/`OFFSET`, top-K heap | mixed ASC/DESC correct; `LIMIT 1` short-circuits |
-| 6 | Planner: `sort_cost` folded into the ranking key, exhaustive join search, `EXPLAIN`, plan cache | candidate costs and both page-read numbers recorded; the interesting-orders test is green |
-| 7 | Differential test generators over the NULL matrix | green across a few hundred generated queries |
+| 3 | Aggregate functions + `HashAggregate`, no-`GROUP BY` single-row case | the semantics table is green |
+| 4 | `GROUP BY`, `HAVING`, `DISTINCT`, `validate_aggregates`, the pipeline shape (hidden columns, collected aggregates) | headline query returns correct rows |
+| 5 | `Sort` with multi-key mixed direction, `Limit`/`OFFSET`, top-K heap | mixed ASC/DESC correct; both `LIMIT` short-circuit tests green |
+| 6 | Planner I: per-table `Predicate`s, pushdown table, parameterized inner seeks, exhaustive join search, executable candidates | both join orders' page-read numbers recorded; `LEFT JOIN` + `WHERE` on the nullable side still correct |
+| 7 | Planner II: `sort_cost` folded into the ranking key, `EXPLAIN` for joins, plan cache | the interesting-orders test is green; cache survives new parameters and dies on DDL/`ANALYZE` |
+| 8 | Differential test generators over the NULL matrix | green across a few hundred generated queries |
 
 
-**Session 7 will find bugs in sessions 2–5.** That's the point, and it's why it isn't session 4. Don't
+**Session 8 will find bugs in sessions 2–7.** That's the point, and it's why it isn't session 4. Don't
 compress it.
 
 
@@ -548,30 +805,40 @@ compress it.
 ## Week 7 definition of done
 
 
+- [ ] Session 0 retrofit landed with the existing suite green, and `NOTES.md` records which week-3/4
+      interfaces had to change for joins (at minimum: `open(outer_row)`) — the roadmap's "did the
+      executor interface leak?" question, answered
 - [ ] The headline query — join + `WHERE` + `GROUP BY` + `HAVING` + `ORDER BY` ordinal + `LIMIT` — works
+- [ ] A bare column name present in two joined tables raises `AmbiguousColumnError`
 - [ ] `EXPLAIN` shows an index-driven inner loop when its estimated total cost wins, and a scan-based
       inner loop when the index is unavailable or more expensive
 - [ ] The optimizer costs every legal left-deep order, picks the minimum, and records actual page reads for both a cheap and expensive order
 - [ ] Candidates are ranked on join cost **plus** the Sort each one would require — the interesting-orders
       regression test proves ranking on `cost.total` alone would pick a different plan
 - [ ] `LEFT JOIN` emits NULL-extended rows; a `WHERE` on the inner side visibly drops them (documented)
+- [ ] A `WHERE` conjunct on a `LEFT JOIN`'s nullable side is never pushed below the join
 - [ ] Two NULL join keys do not match each other
 - [ ] The inner cursor is closed once per outer row — pin counts return to baseline after a join
 - [ ] `SUM` over zero rows is `NULL`; `COUNT` over zero rows is `0`
 - [ ] `SELECT COUNT(*)` over an **empty** table returns exactly **one** row containing 0
 - [ ] `COUNT(*)` vs `COUNT(col)` differ correctly in the presence of NULLs
 - [ ] `AVG` of integers returns a real; `AVG` keeps sum and count, not a running average
+- [ ] All-integer `SUM` overflow raises rather than silently becoming a REAL
 - [ ] `GROUP BY` on a nullable column puts all NULL rows in one group
 - [ ] Multi-key `ORDER BY` with mixed `ASC`/`DESC` is correct; NULLs sort first
 - [ ] An `ORDER BY` matching an index prefix creates a no-Sort candidate; it wins only when its total cost is lower
-- [ ] `ORDER BY indexed_col DESC` also avoids the sort
+- [ ] `ORDER BY indexed_col DESC` also avoids the sort (or, if Session 0.3 was cut, always sorts and the
+      README says so)
 - [ ] `Sort` raises `SortLimitExceededError` with an actionable message rather than exhausting memory
-- [ ] `LIMIT 1` over a million rows reads <10 pages — proven with the counter
-- [ ] The plan cache is invalidated after both DDL and `ANALYZE` through the schema cookie
+- [ ] `LIMIT 1` over a million rows reads <10 pages — proven with the counter, through both a `SeqScan`
+      and an index-order scan
+- [ ] The plan cache is invalidated after both DDL and `ANALYZE` through the schema cookie, and a cached
+      plan re-run with different parameters returns the new parameters' rows
 - [ ] Differential tests green over a few hundred generated join/aggregate queries including the whole
       NULL matrix
-- [ ] Deviations from SQLite (bare columns in aggregate queries, the sort row limit, three-table maximum)
-      are listed in the README
+- [ ] The README has a "Deviations from SQLite" section listing the new ones (bare columns in aggregate
+      queries, the sort row limit, three-table maximum) and the older ones currently only in docstrings
+      (strict declared types, `1 + 'a'`, `WHERE '1'`)
 - [ ] `NOTES.md` entries for every bug over 20 minutes
 
 

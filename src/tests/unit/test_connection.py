@@ -785,6 +785,33 @@ def test_analyze_never_changes_query_results() -> None:
     db.close()
 
 
+def test_analyze_bumps_the_schema_cookie() -> None:
+    """week7-query-processing.md §0.5: the plan cache (§43) invalidates
+    itself off this same cookie, the way every other Connection already
+    notices a schema change (SS37.4)."""
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    before = db.pager.schema_cookie
+    db.execute("ANALYZE")
+    assert db.pager.schema_cookie != before
+    db.close()
+
+
+def test_a_rolled_back_analyze_does_not_leave_the_cookie_bumped() -> None:
+    db = quilldb.connect(":memory:")
+    db.execute(_USERS_SQL)
+    before = db.pager.schema_cookie
+
+
+    db.execute("BEGIN")
+    db.execute("ANALYZE")
+    db.execute("ROLLBACK")
+
+
+    assert db.pager.schema_cookie == before
+    db.close()
+
+
 
 
 # =====================================================================

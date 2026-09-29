@@ -46,8 +46,10 @@ from typing import TYPE_CHECKING, Self
 from quilldb.codec.record import Value
 from quilldb.errors import ThreadingError, TransactionError, UnsupportedFeatureError
 from quilldb.exec.operators import ExplainResult, Operator, build_operator
+from quilldb.plan.planner import PlanShape
 from quilldb.sql.ast import Begin, Commit, CreateIndex, CreateTable, Rollback
 from quilldb.sql.binder import (
+    BoundAggregateSelect,
     BoundAnalyze,
     BoundBinaryOp,
     BoundColumn,
@@ -58,6 +60,7 @@ from quilldb.sql.binder import (
     BoundExpression,
     BoundInsert,
     BoundIsNull,
+    BoundJoinSelect,
     BoundLiteral,
     BoundSelect,
     BoundUnaryOp,
@@ -207,7 +210,6 @@ def _display_name(expression: BoundExpression) -> str:
         suffix = "IS NOT NULL" if expression.negated else "IS NULL"
         return f"{_display_name(expression.operand)} {suffix}"
     raise UnsupportedFeatureError(f"cannot describe a {type(expression).__name__}")
-
 
 
 
@@ -607,15 +609,36 @@ class Connection:
 
 
         # BEGIN/COMMIT/ROLLBACK returned before binding; SELECT is all that's left.
-        assert isinstance(bound, BoundSelect)
-        operator = build_operator(bound, self.pager, self.pool, self.catalog, self.stats, stmt_txn)
+        assert isinstance(bound, (BoundSelect, BoundJoinSelect, BoundAggregateSelect))
+        # The plan cache (plan/cache.py, session 7) only ever covers a
+        # single-table SELECT/aggregate SELECT -- a joined SELECT always
+        # plans fresh (see that module's own docstring for why). A hit
+        # skips build_operator()'s own enumeration/costing entirely; a
+        # miss calls back with the shape just chosen, so next time this
+        # exact SQL text runs it doesn't have to plan again either.
+        cached_shape = None
+        on_planned = None
+        if isinstance(bound, (BoundSelect, BoundAggregateSelect)):
+            schema_cookie = self.pager.schema_cookie
+            cached_shape = self.db.plan_cache.get(sql, schema_cookie)
+            if cached_shape is None:
+
+                def on_planned(shape: PlanShape) -> None:
+                    self.db.plan_cache.put(sql, schema_cookie, shape)
+
+        operator = build_operator(
+            bound, self.pager, self.pool, self.catalog, self.stats, stmt_txn, cached_shape, on_planned
+        )
         try:
             operator.open()
         except BaseException:
             if owns_txn:
                 stmt_txn.rollback()
             raise
-        description = tuple((_display_name(e),) for e in bound.expressions)
+        if isinstance(bound, BoundAggregateSelect):
+            description = tuple((label,) for label in bound.labels)
+        else:
+            description = tuple((_display_name(e),) for e in bound.expressions)
         cursor = Cursor(operator, description, -1, implicit_txn=stmt_txn if owns_txn else None)
         self._open_cursor = cursor
         return cursor

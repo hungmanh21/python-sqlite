@@ -226,14 +226,20 @@ class IndexBTree:
         rowid, so no stored key ever equals a probe that omits it. Seeks to
         the first entry >= `values` and walks forward while the leading
         columns still match.
+
+
+        A GENERATOR, not a function returning `iter(a_list)` -- session 0.1
+        (week7-query-processing.md). `_scan_forward` already unpins each
+        page before every `yield`, so nothing is held open across a paused
+        generator; building the full list first was pure waste, and it hid
+        exactly the cost `ORDER BY indexed_col LIMIT 10` needs to avoid:
+        reading the whole index before the first row comes out.
         """
         probe = tuple(values)
-        rowids: list[int] = []
         for stored in self._scan_forward(self._find_leaf(probe)):
             if compare_keys(probe, stored) != 0:
                 break
-            rowids.append(_rowid_of(stored))
-        return iter(rowids)
+            yield _rowid_of(stored)
 
 
     def seek_range(
@@ -244,7 +250,11 @@ class IndexBTree:
         low_inclusive: bool = True,
         high_inclusive: bool = True,
     ) -> Iterator[int]:
-        """Yield rowids in key order within the bounds. None means unbounded."""
+        """Yield rowids in key order within the bounds. None means unbounded.
+
+
+        A generator for the same reason as `seek_eq` above.
+        """
         low_probe = tuple(low) if low is not None else None
         high_probe = tuple(high) if high is not None else None
 
@@ -252,7 +262,6 @@ class IndexBTree:
         path = self._find_leaf(low_probe) if low_probe is not None else self._descend_leftmost([], self.root)
 
 
-        rowids: list[int] = []
         for stored in self._scan_forward(path):
             if low_probe is not None and not low_inclusive and compare_keys(low_probe, stored) == 0:
                 continue
@@ -260,14 +269,36 @@ class IndexBTree:
                 cmp_high = compare_keys(high_probe, stored)
                 if cmp_high < 0 or (cmp_high == 0 and not high_inclusive):
                     break
-            rowids.append(_rowid_of(stored))
-        return iter(rowids)
+            yield _rowid_of(stored)
 
 
     def scan(self) -> Iterator[tuple[list[Value], int]]:
-        """Every entry in key order, as (key values, rowid). For validation."""
+        """Every entry in key order, as (key values, rowid). For validation.
+
+
+        A generator for the same reason as `seek_eq` above.
+        """
         path = self._descend_leftmost([], self.root)
-        return iter([(list(stored[:-1]), _rowid_of(stored)) for stored in self._scan_forward(path)])
+        for stored in self._scan_forward(path):
+            yield (list(stored[:-1]), _rowid_of(stored))
+
+
+    def scan_reverse(self) -> Iterator[tuple[list[Value], int]]:
+        """Every entry in REVERSE key order, as (key values, rowid).
+
+
+        Session 0.3's proof surface: `list(idx.scan_reverse()) ==
+        list(reversed(list(idx.scan())))` on a tree tall enough to have
+        interior cells is the test that only passes once `_scan_backward`
+        correctly re-emits interior (promoted) keys, not just leaf keys.
+        A future `ORDER BY indexed_col DESC` sort-avoidance path (session
+        5+) is the real caller; this method is what makes the walk it
+        needs independently testable before anything upstream exists to
+        drive it.
+        """
+        path = self._descend_rightmost([], self.root)
+        for stored in self._scan_backward(path):
+            yield (list(stored[:-1]), _rowid_of(stored))
 
 
     def find_conflict(self, values: Sequence[Value]) -> int | None:
@@ -812,6 +843,33 @@ class IndexBTree:
                 self.pool.unpin(current_page_id)
 
 
+    def _descend_rightmost(self, path: list[tuple[int, int]], page_id: int) -> list[tuple[int, int]]:
+        """Mirror of `_descend_leftmost`, for the start of a backward walk
+        (session 0.3): always takes the LAST child (`right_child` on an
+        interior page) instead of the first.
+
+
+        The recorded slot follows `_children(body)`'s own indexing (cells
+        then right_child), same convention `_scan_forward`'s ascend logic
+        already relies on -- a leaf's slot is its last cell index
+        (`len(body.cells) - 1`), an interior's slot is `len(body.cells)`
+        (`_children(body)[len(body.cells)] is body.right_child`).
+        """
+        while True:
+            current_page_id = page_id
+            raw = self.pool.get_page(current_page_id)
+            try:
+                body = parse_page(raw)
+                if body.page_type is PageType.LEAF_INDEX:
+                    path.append((current_page_id, len(body.cells) - 1))
+                    return path
+                children = self._children(body)
+                path.append((current_page_id, len(body.cells)))
+                page_id = children[-1]
+            finally:
+                self.pool.unpin(current_page_id)
+
+
     def _scan_forward(self, path: list[tuple[int, int]]) -> Iterator[tuple[Value, ...]]:
         """Every entry from `path`'s position to the end of the tree, in key
         order -- interior entries included.
@@ -879,6 +937,105 @@ class IndexBTree:
                 yield separator
                 path[-1] = (page_id, slot + 1)
                 path = self._descend_leftmost(path, next_child)
+                descended = True
+                break
+
+
+            if not descended:
+                return
+
+
+    def _scan_backward(self, path: list[tuple[int, int]]) -> Iterator[tuple[Value, ...]]:
+        """Every entry from `path`'s position back to the START of the
+        tree, in REVERSE key order -- the mirror of `_scan_forward` above,
+        for `ORDER BY indexed_col DESC` sort avoidance (session 0.3,
+        week7-query-processing.md).
+
+
+        `path` is expected to come from `_descend_rightmost`, the same way
+        `_scan_forward`'s caller always builds its starting path with
+        `_descend_leftmost` or `_find_leaf`.
+
+
+        Mirrors `_scan_forward` line for line but walks the other
+        direction. `_scan_forward`'s in-order sequence for one subtree is
+
+            child[0], cells[0], child[1], cells[1], ..., cells[n-1], right_child
+
+        so read backward it's
+
+            right_child, cells[n-1], child[n-1], ..., cells[0], child[0]
+
+        Concretely, per level of `path` (page_id, slot), where slot is
+        `_children(body)`'s own index (0..len(cells), inclusive -- see
+        `_descend_rightmost`'s docstring):
+
+          1. At the current leaf, yield body.cells[0..slot] in REVERSE
+             order (slot is the leaf's rightmost not-yet-emitted cell,
+             same role `_scan_forward`'s `leaf_slot` plays going forward).
+          2. Pop the leaf. Then, ascending: an ancestor has something to
+             its LEFT still to emit exactly when `slot > 0` (mirroring
+             `_scan_forward`'s `slot < len(body.cells)` for "something to
+             the right"). That something is `cells[slot - 1]`, and the
+             subtree to descend into next is `children[slot - 1]`.
+          3. `slot == 0` means every child left of and including this one
+             is exhausted -- pop again and keep ascending, same as
+             `_scan_forward`'s `separator is None: path.pop(); continue`.
+          4. On finding a separator: yield it, update this level's slot to
+             `slot - 1` (the separator and everything left of it are now
+             the "not yet visited" frontier), and descend RIGHTMOST (not
+             leftmost) into `next_child` -- a subtree is walked back-to-
+             front too.
+          5. Ascending off the top of `path` with nothing left: return.
+
+        Same pin discipline as `_scan_forward`: every `get_page`/`unpin`
+        pair closes before the next `yield`, so an abandoned scan can't
+        leak a pin.
+        """
+        path = list(path)
+        while path:
+            leaf_page_id, leaf_slot = path[-1]
+            raw = self.pool.get_page(leaf_page_id)
+            try:
+                body = parse_page(raw)
+                leaf_keys = [self._decode_key(PageType.LEAF_INDEX, cell) for cell in body.cells[:leaf_slot+1]]
+                leaf_keys.reverse()
+            finally:
+                self.pool.unpin(leaf_page_id)
+
+
+            yield from leaf_keys
+
+
+            # Ascend until an ancestor still has a cell to its right. Because
+            # children == cells + [right_child], "slot < len(cells)" is both
+            # "there is a separator here to emit" and "there is another child
+            # after it" -- the two can never disagree.
+            path.pop()
+            descended = False
+            while path:
+                page_id, slot = path[-1]
+                raw = self.pool.get_page(page_id)
+                try:
+                    body = parse_page(raw)
+                    if slot > 0:
+                        separator = self._decode_key(PageType.INTERIOR_INDEX, body.cells[slot - 1])
+                        next_child = self._children(body)[slot-1]
+                    else:
+                        separator = None
+                        next_child = 0
+                finally:
+                    self.pool.unpin(page_id)
+
+
+                if separator is None:
+                    path.pop()
+                    continue
+
+
+                yield separator
+                path[-1] = (page_id, slot - 1)
+                path = self._descend_rightmost(path, next_child)
                 descended = True
                 break
 
