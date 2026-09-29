@@ -668,7 +668,7 @@ Project  [id, email, age]
 - An ineligible predicate (leading column absent, function-wrapped column, or `OR`-connected term)
   cannot become a normal IndexScan merely because the index exists
 - Benchmark: indexed equality lookup does ~4 page reads against ~2,417 for the scan (a 3-level index
-  plus one table page, versus 10 MB of rows at 4 KB per page; chapter 19 §19.5).
+  plus one table page, versus 10 MB of rows at 4 KB per page; chapter 19 §19.5). *Target, not result — measured at week 7: 7 page reads vs 2,622 (375×), see README.*
   **This number goes in the README** — a concrete before/after is the most persuasive artifact you
   will produce all project
 - A `UNIQUE` violation raises *before* any page is written — no half-applied insert

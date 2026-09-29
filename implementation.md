@@ -1,6 +1,15 @@
 # quilldb — Implementation Plan
 
 
+> **Superseded.** This is the original single-file implementation plan. The per-week specs in
+> [`docs/implementation/`](docs/implementation/README.md) replace it and are kept in step with the code;
+> this file is not. It is kept because several theory chapters cite it by name ("`implementation.md`
+> week 2 session 2") and the session structure it describes is still what those references mean.
+> Expect signatures, file names and Python version (`>=3.11` here; `>=3.12` in the repo) to be out of date.
+
+
+
+
 Companion to `guide.md` (concepts) and `roadmap.md` (schedule). **This is the coding spec.**
 
 

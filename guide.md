@@ -959,7 +959,7 @@ week 8's presentation polish, not from here.
 | 6   | `IndexScan` operator + **stage 1 only**: candidate generation and the legality rule from §4.2 | The 12-case legality table is green — including that the four *ineligible* cases produce **no** IndexScan candidate at all |
 | 7   | `ANALYZE`, `quill_stat1`, and row estimation (**stages 2**)                                   | A known distribution produces the expected prefix numbers; missing statistics fall back to defaults instead of failing     |
 | 8   | The cost model and access-path choice (**stages 3–4**)                                        | The selective index wins; editing *only* the statistics flips the choice; a low-selectivity index loses to SeqScan         |
-| 9   | `EXPLAIN` + `EXPLAIN ANALYZE` + the benchmark                                                 | **Indexed lookup ~4 page reads vs ~2,417 for the scan. This number goes in your README.**                                  |
+| 9   | `EXPLAIN` + `EXPLAIN ANALYZE` + the benchmark                                                 | **Indexed lookup ~4 page reads vs ~2,417 for the scan. This number goes in your README.** *(measured at week 7: 7 page reads vs 2,622 (375×), see README)*                                  |
 
 
 **Do not merge sessions 6 and 8.** It's the tempting cut when you're behind, and it quietly destroys the

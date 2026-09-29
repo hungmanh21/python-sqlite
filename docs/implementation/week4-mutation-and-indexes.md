@@ -776,7 +776,7 @@ index_total = 4.0 × 3 + 1.0 × max(0, 1-1)                      # seek  = 12.00
 
 
 So `EXPLAIN` prints `cost=24.01` against a scan's `3417.00` — a 142× predicted advantage, next to a
-*measured* ~4 pages versus ~2,417. The estimate and the measurement are different quantities and are
+*measured* ~4 pages versus ~2,417 (the actual week 7 run: 7 versus 2,622). The estimate and the measurement are different quantities and are
 allowed to disagree; that's exactly why `EXPLAIN` and `EXPLAIN ANALYZE` print them separately.
 
 
@@ -1020,7 +1020,7 @@ def main() -> None:
 Report **page reads**, not seconds. Chapter 19 makes the full argument, but the short version: page
 reads are what the algorithm determines, they're deterministic, they don't depend on your laptop's
 thermal state, and nobody can wonder whether you benchmarked a warm cache. The roadmap's target shape
-is ~4 reads against ~2,417 — a number an interviewer can check the arithmetic on (chapter 19 §19.5 shows
+is ~4 reads against ~2,417 (the week 7 run measured 7 against 2,622; see the README) — a number an interviewer can check the arithmetic on (chapter 19 §19.5 shows
 the full result statement, including the conditions that make it falsifiable).
 
 
@@ -1080,7 +1080,7 @@ correctness and plan-choice tests.
 - [ ] A low-selectivity applicable index can lose to SeqScan; a covering index gets the cheaper cost
 - [ ] `EXPLAIN` prints estimates without execution; `EXPLAIN ANALYZE` prints measured rows/page reads
 - [ ] `sqlite3 f.db "PRAGMA integrity_check"` is `ok` after an index-heavy *and* a delete-heavy workload
-- [ ] Benchmark in the README: ~4 page reads indexed vs ~2,417 scanned, plus the insert-side cost
+- [ ] Benchmark in the README: ~4 page reads indexed vs ~2,417 scanned, plus the insert-side cost *(achieved at week 7: 7 vs 2,622)*
 - [ ] `NOTES.md` has an entry for every bug that took over 20 minutes
 
 
