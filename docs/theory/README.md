@@ -14,7 +14,7 @@ The other three docs each do a different job:
 | `docs/implementation/`                             | Signatures and tests to code against                                                                      | Say why the signatures look like that                 |
 | `references.md`                                    | Where to read more                                                                                        | Contain the knowledge — it's a map, not the territory |
 | **`docs/theory/` (this)**                          | **The actual knowledge: the physics, the theory, the design space, and why SQLite picked what it picked** | Tell you what to type                                 |
-| [`../design-decisions.md`](../design-decisions.md) | **One page: same as SQLite, different from SQLite, and why, for every decision**                          | Argue the case — it links back here for that          |
+| [`../design_decisions.md`](../design_decisions.md) | **One page: same as SQLite, different from SQLite, and why, for every decision**                          | Argue the case — it links back here for that          |
 
 
 If `references.md` says *"read atomiccommit.html §3.7–3.11 to learn the fsync order,"* this directory says *"here is the fsync order, here is the failure that each step prevents, here is what SQLite assumes about your hard drive that makes it work, and here is what happens when that assumption is false."*

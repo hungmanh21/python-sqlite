@@ -87,7 +87,7 @@ pip install pytest pytest-cov hypothesis mypy ruff
 [project]
 name = "quilldb"
 version = "0.1.0"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 
 
 [build-system]

@@ -10,7 +10,7 @@ Accepted.
 ## Context
 
 
-`docs/theory/04-buffer-pool.md` §4.2 argues the pool should cache
+`docs/theory/storage/04-buffer-pool.md` §4.2 argues the pool should cache
 *parsed* page objects rather than raw bytes: in Python, re-running
 `struct.unpack` on every access is real, avoidable cost that a C
 implementation wouldn't pay.
@@ -69,6 +69,28 @@ pcache entry underneath it — not a property of the page cache itself.
   directly on the bytes `BufferPool` returns, and is the one who has to
   solve the page-1 offset problem — currently still unsolved anywhere in
   the codebase.
+
+
+## Update (week 8): what happened next
+
+
+The page-1 offset problem was solved the way this ADR predicted it would have to be — one layer above the
+pool. `parse_page` takes a `header_offset` argument (100 for page 1, 0 otherwise), and callers that touch
+page 1 pass `pager.page_header_offset(page_id)`; `BufferPool` still never parses anything. See
+`catalog/catalog.py`, which reads the schema root this way.
+
+
+The "decoded overlay on top of the pool" idea in the third Consequences bullet has **not** been built; the
+code parses on every access. It remains available if profiling ever points at repeated `parse_page` calls.
+*(TODO before publishing: state here whether it was ever profiled — this update records what the code does,
+not why the overlay was skipped.)*
+
+
+**Alternatives considered** (this ADR predates the template's fourth heading): caching parsed `PageBody`
+objects in the pool, as chapter 04 §4.2 argues. It is faster per access in Python, but it welds the pool to
+the page format and puts the page-1 offset inside the cache instead of in its callers. Weeks 5–6 also
+added a second reason to be wary: with journalling and rollback, every cached parse is another copy of a
+page that would have to be invalidated. That is a design argument, not a measured one.
 
 
 

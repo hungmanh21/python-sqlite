@@ -173,7 +173,7 @@ claim is a benchmark you don't need:
 | **Insert cost per index** | honesty about write amplification | linear in index count |
 | **Buffer-pool hit rate vs pool size** | "caching theory is real" | steep, then flat — the working-set knee |
 | **Scan with and without a covering index** | chapter 11 §11.5 | ~2× |
-| **Throughput vs thread count, reads and writes separately** | week 6, honestly | reads scale; writes don't |
+| **Throughput vs thread count, reads and writes separately** | week 6, honestly | writes flat (one writer); reads flat-to-falling under the GIL — see below |
 | **`LIMIT 1` over a million rows** | "the pull model actually short-circuits" | <10 page reads |
 | **Crash matrix case count** | "durability is tested, not claimed" | a few hundred |
 
@@ -205,6 +205,8 @@ Two unfalsifiable claims. No units on the comparison, no conditions, no idea wha
 **Good:**
 
 
+> *(Illustrative figures — quilldb's own measured run is 2,622 vs 7 page reads, in the README.)*
+>
 > **Point lookup, 100,000 rows** (`users(id INTEGER PRIMARY KEY, email TEXT, age INTEGER)`, ~100 B/row,
 > 4096-byte pages, cold buffer pool, median of 20 runs):
 >
@@ -243,9 +245,14 @@ Counterintuitive, and it's the strongest move available in week 8.
 - **Insert cost with 3 indexes vs 0.** Every index is a write tax. Publishing it proves you understand
   indexes are a *tradeoff* rather than a free speedup — and it makes your lookup speedup credible, because
   you clearly weren't cherry-picking.
-- **Write throughput vs thread count, flat.** The GIL plus your single-writer design caps it (chapter 16
-  §16.7). State it, explain *why*, and show that read throughput does scale. Someone who discovers this
-  themselves will discount everything else you claimed.
+- **Throughput vs thread count, flat — in both columns, for different reasons.** Writes are capped by your
+  single-writer design (chapter 16 §16.7): one commit in flight, several `fsync`s each. Reads are capped by
+  the GIL: `SHARED` locks coexist, so reads never queue behind each other, but in pure CPython a read is
+  CPU-bound work and only one thread runs bytecode at a time — so read throughput is flat-to-falling as
+  threads are added, not climbing (quilldb measured 4,983 → 3,321 txn/s from 1 to 8 threads). An earlier
+  draft of this chapter predicted "reads scale"; the measurement disagreed, and the measurement is the
+  better story. State both ceilings and say which one is which. Someone who discovers this themselves will
+  discount everything else you claimed.
 - **Random-order inserts vs sequential.** Random is slower, because splits happen mid-page rather than at
   the rightmost edge. That's chapter 05 §5.7, measured — a weakness that demonstrates understanding.
 - **The sort row limit.** "`ORDER BY` sorts in memory and raises past N rows" is a limitation. Published,
@@ -273,7 +280,9 @@ project ships roughly **590× more test code than library code**, across four in
 
 
 Your README's table of tests by category is the same move at small scale, and one row does most of the
-work:
+work. **The counts below are illustrative round numbers, not quilldb's** — generate yours from
+`pytest -m "" --collect-only` and publish only the categories that exist (at the week 7 merge the crash
+matrix is 83 cases, not 340; see `docs/implementation/week8-presentation.md` §49):
 
 
 ```

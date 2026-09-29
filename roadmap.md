@@ -13,7 +13,7 @@
 > list, and **`docs/theory/` has the actual theory** — the physics, the design space, and why SQLite
 > chose what it chose, with primary sources. All twenty chapters (00–19) are written, and
 > `docs/theory/` mirrors `src/quilldb/` so each folder explains the package it's named after.
-> **`docs/design-decisions.md` is the one-page index: every decision, same as SQLite or different,
+> **`docs/design_decisions.md` is the one-page index: every decision, same as SQLite or different,
 > and why, in a single table.**
 
 
@@ -196,7 +196,7 @@ than approaching a first runnable state. If life happens in week 6, you still ha
 | Area          | Decision                                                                                                     |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
 | Package name  | `quilldb` (cosmetic — rename the `src/` dir anytime)                                                         |
-| Language      | Pure Python 3.11+, stdlib only at runtime                                                                    |
+| Language      | Pure Python 3.12+, stdlib only at runtime                                                                    |
 | File format   | Own format, SQLite-inspired. Documented in `docs/file-format.md`                                             |
 | Page size     | Fixed 4096 bytes                                                                                             |
 | Text encoding | UTF-8 only                                                                                                   |
@@ -980,7 +980,7 @@ test-count table perform at small scale. `shell.c` (the `sqlite3` CLI) plays the
 | `docs/architecture.md`, `docs/file-format.md`, `docs/durability.md`, `docs/concurrency.md`                                                                                               | 2.5   |
 | `docs/decisions/` — 6–8 short ADRs (why undo journal not WAL, why iterators not bytecode, why no page merge, why SQLite's format exactly but only one direction, isolation level choice) | 1.5   |
 | Benchmark harness + results table: point lookup, scan, insert throughput (sorted vs random), index vs no index, buffer-pool hit rate, B+tree height vs row count, threads vs throughput  | 2     |
-| CI matrix: pytest + coverage + mypy strict + ruff on 3.11/3.12/3.13; badges                                                                                                              | 1     |
+| CI matrix: pytest + coverage + mypy strict + ruff on 3.12/3.13; badges                                                                                                              | 1     |
 | Polish CLI: `inspect`, `pages`, `btree --root N`, `validate`, `bench`, `shell` (REPL)                                                                                                    | 1.5   |
 | 5-minute demo script, rehearsed out loud twice                                                                                                                                           | 1     |
 
@@ -1011,7 +1011,7 @@ The `shell` REPL is worth the 45 minutes on its own. "Let me just show you" beat
   test this on a clean checkout, in a fresh virtualenv
 - The README leads with the GIF; the benchmark table has real measured numbers; the limitations
   section is specific rather than apologetic
-- CI badge green across 3.11 / 3.12 / 3.13, with coverage reported
+- CI badge green across 3.12 / 3.13, with coverage reported
 - 6–8 ADRs, each one a decision you can defend out loud without rereading it
 - `quilldb shell` gives a working REPL you can drive in front of someone
 - `docs/architecture.md` has a diagram matching the real module layout
@@ -1128,7 +1128,7 @@ professional maturity.
 - [ ] Atomic commit + rollback + hot-journal recovery, proven by a crash matrix at every write boundary
 - [ ] Multiple connections across threads, single writer, deadlock detection, busy timeout
 - [ ] Threaded stress test proving invariants under contention, in CI
-- [ ] CI green: pytest, coverage, `mypy --strict`, ruff on 3.11–3.13
+- [ ] CI green: pytest, coverage, `mypy --strict` (library), ruff on 3.12–3.13
 - [ ] README with GIF, benchmarks, and an honest limitations section
 - [ ] Architecture docs + ADRs
 - [ ] A rehearsed 5-minute demo

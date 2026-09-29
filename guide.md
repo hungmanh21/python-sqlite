@@ -1525,7 +1525,7 @@ so pages can sit half-empty; space is reused via the freelist but the tree isn't
 | 3   | `docs/architecture.md` with a diagram matching the real module layout; `docs/file-format.md`                                                                                                                                            |
 | 4   | 6–8 ADRs. One page each: the decision, the alternatives, why. (Undo journal not WAL; iterators not bytecode; no page merging; SQLite's format exactly but only one direction; table-level locking; deadlock detection over prevention.) |
 | 5   | `quilldb shell` — a REPL. Worth its 90 minutes on its own: "let me just show you" beats any explanation.                                                                                                                                |
-| 6   | Record the GIF. CI matrix across 3.11/3.12/3.13 with coverage. Test a clean-checkout install in a fresh virtualenv.                                                                                                                     |
+| 6   | Record the GIF. CI matrix across 3.12/3.13 with coverage. Test a clean-checkout install in a fresh virtualenv.                                                                                                                     |
 | 7   | Write the 5-minute demo script. Deliver it out loud, twice, from memory.                                                                                                                                                                |
 
 

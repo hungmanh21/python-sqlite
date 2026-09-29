@@ -12,10 +12,11 @@ encoding, type codes). The acceptance test for storage/codec/btree work is liter
 same SQL against quilldb and real `sqlite3` and diffs the results.
 
 The project is organized as eight weekly slices (storage → B+tree → SQL/executor → mutation &
-indexes → transactions → concurrency → joins/aggregation → presentation). Current branch
-(`week4`) is mutation, indexes, and the planner. Check `docs/implementation/README.md`'s table to
-see which files/weeks exist yet — later-week packages (`plan/`, `txn/`) may not exist in the tree
-until that week lands.
+indexes → transactions → concurrency → joins/aggregation → presentation). Weeks 1–7 are merged;
+the current branch (`week8`) is presentation: README, benchmarks, CI, docs, ADRs, CLI. Start with
+`docs/implementation/week8-presentation.md`'s "Session 0" — it lists where that spec and the code
+disagreed at the week 7 merge (Python 3.12+ only, `EXPLAIN ANALYZE` not yet reporting `pages_read`,
+benchmarks moving into `src/quilldb/bench/`).
 
 There are four docs at the repo root, each answering a different question — check the doc's own
 job before consulting it:
