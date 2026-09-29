@@ -8,6 +8,7 @@ every BoundColumn -- none of which a hand-built operator tree would
 exercise honestly.
 """
 
+import re
 from pathlib import Path
 
 import quilldb
@@ -293,4 +294,6 @@ def test_explain_of_a_join_no_longer_raises(tmp_path: Path) -> None:
         rows = db.execute(
             "EXPLAIN SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id"
         ).fetchall()
-        assert rows == [("Project\n└─ NestedLoopJoin\n   └─ SeqScan users\n   └─ SeqScan orders",)]
+        # Each SeqScan carries its planner annotation now (week 8); the shape is what this test pins.
+        stripped = re.sub(r" est_rows=\d+ startup=[\d.]+ cost=[\d.]+", "", rows[0][0])
+        assert stripped == "Project\n└─ NestedLoopJoin\n   └─ SeqScan users\n   └─ SeqScan orders"

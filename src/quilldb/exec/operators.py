@@ -170,12 +170,21 @@ class SeqScan(Operator):
 
 
     def __init__(
-        self, pager: Pager, pool: BufferPool, table: TableSchema, txn: Transaction | None = None
+        self,
+        pager: Pager,
+        pool: BufferPool,
+        table: TableSchema,
+        txn: Transaction | None = None,
+        path: AccessPath | None = None,
     ) -> None:
         self.pager = pager
         self.pool = pool
         self.table = table
         self.txn = txn
+        # The planner's costed seq_scan path, kept only so EXPLAIN can print
+        # what the scan was priced at. Execution never reads it; tests that
+        # build a SeqScan directly, with no planner, leave it None.
+        self.path = path
         self._cursor: TableCursor | None = None
         self._positioned = False
 
@@ -224,7 +233,15 @@ class SeqScan(Operator):
 
 
     def explain(self, depth: int = 0, verbose: bool = False) -> str:
-        return _explain_line(depth, f"SeqScan {self.table.name}")
+        label = f"SeqScan {self.table.name}"
+        if verbose and self.path is not None:
+            label += f" est_rows={self.path.est_rows}"
+            if self.path.cost is not None:
+                label += f" startup={self.path.cost.startup:.2f} cost={self.path.cost.total:.2f}"
+        # est_rows is the path's estimate AFTER its residual filter, the same meaning IndexScan
+        # prints, so the two are comparable. The scan itself still emits every row of the table;
+        # the Filter above it does the discarding.
+        return _explain_line(depth, label)
 
 
 
@@ -1274,7 +1291,7 @@ def _build_join_operator(
         if path.kind == "index_scan":
             scan = IndexScan(pager, pool, scope.table, path, txn)
         else:
-            scan = SeqScan(pager, pool, scope.table, txn)
+            scan = SeqScan(pager, pool, scope.table, txn, path)
 
         # Only a residual predicate sourced ENTIRELY from this table can be
         # checked right after its own scan -- one that also names an
@@ -1415,7 +1432,7 @@ def _build_single_table_source(
     if path.kind == "index_scan":
         source = IndexScan(pager, pool, table, path, txn)
     else:
-        source = SeqScan(pager, pool, table, txn)
+        source = SeqScan(pager, pool, table, txn, path)
 
     filter_expression = _residual_filter_expression(non_sargable, path.residual)
     if filter_expression is not None:

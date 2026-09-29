@@ -588,6 +588,18 @@ class Connection:
                     # Drain for real, discarding rows -- EXPLAIN ANALYZE trades
                     # "free to run" for "the numbers are measured, not guessed",
                     # the same tradeoff chapter 12 makes for pages_read.
+                    #
+                    # Counters are measured by snapshot-and-subtract, NOT by
+                    # reset_counters(): a caller partway through their own
+                    # measurement must not have it zeroed by an EXPLAIN they
+                    # ran in between. The snapshot is taken after the plan is
+                    # built, so planning's own page reads (statistics lookups)
+                    # are excluded -- this counts what the plan itself costs.
+                    # The pool is per-Database, so these counters are shared
+                    # with sibling connections, exactly like Connection.pages_read.
+                    reads_before = self.pool.misses
+                    cached_before = self.pool.hits
+                    examined_before = self.pool.rows_examined
                     started = time.perf_counter()
                     actual_rows = 0
                     plan.open()
@@ -597,7 +609,11 @@ class Connection:
                     finally:
                         plan.close()
                     elapsed = time.perf_counter() - started
+                    pages_read = self.pool.misses - reads_before
+                    pages_cached = self.pool.hits - cached_before
+                    rows_examined = self.pool.rows_examined - examined_before
                     text += f"\nactual_rows={actual_rows} elapsed={elapsed:.6f}s"
+                    text += f" pages_read={pages_read} pages_cached={pages_cached} rows_examined={rows_examined}"
             finally:
                 if owns_txn:
                     stmt_txn.commit()

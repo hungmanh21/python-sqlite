@@ -10,6 +10,7 @@ DB-API fetch/close contract from docs/implementation/week-3-sql.md §20.
 """
 
 
+import re
 from pathlib import Path
 
 import pytest
@@ -856,15 +857,34 @@ def test_explain_returns_one_row_one_column_without_running_the_query() -> None:
 
 
 
-def test_explain_shows_seq_scan_plainly_without_annotations() -> None:
-    """Step 7 scopes the cost/row annotation to IndexScan specifically --
-    a SeqScan's EXPLAIN line stays exactly what build_operator()'s own
-    plain explain() already produced."""
+def test_explain_annotates_seq_scan_with_estimate_and_cost() -> None:
+    """Week 8 reverses step 7's "annotate IndexScan only": a chosen SeqScan
+    now shows what it was priced at, so `EXPLAIN` before and after
+    `CREATE INDEX` compares like with like (demo step 4 vs step 6). The
+    week-4 spec always meant this: "cost=24.01 against a scan's 3417.00".
+    Plain explain() -- no verbose -- is unchanged; test_operators.py pins that.
+    """
     db = _connect_analyzed_users(1000)
 
 
     rows = db.execute("EXPLAIN SELECT * FROM users WHERE name = 'nobody'").fetchall()
-    assert rows == [("Project\n└─ Filter\n   └─ SeqScan users",)]
+    lines = rows[0][0].split("\n")
+    assert lines[:2] == ["Project", "└─ Filter"]
+    assert re.fullmatch(r"   └─ SeqScan users est_rows=\d+ startup=0\.00 cost=\d+\.\d{2}", lines[2])
+    db.close()
+
+
+def test_explain_shows_the_scan_costing_more_than_the_index_that_beats_it() -> None:
+    """The comparison the annotation exists for: the same table, planned as
+    a scan (no usable index) and as an index seek, with both costs visible."""
+    db = _connect_analyzed_users(1000)
+
+
+    scan = db.execute("EXPLAIN SELECT * FROM users WHERE name = 'nobody'").fetchall()[0][0]
+    seek = db.execute("EXPLAIN SELECT * FROM users WHERE age = 7").fetchall()[0][0]
+    scan_cost = float(re.search(r"SeqScan users .*cost=(\d+\.\d+)", scan).group(1))  # type: ignore[union-attr]
+    seek_cost = float(re.search(r"IndexScan idx_age .*cost=(\d+\.\d+)", seek).group(1))  # type: ignore[union-attr]
+    assert scan_cost > seek_cost
     db.close()
 
 
@@ -904,6 +924,97 @@ def test_explain_analyze_runs_the_query_and_appends_actual_rows() -> None:
     assert lines[0] == "Project"
     assert lines[1] == "└─ IndexScan idx_age (age = 7) est_rows=1 startup=8.00 cost=16.01"
     assert lines[2].startswith("actual_rows=1 elapsed=")
+    db.close()
+
+
+
+
+_ANALYZE_COUNTERS = ("pages_read", "pages_cached", "rows_examined")
+# Big enough that a full scan (~60 pages) dwarfs a b-tree descent (~4); at 1000 rows the
+# table is only ~12 pages and the contrast is a mere 3x.
+_COLD_USERS_ROWS = 5000
+
+
+def _analyze_counters(plan_text: str) -> dict[str, int]:
+    """Pull the `name=<int>` counters out of an EXPLAIN ANALYZE result.
+
+    Deliberately parses by name, not position: how the counters are ordered
+    or spaced on the line is the implementation's call; that they are named,
+    integer-valued, and all present is the contract.
+    """
+    return {name: int(value) for name, value in re.findall(r"\b(\w+)=(\d+)\b", plan_text)
+            if name in _ANALYZE_COUNTERS}
+
+
+def _explain_analyze_cold(path: Path, query: str) -> dict[str, int]:
+    """Run EXPLAIN ANALYZE on a freshly opened connection, i.e. an empty
+    buffer pool. That is what makes `pages_read` (pool MISSES) deterministic:
+    chapter 19 SS19.3's "cold-ish" setting, the same one benchmarks/ uses.
+    """
+    db = quilldb.connect(str(path))
+    try:
+        rows = db.execute(f"EXPLAIN ANALYZE {query}").fetchall()
+    finally:
+        db.close()
+    return _analyze_counters(rows[0][0])
+
+
+@pytest.fixture(scope="module")
+def cold_users_db(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """5000 users on disk, indexed on age and ANALYZE'd, then closed -- so
+    every test below reopens it with nothing cached. Module-scoped because
+    every test only reads it, and building it (one fsync per commit) is the
+    slow part; the inserts share one transaction for the same reason.
+    """
+    path = tmp_path_factory.mktemp("explain_analyze") / "users.db"
+    db = quilldb.connect(str(path))
+    db.execute(_USERS_SQL)
+    db.execute(_USERS_WITH_AGE_INDEX_SQL)
+    db.execute("BEGIN")
+    for i in range(1, _COLD_USERS_ROWS + 1):
+        db.execute("INSERT INTO users VALUES (?, ?, ?)", (i, f"user_number_{i}_padded_for_size", i))
+    db.execute("COMMIT")
+    db.execute("ANALYZE")
+    db.close()
+    return path
+
+
+def test_explain_analyze_reports_named_integer_counters(cold_users_db: Path) -> None:
+    counters = _explain_analyze_cold(cold_users_db, "SELECT * FROM users WHERE age = 7")
+    assert set(counters) == set(_ANALYZE_COUNTERS)
+
+
+def test_explain_analyze_pages_read_counts_cold_pool_misses(cold_users_db: Path) -> None:
+    """A point lookup through the index touches a handful of pages -- the
+    b-tree descent -- and on a cold pool every one of them is a miss."""
+    counters = _explain_analyze_cold(cold_users_db, "SELECT * FROM users WHERE age = 7")
+    assert counters["rows_examined"] == 1
+    assert 0 < counters["pages_read"] <= 10
+
+
+def test_explain_analyze_shows_the_scan_reading_far_more_pages_than_the_index(
+    cold_users_db: Path,
+) -> None:
+    """THE contrast the demo is built on: same table, same row count out,
+    very different pages read. `name` has no index, so this is a SeqScan."""
+    indexed = _explain_analyze_cold(cold_users_db, "SELECT * FROM users WHERE age = 7")
+    scanned = _explain_analyze_cold(cold_users_db, "SELECT * FROM users WHERE name = 'user_number_7_padded_for_size'")
+    assert scanned["rows_examined"] == _COLD_USERS_ROWS
+    assert scanned["pages_read"] > 3 * indexed["pages_read"]
+
+
+def test_explain_analyze_does_not_disturb_the_callers_own_counters(cold_users_db: Path) -> None:
+    """EXPLAIN ANALYZE measures by snapshot-and-subtract, not by calling
+    reset_counters(): a caller mid-way through their own measurement must
+    not have it zeroed by an EXPLAIN they ran in between."""
+    db = quilldb.connect(str(cold_users_db))
+    db.reset_counters()
+    db.execute("SELECT * FROM users WHERE age = 7").fetchall()
+    before = db.pages_read
+    assert before > 0
+
+    db.execute("EXPLAIN ANALYZE SELECT * FROM users WHERE age = 7").fetchall()
+    assert db.pages_read >= before  # never reset; only ever grows (or stays put, all cached)
     db.close()
 
 
