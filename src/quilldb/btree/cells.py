@@ -10,7 +10,7 @@
 Pure encode/decode -- no Pager, no BufferPool, no page allocation. Writing an
 oversized payload's overflow chain to disk is storage/overflow.py's job; this
 module only decides *how many bytes stay local* and packs/unpacks the cell
-bytes PageBody.cells already treats as opaque. See docs/theory/06-b-tree-mechanics.md.
+bytes PageBody.cells already treats as opaque. See docs/theory/btree/06-b-tree-mechanics.md.
 
 
 Table interior cells carry no payload at all -- not "a small payload", none

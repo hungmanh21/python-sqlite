@@ -2,7 +2,7 @@
 
 
 Both functions here are pure -- a PageBody in, an answer out, no Pager or BufferPool. That's
-deliberate (docs/theory/06-b-tree-mechanics.md §6.1): it lets you test the search logic against
+deliberate (docs/theory/btree/06-b-tree-mechanics.md §6.1): it lets you test the search logic against
 a page you built by hand, so a failure is unambiguously in search, not in the I/O or the parser
 underneath it. btree.py is what adds the page-fetching loop on top of these.
 

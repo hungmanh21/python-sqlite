@@ -1,4 +1,4 @@
-"""TableCursor: a movable position in a table b-tree (docs/theory/06-b-tree-mechanics.md §6.3).
+"""TableCursor: a movable position in a table b-tree (docs/theory/btree/06-b-tree-mechanics.md §6.3).
 
 
 search.py and btree.py only ever answer "where is this one key" and then let go of every page

@@ -587,7 +587,7 @@ Test 2 is the one that matters most and it's the one most likely to be written w
 ---
 
 
-**Next:** [05 — Why B-trees](05-b-trees.md) — the arithmetic that makes 125 million rows reachable in four page reads, and the two data structures that beat B-trees at exactly one thing each.
+**Next:** [05 — Why B-trees](../btree/05-why-b-trees.md) — the arithmetic that makes 125 million rows reachable in four page reads, and the two data structures that beat B-trees at exactly one thing each.
 
 
 
