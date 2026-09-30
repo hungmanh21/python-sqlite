@@ -8,9 +8,10 @@ its b-tree page header, so page 1's page header begins at byte 100 and page 1 ha
 100 fewer usable bytes than every other page. Use page_header_offset() and never
 inline that comparison.
 
-Freed pages form a TWO-level structure: header.freelist_trunk points at a trunk
-page holding an array of free leaf page numbers, and the leaf pages themselves are
-never read or written. See allocate_page/free_page and chapter 01 §1.8.
+SQLite's freelist is two-level (a trunk page holding an array of free leaf page
+numbers); quilldb writes the legal degenerate form, a chain of trunk pages that
+each hold zero leaves, so every free and allocate touches the page itself. See
+allocate_page/free_page, ADR-008 and chapter 01 §1.8.
 """
 
 import io

@@ -81,10 +81,19 @@ page 1 pass `pager.page_header_offset(page_id)`; `BufferPool` still never parses
 
 
 The "decoded overlay on top of the pool" idea in the third Consequences bullet has **not** been built; the
-code parses on every access. It remains available if profiling ever points at repeated `parse_page` calls.
-*(TODO before publishing: state here whether it was ever profiled — this update records what the code does,
-not why the overlay was skipped.)*
+code parses on every access. It was profiled in week 8, after the decision, and the cost is real for point
+lookups and negligible for scans:
 
+| Workload (20,000 rows) | Time in `parse_page` | Calls |
+|---|---:|---:|
+| 5,000 Zipf point lookups (index path, then table leaf) | **22%** of wall time with no profiler, counting only the b-tree modules' calls; **31%** under `cProfile`, counting every caller | 30,019 under `cProfile`: about six page parses per lookup |
+| One full scan | 3% under `cProfile` | 518 (about one parse per page, and a leaf is parsed once for all its rows) |
+
+So the overlay would recover roughly a fifth to a third of a point lookup, and almost nothing on a scan.
+It was skipped for the reasons above (it welds the pool to the page format, and it puts the page-1 offset
+inside the cache), and the profile does not overturn them: the headline metric in this project is page
+reads, which parsing does not change, and an overlay would have to be invalidated on every page write,
+including rollback. If time per lookup ever becomes the target, this is where to look first.
 
 **Alternatives considered** (this ADR predates the template's fourth heading): caching parsed `PageBody`
 objects in the pool, as chapter 04 §4.2 argues. It is faster per access in Python, but it welds the pool to

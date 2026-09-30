@@ -163,15 +163,26 @@ keeps an index page's fanout at four or more. Implementation:
 
 ## The freelist
 
-Pages that were freed are kept in a two-level structure, and the file does not shrink.
+SQLite's freelist is two-level: `header.freelist_trunk` points at a trunk page laid out as
+`[next trunk (4)][leaf count L (4)][L leaf page numbers (4 each)]`, so freeing a page touches only the
+trunk, not the freed page. **quilldb writes the degenerate legal form of it**: a chain of trunk pages that
+each hold zero leaves.
 
 ```
-header.freelist_trunk -> trunk page: [next trunk (4)][leaf count L (4)][L leaf page numbers (4 each)]
+header.freelist_trunk -> page A [next -> B][L = 0][zeros] -> page B [next -> C][L = 0][zeros] -> ... -> 0
 ```
 
-Allocation takes the trunk's last leaf, or the trunk itself once it has none; with no free pages the file
-grows by one. Freeing appends to a trunk. `header.freelist_count` is the total of trunks and leaves.
-`VACUUM` is not implemented, so the file only grows or holds steady.
+Freeing a page zeroes the whole page and makes it the new head of the chain; allocating takes the head, or
+grows the file by one when the chain is empty. `header.freelist_count` counts the pages in the chain. Real
+`sqlite3` reads this as a chain of empty trunks, and `integrity_check` says `ok`. The cost is that every
+free and every allocation touches the page itself, the traffic the two-level design exists to avoid
+([ADR-008](decisions/ADR-008-repack-pages-on-delete.md)). Zeroing the whole page is not optional: stale
+bytes at offsets 4 to 7 would be read as the leaf count, and `sqlite3` reports "freelist leaf count too
+big".
+
+quilldb does not read leaf arrays. A file real SQLite has deleted from (its freelist holds trunks with
+leaves) is one of the files quilldb makes no promise to open correctly. `VACUUM` is not implemented, so
+the file only grows or holds steady.
 
 ## `sqlite_schema` and quilldb's own table
 

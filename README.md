@@ -273,6 +273,7 @@ $ quilldb inspect mydata.db             # dump a file's header
   | [006](docs/decisions/ADR-006-table-level-2pl-with-deadlock-detection.md) | Table-level strict 2PL with deadlock detection |
   | [007](docs/decisions/ADR-007-cost-model-and-exhaustive-join-search.md) | A page-cost model and exhaustive left-deep join search |
   | [008](docs/decisions/ADR-008-repack-pages-on-delete.md) | Repack a page on delete instead of keeping freeblocks |
+  | [009](docs/decisions/ADR-009-hash-aggregation.md) | Hash aggregation, where SQLite sorts |
 
 ## Documentation
 
