@@ -369,9 +369,9 @@ Per chapter 19: **page reads are the headline, time is context.**
 BENCHMARKS = [
     "point_lookup_index_vs_scan",      # EXISTS (index_lookup.py): 2,622 vs 7 page reads, 375×   ← THE number
     "btree_height_vs_rows",            # 1k->2, 100k->3; 10M->4 is extrapolated from fanout, label it
-    "insert_sequential_vs_random",     # rightmost-split case, chapter 05 §5.7
+    "insert_sequential_vs_random",     # EXISTS (inserts.py, via BTree): 1 vs 12,259 reads       ← publish it
     "insert_cost_per_index",           # EXISTS (index_lookup.py): 1.00× / 2.17× / 4.18×          ← publish it
-    "buffer_pool_hit_rate_vs_size",    # the working-set knee, chapter 04
+    "buffer_pool_hit_rate_vs_size",    # EXISTS (hit_rate.py): 70.7% at 8 pages -> 99.5% at 512
     "covering_index_vs_not",           # ~2x, chapter 11 §11.5
     "join_order_cheap_vs_expensive",   # both orders' page reads                                  ← publish it
     "limit_1_short_circuits",          # <10 page reads over 1M rows
@@ -386,15 +386,22 @@ and reformatting as tables. Most of the rest need only what the engine already e
 depend on something to settle first:
 
 
-- **`insert_sequential_vs_random`** needs to insert with a chosen rowid, and **the SQL surface can't do
-  that today** — `sql/parser.py` has no `PRIMARY KEY`, and the benchmarks so far use
-  `CREATE TABLE users (id INTEGER, …)` with an automatically assigned rowid. So this benchmark goes through
-  the `BTree` API directly (legitimate, but say so in the write-up), or you add `INTEGER PRIMARY KEY` as
-  a rowid alias, which is a bigger change than a benchmark justifies.
-- **`buffer_pool_hit_rate_vs_size`** needs to vary the pool's capacity. `BufferPool.__init__` takes
-  `capacity` (default 128), but `api/database.py` constructs it as `BufferPool(pager)` without passing one
-  through, so `connect()` can't set it. Plumbing a `cache_pages` argument through is a few lines, not a
-  redesign. The hit rate itself is already derivable: `pages_cached / (pages_cached + pages_read)`.
+- **`insert_sequential_vs_random`** ✅ done via the `BTree` API (`bench/inserts.py`), because the SQL
+  surface can't choose a rowid (`sql/parser.py` has no `PRIMARY KEY`). The table is labelled "B+tree
+  insert", not "INSERT". 20,000 rows through a 64-page pool: sequential 1 read, random 12,259; a cold search
+  of every key reads 363 pages sequentially, 16,580 randomly.
+- **`buffer_pool_hit_rate_vs_size`** ✅ done. `connect(path, pool_capacity=…)` now reaches the pool, and
+  `bench/hit_rate.py` sweeps it. Writing it exposed a bug: `allocate_page` never evicted, so capacity was
+  enforced on reads only (fixed; see the ADR-001 update). Two results to publish honestly:
+  - The Zipf-skewed sweep is a gentle curve, not a cliff: 70.7% at 8 pages, 88.2% at 64, 93.7% at 128,
+    99.5% at 512. State the skew (exponent 1.2, hot ids scattered); uniform draws give a sharp knee at
+    about 512 pages instead.
+  - **Chapter 04 ("What you should do") says "hit rate went from 99% to near zero after a scan". Measured, it does not:**
+    100% before, **67.5%** on the first pass over a 20-id hot set right after a full-table scan, 100% once
+    the hot set is reloaded. The floor is high because every lookup re-hits the catalog and index-root
+    pages within the same query. Either soften the chapter to "the scan evicts the hot set (about 3 reads
+    per lookup instead of 0 on the first pass)" or drop the number, and report reads, per chapter 19.
+    *(TODO: edit chapter 04 `docs/theory/storage/04-buffer-pool.md`, line ~314, "Say this out loud".)*
 - **`btree_height_vs_rows` at 10M rows** takes roughly 25 minutes to build at the measured ~0.15 ms per
   unindexed insert. Measure 1k / 10k / 100k / 1M, compute the 10M row from the fanout, and mark it as
   computed — that also invites the reader to check `log_fanout(N)` themselves, which is the point of
