@@ -368,13 +368,13 @@ Per chapter 19: **page reads are the headline, time is context.**
 # src/quilldb/bench/run_all.py — emits a paste-able markdown table
 BENCHMARKS = [
     "point_lookup_index_vs_scan",      # EXISTS (index_lookup.py): 2,622 vs 7 page reads, 375×   ← THE number
-    "btree_height_vs_rows",            # 1k->2, 100k->3; 10M->4 is extrapolated from fanout, label it
+    "btree_height_vs_rows",            # EXISTS (btree_height.py): 1k->2, 100k->3 measured; 10M->4 computed
     "insert_sequential_vs_random",     # EXISTS (inserts.py, via BTree): 1 vs 12,259 reads       ← publish it
-    "insert_cost_per_index",           # EXISTS (index_lookup.py): 1.00× / 2.17× / 4.18×          ← publish it
+    "insert_cost_per_index",           # EXISTS (index_lookup.py): ~1× / ~2× / ~4× (2.17/4.18 in README; 1.99/3.93 on rerun) ← publish it
     "buffer_pool_hit_rate_vs_size",    # EXISTS (hit_rate.py): 70.7% at 8 pages -> 99.5% at 512
-    "covering_index_vs_not",           # ~2x, chapter 11 §11.5
-    "join_order_cheap_vs_expensive",   # both orders' page reads                                  ← publish it
-    "limit_1_short_circuits",          # <10 page reads over 1M rows
+    "covering_index_vs_not",           # EXISTS (covering_index.py): 7 vs 3 reads (2.3x) -- index-ONLY, quilldb has no covering path
+    "join_order_cheap_vs_expensive",   # EXISTS (join_order.py): 388 vs 7,703 reads (20x)         ← publish it
+    "limit_1_short_circuits",          # EXISTS (limit_short_circuit.py): 4 reads vs 1,990 over 100k rows
     "throughput_vs_threads",           # EXISTS (concurrent.py): neither reads nor writes scale   ← publish it
 ]
 ```
@@ -402,11 +402,31 @@ depend on something to settle first:
     pages within the same query. Either soften the chapter to "the scan evicts the hot set (about 3 reads
     per lookup instead of 0 on the first pass)" or drop the number, and report reads, per chapter 19.
     *(TODO: edit chapter 04 `docs/theory/storage/04-buffer-pool.md`, line ~314, "Say this out loud".)*
-- **`btree_height_vs_rows` at 10M rows** takes roughly 25 minutes to build at the measured ~0.15 ms per
-  unindexed insert. Measure 1k / 10k / 100k / 1M, compute the 10M row from the fanout, and mark it as
-  computed — that also invites the reader to check `log_fanout(N)` themselves, which is the point of
-  the table.
+- **`btree_height_vs_rows`** ✅ done. Built at 1k / 10k / 100k rows (heights 2 / 2 / 3, measured 53.6 rows
+  per leaf and 312 children per interior page); 1M / 10M / 100M are computed from that fanout and labelled
+  "computed" in the output (heights 3 / 4 / 4). Building 1M+ rows takes too long to be worth it.
+- **`limit_1_short_circuits`** ✅ done, at 100,000 rows rather than 1M: `LIMIT 1` reads 4 pages against 1,990
+  for the full scan. `ORDER BY grp LIMIT 1` reads all 1,990, because a sort blocks the short-circuit; keep
+  that row, it is the one people expect to be cheap.
+- **`join_order_cheap_vs_expensive`** ✅ done, with two caveats to state in the write-up. (1) A `LEFT JOIN`
+  is used to pin the written order, because an INNER join is always reordered to the cheapest; the data
+  guarantees every left row matches so all statements return the same rows. (2) The effect is in page
+  reads (388 vs 7,703), not rows examined (about 100,000 either way), and it needs the inner table bigger
+  than the pool. The planner does not use an index on the join column at these sizes: its cost model is in
+  pages and prices a scan of the inner table below the seeks.
+- **`covering_index_vs_not`** ✅ done, but **not as the plan described it**: quilldb has no index-only path
+  (`IndexScan` always looks up the table row), so the benchmark compares the engine's real cost with a
+  direct `IndexBTree.seek_range` walk (7 vs 3 reads at 1 row, 13 vs 4 at 200 rows). Present it as "what a
+  covering index would save", never as a feature quilldb has. Possible follow-up: implement it.
 
+
+**`run_all` ✅ done** (`python -m quilldb.bench [names…] [--list]`): each benchmark's own table under a
+heading, with a one-line caveat, in a fenced block, ready to paste. Full run: a few minutes. **Two lessons
+from writing it:** (1) `index_lookup` originally inserted one row per autocommitted statement, which cost an
+`fsync` each (~15 ms). Setup took ~54 minutes and the write-side table read 1.00× / 1.03× / 1.11×, hiding the
+index tax completely. Batched into one transaction it runs in under 2 minutes and shows ~1× / 2× / 4×. State
+in the write-up that the tax is measured inside a transaction. (2) Every other benchmark batches for the
+same reason.
 
 **The throughput row has changed meaning since this plan was drafted.** The original expected shape was
 "reads scale, writes don't". The measurement (`concurrent.py`) says reads *fall* slightly as threads are
