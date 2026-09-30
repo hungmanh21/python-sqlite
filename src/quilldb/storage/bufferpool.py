@@ -28,11 +28,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from quilldb.constants import PAGE_SIZE
 from quilldb.errors import PageOutOfRangeError, PoolExhaustedError
 
 if TYPE_CHECKING:
     from quilldb.txn.transaction import Transaction
-from quilldb.storage.pager import PAGE_SIZE, Pager
+from quilldb.storage.pager import Pager
 
 
 @dataclass
