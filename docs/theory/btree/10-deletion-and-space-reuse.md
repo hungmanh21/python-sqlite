@@ -510,7 +510,8 @@ payoff is one page write versus one page write. Note it in the README as future 
 | Cell removal | freeblock chain, coalescing, fragments | **repack the page** | ✅ a page with no holes is well-formed |
 | Empty page | freed to the freelist | **freed to the freelist** | ✅ same |
 | Underfull page | merge siblings below ⅓ occupancy | **nothing** | ✅ occupancy is not a format constraint |
-| Root collapse | interior root reverts to leaf | **when it empties, yes** | ✅ same |
+| Root collapse | interior root reverts to leaf | **yes: on empty, and when left with one child** | ✅ same (a zero-cell interior page is malformed; NOTES.md B8-1) |
+| Single-child interior page | merged into a sibling | **merged or rotated, same two moves as the index tree** | ✅ heights stay uniform |
 | Shrink the file | `VACUUM` | **not implemented** | ✅ absence of a feature |
 | `UPDATE` | in-place when it fits, else delete+insert | **always delete+insert** | ✅ same bytes either way |
 

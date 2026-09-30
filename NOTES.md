@@ -495,7 +495,7 @@ distinction is week7-query-processing.md §40's `resolve_layout`, session 1's jo
 
 ## Week 8 — presentation
 
-### B8-1 ★ (open) A table delete can leave a zero-cell interior root that `sqlite3` calls malformed
+### B8-1 ★ (fixed) A table delete can leave a zero-cell interior root that `sqlite3` calls malformed
 - **Symptom:** found while building `quilldb validate`. A table whose root has exactly two leaves, with
   every row of one leaf deleted, ends up with a root interior page of **zero cells** and one child
   (`quilldb btree FILE --root 3` shows `page 3 INTERIOR_TABLE cells=0`). Real SQLite then refuses the file
@@ -508,7 +508,12 @@ distinction is week7-query-processing.md §40's `resolve_layout`, session 1's jo
   (`IndexBTree._rebalance` pulls the lone child up into the root). The **table** tree never got the same
   treatment, and its validator (`validate_btree`) has no zero-cell check, so nothing in quilldb noticed.
   `validate_index_btree` does have it.
-- **Not fixed.** Adding the check to `validate_btree` makes the test above fail, because that test asserts the
-  illegal state. A fix needs the table delete to collapse a zero-cell interior page (pull its only child up,
-  keeping the root's page number), a validator check, and that test rewritten to assert the collapse.
-  `quilldb validate` already reports it, through the real-SQLite half.
+- **Fixed.** `BTree.delete` now calls `_collapse_single_child` whenever an interior page is left with one
+  child: the root pulls the child up into its own page; any other page is merged into an adjacent sibling,
+  or a child is rotated over when the sibling is full, recursing if the grandparent is left with one child.
+  A first attempt that simply pointed the grandparent at the child gave `uneven heights [1, 2]`: bypassing
+  a page breaks the uniform-depth rule, so a real merge/rotate is needed. `validate_btree` now rejects
+  zero-cell interior pages and non-root empty leaves. Tests: the two rewritten/new unit tests in
+  `test_btree.py` (root collapse, non-root merge, rotate from a full sibling on either side) and
+  `differential/test_delete_integrity.py`, which opens the result with real `sqlite3` (the reproduction plus
+  six randomized delete sequences).

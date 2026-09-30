@@ -119,6 +119,8 @@ def validate_btree(pager: Pager, pool: BufferPool, root: int) -> None:
 
 
         if body.page_type is PageType.LEAF_TABLE:
+            if not body.cells and page_id != root:
+                raise BTreeInvariantError(f"page {page_id} is a non-root leaf with zero cells -- not a legal page")
             prev_key: int | None = None
             for cell in body.cells:
                 rowid, total_payload_len, local_payload, overflow_page = decode_leaf_table_cell(cell)
@@ -133,6 +135,12 @@ def validate_btree(pager: Pager, pool: BufferPool, root: int) -> None:
                 prev_key = rowid
             return 1
 
+
+        if not body.cells:
+            raise BTreeInvariantError(
+                f"page {page_id} is an interior page with zero cells -- not a legal page; "
+                "real sqlite3 reports the file as malformed"
+            )
 
         # INTERIOR_TABLE: each cell's child covers (bound, separator], where
         # `bound` starts at this page's own `low` and becomes each separator

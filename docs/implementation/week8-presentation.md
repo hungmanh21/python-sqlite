@@ -607,8 +607,8 @@ quilldb cannot open; `validate` runs quilldb's validator over every table and in
 through the standard library's `sqlite3` module (not a `sqlite3` binary, so there is no "binary not found"
 case), and exits 1 if either finds a problem; `bench` takes benchmark names, not a database. `shell` has
 statements ending in `;`, `.tables` / `.schema` / `.help` / `.quit`, and `!command`. **Building `validate`
-found a real bug: see `NOTES.md` B8-1** (a table delete can write a file real SQLite calls malformed; not
-fixed). `statement_complete` in `shell.py` is quote- and comment-aware (a `;` inside a string, identifier or comment does not end a statement).
+found a real bug: see `NOTES.md` B8-1** (a table delete could write a file real SQLite calls malformed;
+fixed, with a real-sqlite3 test). `statement_complete` in `shell.py` is quote- and comment-aware (a `;` inside a string, identifier or comment does not end a statement).
 
 **Design notes, from what exists:**
 

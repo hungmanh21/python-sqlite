@@ -201,13 +201,16 @@ class BTree:
         If the root itself empties out this way (every row gone), it's
         rewritten in place as an empty leaf rather than left as a
         childless interior page -- its page number can't change, since
-        sqlite_schema points at it. Short of that, quilldb tolerates a
-        root (or any interior page) left with a single surviving child
-        rather than collapsing it further: real, if minor, wasted height,
-        matching this codebase's other documented choice not to merge
-        underfull siblings (chapter 10 §10.3) -- fixing either one needs
-        the same rebalancing work, deliberately out of scope.
+        sqlite_schema points at it.
 
+        An interior page left with exactly one child is collapsed too,
+        because real sqlite3 rejects a zero-cell b-tree page as "database
+        disk image is malformed" -- a hard parse error, not a soft
+        integrity_check finding (NOTES.md B8-1). Table interior cells are
+        pure routing, so the fix is cheap: the surviving child takes the
+        page's place in the grandparent, or, for the root, is copied up into
+        the root's page. Underfull siblings are still not merged
+        (chapter 10 §10.3); only zero-cell pages are illegal.
 
         One trap: removing a child from a parent is a *different*
         operation from removing a row: the parent's cell is `[left
@@ -277,6 +280,7 @@ class BTree:
 
 
                 parent_is_empty = not parent.cells and parent.right_child == 0
+                only_child = 0 if parent.cells else parent.right_child
 
 
                 if level == 0 and parent_is_empty:
@@ -290,6 +294,10 @@ class BTree:
             self.pool.free_page(child_to_free)
 
 
+            if only_child:
+                self._collapse_single_child(path, level, only_child)
+                return True
+
             if level == 0 or not parent_is_empty:
                 return True
 
@@ -300,6 +308,113 @@ class BTree:
             child_to_free = parent_page_id
             level -= 1
 
+
+    def _collapse_single_child(self, path: list[tuple[int, int]], level: int, only_child: int) -> None:
+        """`path[level]` is an interior page with zero cells and one child.
+
+        The root keeps its page number (sqlite_schema records it), so the
+        child's content is copied up into it: one level of height goes away.
+
+        Any other page cannot simply be bypassed -- pointing the grandparent
+        straight at the child would put a leaf at a different depth from its
+        cousins, which sqlite3 also rejects. Height must stay uniform, so the
+        page is filled from an adjacent sibling instead, by one of two moves
+        (the same two the index tree uses):
+
+        * MERGE -- the child joins the sibling as one more entry, the page is
+          freed, and the grandparent loses a cell. If that leaves the
+          grandparent with a single child, the same problem is now one level
+          up, and this method recurses.
+        * ROTATE -- used when the sibling has no room for the extra entry.
+          The sibling's edge child moves over into this page, so the
+          grandparent keeps its cell count.
+
+        The separator between the child and its new neighbour is the
+        grandparent's own separator for this page: it is >= every key under
+        the child and < every key of the sibling's edge child. Interior
+        cells are pure routing, so no key moves.
+        """
+        page_id, _ = path[level]
+        if level == 0:
+            raw = self.pool.get_page(only_child)
+            try:
+                promoted = parse_page(raw)
+            finally:
+                self.pool.unpin(only_child)
+            with self.pool.pinned_for_write(self.root) as root_raw:
+                root_raw[:] = serialize_page(promoted)
+            self.pool.free_page(only_child)
+            return
+
+        grand_id, slot = path[level - 1]
+        grand_raw = self.pool.get_page_for_write(grand_id)
+        grand_now_single = 0
+        try:
+            grand = parse_page(grand_raw)
+            n = len(grand.cells)
+            on_right = slot >= n  # this page is the grandparent's right_child
+            children = [decode_interior_table_cell(c)[0] for c in grand.cells] + [grand.right_child]
+            sep_slot = n - 1 if on_right else slot
+            sib_slot = n - 1 if on_right else slot + 1
+            sib_id = children[sib_slot]
+            _, sep = decode_interior_table_cell(grand.cells[sep_slot])
+
+            sib_raw = self.pool.get_page_for_write(sib_id)
+            try:
+                sib = parse_page(sib_raw)
+                if on_right:
+                    entry = encode_interior_table_cell(sib.right_child, sep)
+                else:
+                    entry = encode_interior_table_cell(only_child, sep)
+
+                if sib.fits(len(entry)):  # MERGE
+                    if on_right:
+                        sib.insert_cell(len(sib.cells), entry)
+                        sib.right_child = only_child
+                        grand.delete_cell(n - 1)
+                        grand.right_child = sib_id
+                    else:
+                        sib.insert_cell(0, entry)
+                        grand.delete_cell(slot)
+                    sib_raw[:] = serialize_page(sib)
+                    grand_raw[:] = serialize_page(grand)
+                    merged = True
+                    grand_now_single = 0 if grand.cells else grand.right_child
+                else:  # ROTATE: a full sibling has plenty of cells to lend one
+                    if on_right:
+                        edge_child, edge_sep = sib.right_child, decode_interior_table_cell(sib.cells[-1])[1]
+                        moved = PageBody(
+                            PageType.INTERIOR_TABLE,
+                            cells=[encode_interior_table_cell(edge_child, sep)],
+                            right_child=only_child,
+                        )
+                        sib.right_child = decode_interior_table_cell(sib.cells[-1])[0]
+                        sib.delete_cell(len(sib.cells) - 1)
+                        grand.cells[n - 1] = encode_interior_table_cell(sib_id, edge_sep)
+                    else:
+                        edge_child, edge_sep = decode_interior_table_cell(sib.cells[0])
+                        moved = PageBody(
+                            PageType.INTERIOR_TABLE,
+                            cells=[encode_interior_table_cell(only_child, sep)],
+                            right_child=edge_child,
+                        )
+                        sib.delete_cell(0)
+                        grand.cells[slot] = encode_interior_table_cell(page_id, edge_sep)
+                    sib_raw[:] = serialize_page(sib)
+                    grand_raw[:] = serialize_page(grand)
+                    merged = False
+            finally:
+                self.pool.unpin(sib_id)
+        finally:
+            self.pool.unpin(grand_id)
+
+        if merged:
+            self.pool.free_page(page_id)
+            if grand_now_single:
+                self._collapse_single_child(path, level - 1, grand_now_single)
+        else:
+            with self.pool.pinned_for_write(page_id) as raw:
+                raw[:] = serialize_page(moved)
 
     def _find_leaf(self, rowid: int) -> list[tuple[int, int]]:
         """Return the unpinned root-to-leaf path for where `rowid` belongs.

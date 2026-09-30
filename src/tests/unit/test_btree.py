@@ -367,11 +367,10 @@ def test_delete_empty_leaf_unlinks_it_from_a_parent_with_three_children(pager, p
 
 
 
-def test_delete_from_one_of_two_root_children_leaves_a_single_child_root(pager, pool) -> None:
-    """A root that drops from two children to one is tolerated, not
-    collapsed -- the same "less dense, still valid" trade this codebase
-    already makes for a non-root interior page (chapter 10 §10.3). Only a
-    root that empties out ENTIRELY is rewritten back to a leaf.
+def test_delete_from_one_of_two_root_children_collapses_the_root(pager, pool) -> None:
+    """A root left with one child is pulled up: real sqlite3 calls a
+    zero-cell interior page malformed (NOTES.md B8-1). The root keeps its
+    page number and the vacated child goes to the freelist.
     """
     left = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(1)]))
     right = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(2)]))
@@ -386,24 +385,117 @@ def test_delete_from_one_of_two_root_children_leaves_a_single_child_root(pager, 
     )
     bt = BTree(pager, pool, root)
 
-
     assert bt.delete(1) is True
     assert bt.root == root
-    assert bt.search(2) == (right, 0)
-
+    assert bt.search(2) == (root, 0)
 
     raw = pool.get_page(root)
     try:
         root_body = parse_page(raw)
     finally:
         pool.unpin(root)
-    assert root_body.page_type is PageType.INTERIOR_TABLE
-    assert root_body.cells == []
-    assert root_body.right_child == right
-    assert pager._allocate_page() == left
+    assert root_body.page_type is PageType.LEAF_TABLE
+    assert len(root_body.cells) == 1
     validate_btree(pager, pool, root)
 
 
+def test_delete_bypasses_a_non_root_interior_page_left_with_one_child(pager, pool) -> None:
+    """root -> [mid_a, mid_b]; each mid has two leaves. Emptying one leaf of
+    mid_a leaves it with one child, so the root should point at that leaf
+    directly and mid_a should be freed.
+    """
+    leaves = [
+        _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(i)])) for i in (1, 2, 3, 4)
+    ]
+    mid_a = _write_page(
+        pager,
+        pool,
+        PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(leaves[0], 1)], right_child=leaves[1]),
+    )
+    mid_b = _write_page(
+        pager,
+        pool,
+        PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(leaves[2], 3)], right_child=leaves[3]),
+    )
+    root = _write_page(
+        pager,
+        pool,
+        PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(mid_a, 2)], right_child=mid_b),
+    )
+    bt = BTree(pager, pool, root)
+
+    assert bt.delete(1) is True
+
+    raw = pool.get_page(root)
+    try:
+        root_body = parse_page(raw)
+    finally:
+        pool.unpin(root)
+    child, _ = decode_interior_table_cell(root_body.cells[0])
+    assert child == leaves[1]
+    for rowid in (2, 3, 4):
+        assert bt.search(rowid) is not None
+    assert bt.search(1) is None
+    validate_btree(pager, pool, root)
+
+
+def _full_interior(pager, pool, first_key: int) -> tuple[int, int]:
+    """An interior page filled until no more cells fit, over one-row leaves
+    with keys first_key, first_key+1, ...; returns (page, last_key)."""
+    body = PageBody(PageType.INTERIOR_TABLE)
+    key = first_key
+    while True:
+        leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(key)]))
+        cell = encode_interior_table_cell(leaf, key)
+        if not body.fits(len(cell)):
+            body.right_child = leaf
+            return _write_page(pager, pool, body), key
+        body.insert_cell(len(body.cells), cell)
+        key += 1
+
+
+@pytest.mark.parametrize("sibling_on_right", [True, False])
+def test_delete_rotates_from_a_full_sibling(pager, pool, sibling_on_right) -> None:
+    """A single-child interior page next to a FULL sibling cannot merge into
+    it, so one child rotates over; the grandparent keeps both children."""
+    if sibling_on_right:
+        lone_leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(1)]))
+        keeper = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(2)]))
+        lone = _write_page(
+            pager, pool,
+            PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(lone_leaf, 1)], right_child=keeper),
+        )
+        full, last = _full_interior(pager, pool, 3)
+        root = _write_page(
+            pager, pool,
+            PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(lone, 2)], right_child=full),
+        )
+        gone, kept = 1, [2, *range(3, last + 1)]
+    else:
+        full, last = _full_interior(pager, pool, 1)
+        lone_leaf = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(last + 1)]))
+        keeper = _write_page(pager, pool, PageBody(PageType.LEAF_TABLE, cells=[_leaf_cell(last + 2)]))
+        lone = _write_page(
+            pager, pool,
+            PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(lone_leaf, last + 1)], right_child=keeper),
+        )
+        root = _write_page(
+            pager, pool,
+            PageBody(PageType.INTERIOR_TABLE, cells=[encode_interior_table_cell(full, last)], right_child=lone),
+        )
+        gone, kept = last + 1, [*range(1, last + 1), last + 2]
+    bt = BTree(pager, pool, root)
+
+    assert bt.delete(gone) is True
+
+    raw = pool.get_page(root)
+    try:
+        assert len(parse_page(raw).cells) == 1  # still two children: a rotation, not a merge
+    finally:
+        pool.unpin(root)
+    assert bt.search(gone) is None
+    assert all(bt.search(k) is not None for k in kept)
+    validate_btree(pager, pool, root)
 
 
 def test_delete_last_row_collapses_root_to_an_empty_leaf(pager, pool) -> None:

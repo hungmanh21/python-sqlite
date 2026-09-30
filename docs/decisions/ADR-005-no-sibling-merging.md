@@ -29,7 +29,10 @@ Not every empty page is optional, though. Real `sqlite3` rejects a page with zer
   parent and freed to the freelist. An emptied root reverts to an empty leaf **in place**, because
   `sqlite_schema` records the root's page number.
 - A page that is merely **sparse** is left alone. Splits are two-way only, and an interior page left with
-  a single child is tolerated rather than collapsed, which costs a little wasted height.
+  a single child is not tolerated: it has zero cells, which real SQLite rejects as malformed (NOTES.md
+  B8-1, found late by `quilldb validate`). The table delete pulls the child up into the root, or merges
+  the page into an adjacent sibling (rotating one child over when the sibling is full), so a page with
+  live cells but few of them is fine and a page with none is never left behind.
 
 
 ## Consequences
