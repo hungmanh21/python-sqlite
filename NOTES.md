@@ -492,3 +492,23 @@ distinction is week7-query-processing.md §40's `resolve_layout`, session 1's jo
 - **Fix:** `row_count == 0` short-circuits to `leaf_pages_touched = 1` — the same floor the general
   formula already clamps to, not a different cost shape. *Lesson: a `stats.field` that's usually a
   divisor is a divide-by-zero waiting for the one fixture nobody happened to write yet.*
+
+## Week 8 — presentation
+
+### B8-1 ★ (open) A table delete can leave a zero-cell interior root that `sqlite3` calls malformed
+- **Symptom:** found while building `quilldb validate`. A table whose root has exactly two leaves, with
+  every row of one leaf deleted, ends up with a root interior page of **zero cells** and one child
+  (`quilldb btree FILE --root 3` shows `page 3 INTERIOR_TABLE cells=0`). Real SQLite then refuses the file
+  outright: `database disk image is malformed`, a hard parse error, not an `integrity_check` finding.
+  Reproduce: 100 rows of `(id, 'x' * 60)`, then `DELETE FROM t WHERE id <= 59`.
+- **Assumed:** the docs and `test_delete_from_one_of_two_root_children_leaves_a_single_child_root` call this
+  state "tolerated, not collapsed ... less dense, still valid" (`BTree.delete`'s docstring; chapter 10
+  §10.3; ADR-005). That holds for a single-child page with a live cell, not for an interior page with none.
+- **Actually:** it is the same illegal state as B4-4 and B4-5, which the **index** tree already handles
+  (`IndexBTree._rebalance` pulls the lone child up into the root). The **table** tree never got the same
+  treatment, and its validator (`validate_btree`) has no zero-cell check, so nothing in quilldb noticed.
+  `validate_index_btree` does have it.
+- **Not fixed.** Adding the check to `validate_btree` makes the test above fail, because that test asserts the
+  illegal state. A fix needs the table delete to collapse a zero-cell interior page (pull its only child up,
+  keeping the root's page number), a validator check, and that test rewritten to assert the collapse.
+  `quilldb validate` already reports it, through the real-SQLite half.

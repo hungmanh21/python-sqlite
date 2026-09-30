@@ -601,6 +601,15 @@ the GIF possible.
 demonstrates the whole format-fidelity bet.
 
 
+**Status: all six commands written ✅** (`quilldb shell | inspect | pages | btree | validate | bench`), 24 tests in
+`test_cli.py`. Decisions: `pages` and `btree` read raw bytes and never go through `Pager`, so they work on files
+quilldb cannot open; `validate` runs quilldb's validator over every table and index, then asks real SQLite
+through the standard library's `sqlite3` module (not a `sqlite3` binary, so there is no "binary not found"
+case), and exits 1 if either finds a problem; `bench` takes benchmark names, not a database. `shell` has
+statements ending in `;`, `.tables` / `.schema` / `.help` / `.quit`, and `!command`. **Building `validate`
+found a real bug: see `NOTES.md` B8-1** (a table delete can write a file real SQLite calls malformed; not
+fixed). `statement_complete` in `shell.py` is quote- and comment-aware (a `;` inside a string, identifier or comment does not end a statement).
+
 **Design notes, from what exists:**
 
 
