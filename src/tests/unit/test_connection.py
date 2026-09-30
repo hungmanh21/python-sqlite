@@ -1288,3 +1288,27 @@ def test_close_is_idempotent_after_rolling_back_an_open_transaction(tmp_path: Pa
 
     db.close()
     db.close()  # must not raise a second time
+
+
+def test_connect_pool_capacity_bounds_the_cache(tmp_path):
+    """A small pool re-reads what a large one keeps: the knob reaches the pool."""
+    path = tmp_path / "cap.db"
+    conn = quilldb.connect(path)
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")
+    conn.execute("BEGIN")
+    for i in range(2000):
+        conn.execute("INSERT INTO t VALUES (?, ?)", (i, "x" * 50))
+    conn.execute("COMMIT")
+    conn.close()
+
+    def second_scan_misses(capacity):
+        c = quilldb.connect(path, pool_capacity=capacity)
+        c.execute("SELECT * FROM t").fetchall()
+        before = c.pool.misses
+        c.execute("SELECT * FROM t").fetchall()
+        misses = c.pool.misses - before
+        c.close()
+        return misses
+
+    assert second_scan_misses(256) == 0
+    assert second_scan_misses(4) > 10

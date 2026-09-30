@@ -18,7 +18,7 @@ from quilldb.catalog.catalog import Catalog
 from quilldb.constants import FILE_HEADER_SIZE, SCHEMA_ROOT_PAGE
 from quilldb.plan.analyze import StatisticsCatalog
 from quilldb.plan.cache import PlanCache
-from quilldb.storage.bufferpool import BufferPool
+from quilldb.storage.bufferpool import DEFAULT_POOL_CAPACITY, BufferPool
 from quilldb.storage.pager import Pager
 from quilldb.txn.locks import LockManager
 from quilldb.txn.recovery import recover_if_needed
@@ -101,12 +101,16 @@ class Database:
             self.pager.close()
 
 
-def open_database(path: str | Path) -> Database:
+def open_database(path: str | Path, *, pool_capacity: int = DEFAULT_POOL_CAPACITY) -> Database:
     """Open an existing database file or create a new one.
 
     The exact string ":memory:" selects Pager.memory() and never creates a
     file -- anything else, including a Path spelled ":memory:", is a real
     path on disk. Same convention connect() has always used.
+
+    `pool_capacity` is the buffer pool's size in pages. The default is what
+    every caller got before it was a parameter; benchmarks shrink it to
+    watch the hit rate fall as the working set outgrows the cache.
     """
     if path == _MEMORY_PATH:
         pager = Pager.memory()
@@ -117,7 +121,7 @@ def open_database(path: str | Path) -> Database:
     # Recovery completes before the pool exists -- there is no cache to
     # invalidate because there is no cache yet (week5-transactions.md).
     recover_if_needed(pager.path, pager)
-    pool = BufferPool(pager)
+    pool = BufferPool(pager, pool_capacity)
     catalog = Catalog(pager, pool)
     catalog.load()
 

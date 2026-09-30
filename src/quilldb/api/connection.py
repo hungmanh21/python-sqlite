@@ -68,6 +68,7 @@ from quilldb.sql.binder import (
     bind,
 )
 from quilldb.sql.parser import parse
+from quilldb.storage.bufferpool import DEFAULT_POOL_CAPACITY
 from quilldb.txn.transaction import Transaction
 
 if TYPE_CHECKING:
@@ -697,7 +698,7 @@ class Connection:
 
 
 
-def connect(path: str | Path) -> Connection:
+def connect(path: str | Path, *, pool_capacity: int = DEFAULT_POOL_CAPACITY) -> Connection:
     """Open an existing database or create a new one, returning a single
     Connection bound to the calling thread.
 
@@ -709,4 +710,4 @@ def connect(path: str | Path) -> Connection:
     """
     from quilldb.api.database import open_database
 
-    return open_database(path).connect()
+    return open_database(path, pool_capacity=pool_capacity).connect()
