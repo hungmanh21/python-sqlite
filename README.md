@@ -282,5 +282,8 @@ $ quilldb inspect mydata.db             # dump a file's header
 | `guide.md` | What this thing *is*, in plain language |
 | `docs/theory/` | *Why* it's shaped that way — mirrors `src/quilldb/` package for package |
 | `docs/implementation/` | Exact contracts and the tests that define "done" |
-| `docs/concurrency.md` | The isolation level, and what it permits |
+| [`docs/architecture.md`](docs/architecture.md) | How the layers fit, and one query traced end to end |
+| [`docs/file-format.md`](docs/file-format.md) | What is on disk, and what is refused |
+| [`docs/durability.md`](docs/durability.md) | Why a crash cannot corrupt it, and what is not guaranteed |
+| [`docs/concurrency.md`](docs/concurrency.md) | The isolation level, and what it permits |
 | `docs/decisions/` | ADRs for deliberate departures from the obvious design |
