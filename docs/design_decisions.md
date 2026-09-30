@@ -335,6 +335,7 @@ whether false-positive aborts (avoidance) or bookkeeping (detection) cost you mo
 This page is an index. Every "why" above is argued in full — with the empirical verification, the
 counterexample, and the "say this out loud" version — in its linked chapter under `docs/theory/`, and the
 signatures/tests to build against are in the matching `docs/implementation/week-N-*.md`. The ADRs in
-`docs/decisions/` are the fullest record for decisions that have one written; not every row above has an
-ADR yet (see [`week8-presentation.md` §48](implementation/week8-presentation.md) for the list being written) —
-until it does, the chapter is the source of truth.
+`docs/decisions/` are the fullest record for decisions that have one written; the rows behind ADRs 001 to 008 are
+argued in full there, and for any other row the chapter is the source of truth. Hash aggregation and
+`quill_stat1` are the two decisions above with the most to say and no ADR of their own yet
+(`quill_stat1` is covered inside [ADR-007](decisions/ADR-007-cost-model-and-exhaustive-join-search.md)).

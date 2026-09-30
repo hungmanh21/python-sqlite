@@ -260,9 +260,19 @@ $ quilldb inspect mydata.db             # dump a file's header
 
 - [`docs/design_decisions.md`](docs/design_decisions.md) — one page: what's the same as SQLite, what's
   different on purpose, what was cut, and why.
-- [`docs/decisions/`](docs/decisions/) — ADRs for the deliberate departures from the obvious design
-  (start with [ADR-001](docs/decisions/ADR-001-bufferpool-raw-pages.md): the buffer pool caches raw
-  page bytes, not parsed pages).
+- [`docs/decisions/`](docs/decisions/) — one ADR per deliberate departure from the obvious design, each
+  with context, decision, consequences and the alternatives that were rejected:
+
+  | ADR | Decision |
+  |---|---|
+  | [001](docs/decisions/ADR-001-bufferpool-raw-pages.md) | The buffer pool caches raw page bytes, not parsed pages |
+  | [002](docs/decisions/ADR-002-sqlite-format-one-direction.md) | SQLite's exact on-disk format, in one direction only |
+  | [003](docs/decisions/ADR-003-iterator-pipeline-not-bytecode.md) | A pull-based iterator pipeline, not a bytecode VM |
+  | [004](docs/decisions/ADR-004-undo-journal-not-wal.md) | An undo journal, not a write-ahead log |
+  | [005](docs/decisions/ADR-005-no-sibling-merging.md) | Free empty pages, but never merge underfull siblings |
+  | [006](docs/decisions/ADR-006-table-level-2pl-with-deadlock-detection.md) | Table-level strict 2PL with deadlock detection |
+  | [007](docs/decisions/ADR-007-cost-model-and-exhaustive-join-search.md) | A page-cost model and exhaustive left-deep join search |
+  | [008](docs/decisions/ADR-008-repack-pages-on-delete.md) | Repack a page on delete instead of keeping freeblocks |
 
 ## Documentation
 

@@ -348,6 +348,20 @@ that material into the four headings, and add the alternatives section where the
 | 008 | Repack pages on delete instead of maintaining freeblocks                           | chapter 02 §2.4, chapter 10 §10.1                                                   |
 
 
+**Status: ADRs 002 to 008 written ✅** (`docs/decisions/`, one per row above, linked from the README). Notes on
+how they were written, since the plan called it a harvest: each restates reasoning from `design_decisions.md`
+and the cited chapters, and every "Consequences" section quotes numbers this week measured, or says
+explicitly that something was **not measured** (ADR-003's per-row dispatch cost, ADR-008's delete cost).
+Two findings changed what the ADR says: **ADR-005** is about *underfull* pages, not empty ones (the index
+tree does merge and rotate, because real `sqlite3` rejects a zero-cell page), and deleting 90% of 20,000
+rows freed **0** pages in quilldb against **316** in SQLite 3.50.4, with a full scan of the survivors still
+reading 360 pages; **ADR-007** records that the page-cost model does not use an index on a join column at
+small sizes. `quill_stat1` is folded into ADR-007. **Hash aggregation has no ADR**, and the plan's own advice
+was that it is a better candidate than 005 or 008; adding it as ADR-009 is the open decision.
+ADR-001 still carries its TODO about whether the decoded-page overlay was ever profiled.
+
+
+
 ADR 007's title changed from "three-table search": the search enumerates every legal order with no hard
 cap, and it is only *cheap* at three tables. Say so in the ADR rather than claiming a limit the code
 doesn't enforce.
