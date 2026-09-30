@@ -5,7 +5,8 @@
 
 ![python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)
 ![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)
-<!-- TODO: CI and coverage badges once .github/workflows/ci.yml exists. -->
+[![CI](https://github.com/hungmanh21/python-sqlite/actions/workflows/ci.yml/badge.svg)](https://github.com/hungmanh21/python-sqlite/actions/workflows/ci.yml)
+<!-- No coverage badge: it needs a third-party service. CI prints coverage in its log. -->
 
 quilldb is a paged storage layer, an LRU buffer pool, B+tree tables and indexes, a hand-written SQL
 parser and iterator-based executor with a statistics-driven cost-based optimizer, crash-safe
@@ -56,7 +57,10 @@ print(db.execute("SELECT age, COUNT(*) FROM users GROUP BY age ORDER BY age LIMI
 db.close()
 
 # The file is a real SQLite database: the standard library's sqlite3 checks it.
-print(sqlite3.connect(path).execute("PRAGMA integrity_check").fetchone()[0])
+# CI runs this script, so a corrupt file fails the build.
+result = sqlite3.connect(path).execute("PRAGMA integrity_check").fetchone()[0]
+print(result)
+assert result == "ok", result
 ```
 
 ```text

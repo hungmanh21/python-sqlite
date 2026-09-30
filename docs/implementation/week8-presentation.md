@@ -509,6 +509,17 @@ fault. The demo script and README must not claim more than that.
 ## 50. CI
 
 
+**Status: written ✅, not yet run on GitHub.** `.github/workflows/ci.yml` has two jobs: `test` (3.12 and
+3.13: `ruff check .`, `mypy --strict src/quilldb`, the fast suite with coverage, the README example, and
+`python -m quilldb.bench --list`) and `slow` (3.13 only, `pytest -m slow`). Every command was run locally
+and passes (the fast suite: 1,593 tests, 96% coverage, about 6 minutes), but the workflow itself has not
+run, and the slow suite was not run in this pass. Deviations from the sketch below: the example writes to a
+temp directory and **asserts** `integrity_check == "ok"` with the standard library's `sqlite3`, instead of a
+separate `sqlite3` CLI step; `ruff check .` covers `examples/` too; coverage is printed in the log and there
+is no coverage badge (it needs a third-party service). The README's CI badge points at
+`hungmanh21/python-sqlite`, so it stays grey until the first run.
+
+
 ```yaml
 # .github/workflows/ci.yml
 strategy:

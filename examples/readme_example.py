@@ -24,4 +24,7 @@ print(db.execute("SELECT age, COUNT(*) FROM users GROUP BY age ORDER BY age LIMI
 db.close()
 
 # The file is a real SQLite database: the standard library's sqlite3 checks it.
-print(sqlite3.connect(path).execute("PRAGMA integrity_check").fetchone()[0])
+# CI runs this script, so a corrupt file fails the build.
+result = sqlite3.connect(path).execute("PRAGMA integrity_check").fetchone()[0]
+print(result)
+assert result == "ok", result

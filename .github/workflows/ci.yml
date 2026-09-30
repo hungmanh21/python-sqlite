@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, week8]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Not 3.11: the library uses PEP 695 syntax (type parameters).
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      # The library only. src/tests/ is deliberately not type-checked.
+      - run: mypy --strict src/quilldb
+      # Coverage is printed in the log; publishing a badge needs a third-party service.
+      - run: pytest src/tests -m "not slow" --cov=quilldb --cov-report=term
+      # One example, two guarantees: the README's code runs, and the file it writes
+      # passes PRAGMA integrity_check in real SQLite (the script asserts "ok").
+      - run: python examples/readme_example.py
+      # The benchmark runner is what the README's numbers come from; check it starts.
+      - run: python -m quilldb.bench --list
+
+  slow:
+    # The crash matrix and the concurrency stress test: minutes, not seconds. One Python
+    # version is enough; the fast suite already covers both.
+    name: slow tests (python 3.13)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: pytest src/tests -m slow
