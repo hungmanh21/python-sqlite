@@ -42,8 +42,13 @@ def build(path: pathlib.Path, *, with_index: bool) -> None:
     db.execute("CREATE TABLE users (id INTEGER, email TEXT, name TEXT)")
     if with_index:
         db.execute("CREATE INDEX ix_email ON users (email)")
+    # One transaction: an autocommitted INSERT syncs the journal and the file
+    # (~15 ms each), which is 100,000 syncs of setup and, in the write-side
+    # measurement below, a cost that dwarfs the thing being measured.
+    db.execute("BEGIN")
     for i in range(1, ROWS + 1):
         db.execute("INSERT INTO users VALUES (?, ?, ?)", _row(i))
+    db.execute("COMMIT")
     db.close()
 
 
@@ -71,9 +76,15 @@ def measure_insert_cost(tmp: pathlib.Path, index_count: int, rows: int = 5_000) 
     db.execute("CREATE TABLE users (id INTEGER, email TEXT, name TEXT)")
     for column in ("email", "name", "id")[:index_count]:
         db.execute(f"CREATE INDEX ix_{column} ON users ({column})")
+    # Inside one transaction so the number is the cost of maintaining the
+    # indexes (page reads and writes, encoding), not of one fsync per row,
+    # which at ~15 ms swamps it: measured per-statement, 0 vs 3 indexes
+    # differ by only 1.11x.
+    db.execute("BEGIN")
     started = time.perf_counter()
     for i in range(1, rows + 1):
         db.execute("INSERT INTO users VALUES (?, ?, ?)", _row(i))
+    db.execute("COMMIT")
     elapsed = time.perf_counter() - started
     db.close()
     return elapsed * 1000 / rows

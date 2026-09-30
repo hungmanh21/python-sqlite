@@ -1,20 +1,8 @@
-"""`python -m quilldb.bench` -- run every benchmark that exists, in order.
+"""`python -m quilldb.bench` -- see run_all.py. Each benchmark also runs alone:
 
-Each benchmark builds its own database in a temp directory, so this takes no
-path argument. The individual modules can also be run alone:
-
-    python -m quilldb.bench.index_lookup
-    python -m quilldb.bench.concurrent
+    python -m quilldb.bench.hit_rate
 """
 
-from quilldb.bench import concurrent, index_lookup
+from quilldb.bench.run_all import main
 
-
-def main() -> None:
-    index_lookup.main()
-    print()
-    concurrent.main()
-
-
-if __name__ == "__main__":
-    main()
+raise SystemExit(main())
