@@ -634,3 +634,17 @@ def test_pool_reused_page_leaves_no_outstanding_pin(pager) -> None:
 
 
 
+
+
+def test_allocate_page_respects_capacity_outside_a_transaction(tmp_path) -> None:
+    """Allocating past capacity evicts; the cache must not grow without bound.
+
+    Found by the insert benchmark: splits allocate pages, allocation never
+    evicted, and a tree that never missed held every page it had ever made.
+    """
+    pager = Pager.create(tmp_path / "cap.db")
+    pool = BufferPool(pager, capacity=8)
+    for _ in range(50):
+        pool.allocate_page()
+    assert len(pool._cache) <= 8
+    pager.close()

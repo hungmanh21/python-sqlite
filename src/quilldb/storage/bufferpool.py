@@ -48,8 +48,12 @@ class _Entry:
 
 
 
+# Pages, not bytes: 128 x 4 KiB = 512 KiB.
+DEFAULT_POOL_CAPACITY = 128
+
+
 class BufferPool:
-    def __init__(self, pager: Pager, capacity: int = 128) -> None:
+    def __init__(self, pager: Pager, capacity: int = DEFAULT_POOL_CAPACITY) -> None:
         """A pool over `pager` holding at most `capacity` pages at once."""
         self._pager = pager
         self._capacity = capacity
@@ -371,6 +375,16 @@ class BufferPool:
                 self._unpin_locked(page_id)
                 return page_id
             else:
+                # A new page is a cache insert like any other, so it evicts
+                # like any other. Without this the pool is only bounded on
+                # the read path (get_page): a tree that only ever allocates
+                # and re-hits pages never misses, never evicts, and the
+                # "64-page pool" quietly holds every page it has ever made.
+                # Under a transaction _evict_one() still declines to spill
+                # dirty pages (no-steal), so the pool grows exactly as
+                # before there.
+                if len(self._cache) >= self._capacity:
+                    self._evict_one()
                 self._pager._header.page_count += 1
                 page_id = self._pager._header.page_count
                 self._cache[page_id] = _Entry(data=bytearray(PAGE_SIZE), pin_count=0, dirty=True)

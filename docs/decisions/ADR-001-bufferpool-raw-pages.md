@@ -95,3 +95,14 @@ page that would have to be invalidated. That is a design argument, not a measure
 
 
 
+
+
+**Found by a benchmark (week 8): capacity was only enforced on reads.** `BufferPool.allocate_page` inserted
+the new page into the cache without checking `capacity`, and eviction only ran inside `get_page` on a miss.
+A tree that only allocates and re-hits its own pages never missed, so it never evicted: the insert benchmark
+built a 517-page tree through a "64-page" pool and reported 1 read, because the pool held all 516 pages it
+had touched. `allocate_page` now evicts at capacity like `get_page` does (under a transaction `_evict_one`
+still declines to spill dirty pages, so no-steal behaviour is unchanged). Regression test:
+`test_allocate_page_respects_capacity_outside_a_transaction`. The corrected numbers, 20,000 rows through a
+64-page pool: sequential inserts 1 read, random inserts 12,259 (0.61 per insert); a cold search of every key
+reads 363 pages sequentially and 16,580 in random order. The search numbers do not depend on the fix.
