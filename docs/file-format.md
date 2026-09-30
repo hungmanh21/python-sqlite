@@ -1,8 +1,10 @@
 # File format: what is on disk
 
 A quilldb database is a **real SQLite 3 file**, byte for byte. There is no quilldb-specific container:
-`sqlite3 file.db` opens it, `PRAGMA integrity_check` returns `ok`, and a file SQLite wrote can be read
-back (within the limits in [What is refused](#what-is-refused-and-why)). The reference is
+`sqlite3 file.db` opens it and `PRAGMA integrity_check` returns `ok`. The direction matters: quilldb
+*writes* the format faithfully, but it does not promise to *read* every file SQLite writes (it does not
+parse freeblock chains, for one; see [What is refused](#what-is-refused-and-why) and
+[ADR-002](decisions/ADR-002-sqlite-format-one-direction.md)). The reference is
 [sqlite.org/fileformat2.html](https://www.sqlite.org/fileformat2.html); every offset and type code in
 [`constants.py`](../src/quilldb/constants.py) is copied from it, not invented.
 
@@ -204,8 +206,9 @@ and that deletion is the commit point.
 
 ## What is refused, and why
 
-Opening a file that SQLite wrote is fine when it stays within this list. Otherwise quilldb raises
-`InvalidHeaderError` rather than misreading bytes. Each refusal is one place where a different value would
+quilldb makes no promise to read arbitrary SQLite-written files. What it does promise is to refuse the
+header settings below with `InvalidHeaderError` rather than misread bytes. (Freeblock chains, which
+SQLite maintains and quilldb does not, are a separate gap the header cannot flag.) Each refusal is one place where a different value would
 change *where bytes live or what they mean*:
 
 | If the header says | quilldb | Why |

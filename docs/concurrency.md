@@ -1,8 +1,10 @@
 # Concurrency in quilldb
 
-Written before `txn/locks.py`, per [chapter 15 §15.8](theory/txn/15-isolation-anomalies.md#158-what-youre-building-this-week):
-naming the isolation level first is what forces the decisions that are painful to retrofit — like
-"when do read locks get released" — rather than discovering them in session 6.
+The isolation level was named before `txn/locks.py` was written, per
+[chapter 15 §15.8](theory/txn/15-isolation-anomalies.md#158-what-youre-building-this-week): deciding
+it first is what forces the choices that are painful to retrofit, like "when do read locks get
+released". The implementation now exists and the checklist at the bottom records what was confirmed
+against it. The design rationale is [ADR-006](decisions/ADR-006-table-level-2pl-with-deadlock-detection.md).
 
 ## Isolation level
 

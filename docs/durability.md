@@ -6,7 +6,7 @@ and [`docs/theory/txn/14-crash-recovery.md`](theory/txn/14-crash-recovery.md).
 
 ## The commit point, precisely
 
-A transaction is committed the instant `Journal.delete()` (`src/quilldb/txn/journal.py:251`) returns
+A transaction is committed the instant `Journal.delete()` (in `src/quilldb/txn/journal.py`) returns
 — its own docstring says so: `"""Unlink. THE COMMIT POINT."""`. Not `commit_barrier()`, even though
 that's where the journal becomes *valid* (magic + `nRec` stamped, §13.4 step 3.7) and where the new
 page data is physically written to the database file (`flush_all()` + `pager.sync()`, step 3.9–3.10).
@@ -74,7 +74,7 @@ Volunteering these is stronger than being asked about them.
 - **A lost page cache.** Killing a process (what every test here does) leaves the OS page cache intact
   and the kernel finishes pending writes on its own. A real power cut does not. Nothing here simulates
   that; it needs a VM snapshot or an actual power cut.
-- **No directory fsync after `unlink()`.** `Journal.delete()` (`journal.py:251`) calls `self.path.unlink()`
+- **No directory fsync after `unlink()`.** `Journal.delete()` calls `self.path.unlink()`
   directly, with no following `os.fsync()` on the parent directory. `commit_barrier()` *does* fsync the
   directory once, after journal creation (§13.4 step 3.5) — but the corresponding fsync after deletion,
   which would make the journal's *absence* durable as promptly as its presence was, is not implemented.
@@ -88,16 +88,17 @@ Volunteering these is stronger than being asked about them.
   every crash test here, because rollback would faithfully restore the already-broken state. The guard
   against that class of bug is the byte-identical rollback hash test (`test_transaction.py`,
   hash-before-`BEGIN` vs. hash-after-`ROLLBACK`), not this matrix.
-- **Single-process, single-writer.** `recover_if_needed()`'s own docstring says so directly: the
-  two-processes-race-to-recover and stale-lock hazards (§14.2) don't apply yet because there's no
-  locking (chapter 16, week 6) to race over. A hot journal today only ever comes from *this* process
-  having crashed, not a concurrent one.
+- **Single-process.** Locks (`txn/locks.py`) coordinate *threads*, not processes: they are in-memory
+  objects, not file locks. Two processes opening the same file would race to recover a hot journal
+  and would not see each other's locks (§14.2's hazards). Recovery assumes a hot journal came from a
+  process that has died, not from a concurrent writer. Within one process, the single-writer rule in
+  [concurrency.md](concurrency.md) keeps commits serial.
 - **Max transaction size is bounded by RAM, not by the buffer pool's configured capacity.** No-steal
   forbids evicting a dirty, uncommitted page early, so growing the pool past capacity (what
   `multi_page_txn` exercises) is correct behavior, not a leak — but it also means a transaction's
-  entire dirty set has to fit in memory. There is no spill-to-disk path, and none is planned this week;
-  ARIES-style logging is the real answer to that limit, and adopting it is a deliberate non-goal for
-  week 5 (§0.1).
+  entire dirty set has to fit in memory. There is no spill-to-disk path;
+  ARIES-style logging is the real answer to that limit, and adopting it is a deliberate non-goal
+  (week 5 spec §0.1, [ADR-004](decisions/ADR-004-undo-journal-not-wal.md)).
 
 ## The honest one-sentence version
 

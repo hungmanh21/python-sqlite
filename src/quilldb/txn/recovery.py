@@ -7,10 +7,11 @@ journal.delete() of Transaction.commit()/rollback(). Its existence alone is
 the crash signal -- there is no other bookkeeping, because the crashed
 process never got a chance to write any.
 
-quilldb is single-process/single-writer this week (week 6 adds real
-locking), so the two-processes-race-to-recover and stale-lock hazards
-chapter 14 SS14.2 describes don't apply yet: recover_if_needed() is simply
-called once, synchronously, before anything else touches the file.
+quilldb's locks coordinate threads within one process, not separate
+processes, so the two-processes-race-to-recover and stale-lock hazards
+chapter 14 SS14.2 describes are not handled: recover_if_needed() is simply
+called once, synchronously, before anything else touches the file, and
+assumes a hot journal belongs to a process that has died.
 """
 
 from pathlib import Path

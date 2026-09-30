@@ -286,4 +286,5 @@ $ quilldb inspect mydata.db             # dump a file's header
 | [`docs/file-format.md`](docs/file-format.md) | What is on disk, and what is refused |
 | [`docs/durability.md`](docs/durability.md) | Why a crash cannot corrupt it, and what is not guaranteed |
 | [`docs/concurrency.md`](docs/concurrency.md) | The isolation level, and what it permits |
+| [`docs/demo.md`](docs/demo.md) | The demo: shot list with real output, and the five-minute talk |
 | `docs/decisions/` | ADRs for deliberate departures from the obvious design |
