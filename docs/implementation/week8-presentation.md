@@ -69,16 +69,24 @@ they get fixed **first**, before any presentation work depends on them.
   when run as a script — a hazard the current file's docstring works around.
 
 
-**Code changes this week depends on (each is small):**
+**Code changes this week depends on (each is small).** All five are done (✅) as of the Session 0 commits;
+the harness move only relocated the two existing scripts and added `python -m quilldb.bench` — the
+`run_all` table generator is still Session 1's job. Two notes on what actually landed:
+
+
+- The `SeqScan` annotation reversed a deliberate earlier test ("annotate `IndexScan` only"), and `est_rows`
+  keeps `IndexScan`'s meaning — the estimate *after* the residual filter — not the rows the scan emits.
+- `pyproject.toml` lists the dev tools twice, as a `dev` extra (what `pip install -e ".[dev]"` and CI use)
+  and as a `[dependency-groups]` entry (what `uv sync` uses). They must be kept in step by hand.
 
 
 | Change | Why the plan needs it |
 | --- | --- |
-| `EXPLAIN ANALYZE` reports `pages_read` (and `rows_examined`) next to `actual_rows` / `elapsed` — `api/connection.py` around line 590 | Demo step 7 is "THE MOMENT" and today it prints only `actual_rows=… elapsed=…`. The counters already exist (`pool.misses`, `pool.rows_examined`). |
-| `EXPLAIN` shows `est_rows` / `cost` on the `SeqScan` line too, not just `IndexScan` | Demo step 4 promises "SeqScan, est_rows and cost". Today it prints a bare `SeqScan users`. The planner already computes the sequential cost to compare against. |
-| `pyproject.toml`: rename `sqlite-scratch` → `quilldb`, real description, move `hypothesis`/`pytest` out of runtime `dependencies`, add `pytest-cov`, add a `dev` extra, set mypy `files = ["src/quilldb"]`, `requires-python` stays `>=3.12` | `pip install -e ".[dev]"` finds no `dev` extra today (dev tools are in `[dependency-groups]`, which is uv's mechanism); `pytest-cov` isn't installed anywhere; and a stranger's `pip install -e .` shouldn't pull in test tools. |
-| Fix `storage/bufferpool.py:35` (imports `PAGE_SIZE` from `storage.pager`, which doesn't re-export it — import it from `quilldb.constants`) | The only `mypy --strict src/quilldb` error; CI would fail on it. |
-| Move `benchmarks/*.py` into `src/quilldb/bench/`, expose `python -m quilldb.bench` | See the decision above; the README's `python benchmarks/…` lines change with it. |
+| ✅ `EXPLAIN ANALYZE` reports `pages_read` (and `rows_examined`) next to `actual_rows` / `elapsed` — `api/connection.py` around line 590 | Demo step 7 is "THE MOMENT" and today it prints only `actual_rows=… elapsed=…`. The counters already exist (`pool.misses`, `pool.rows_examined`). |
+| ✅ `EXPLAIN` shows `est_rows` / `cost` on the `SeqScan` line too, not just `IndexScan` | Demo step 4 promises "SeqScan, est_rows and cost". Today it prints a bare `SeqScan users`. The planner already computes the sequential cost to compare against. |
+| ✅ `pyproject.toml`: rename `sqlite-scratch` → `quilldb`, real description, move `hypothesis`/`pytest` out of runtime `dependencies`, add `pytest-cov`, add a `dev` extra, set mypy `files = ["src/quilldb"]`, `requires-python` stays `>=3.12` | `pip install -e ".[dev]"` finds no `dev` extra today (dev tools are in `[dependency-groups]`, which is uv's mechanism); `pytest-cov` isn't installed anywhere; and a stranger's `pip install -e .` shouldn't pull in test tools. |
+| ✅ Fix `storage/bufferpool.py:35` (imports `PAGE_SIZE` from `storage.pager`, which doesn't re-export it — import it from `quilldb.constants`) | The only `mypy --strict src/quilldb` error; CI would fail on it. |
+| ✅ Move `benchmarks/*.py` into `src/quilldb/bench/`, expose `python -m quilldb.bench` | See the decision above; the README's `python benchmarks/…` lines change with it. |
 
 
 **Docs that were stale at the week 7 merge** (fixed alongside this rewrite; listed so they stay fixed):
@@ -229,10 +237,10 @@ font size.
 1. quilldb shell demo.db
 2. CREATE TABLE users (...); a few INSERTs
 3. SELECT ... WHERE active=1 AND email=?  -> rows come back
-4. EXPLAIN the same query                 -> SeqScan, est_rows and cost      (needs the session 0 change)
+4. EXPLAIN the same query                 -> SeqScan, est_rows and cost
 5. CREATE INDEX idx_active; CREATE INDEX idx_email; ANALYZE
 6. EXPLAIN again                          -> chooses selective idx_email, not first idx_active
-7. EXPLAIN ANALYZE the query              -> actual pages_read=<N>   ← THE MOMENT (needs session 0)
+7. EXPLAIN ANALYZE the query              -> actual pages_read=<N>   ← THE MOMENT
 8. !sqlite3 demo.db "PRAGMA integrity_check"   -> ok                 ← THE OTHER MOMENT
 ```
 

@@ -1,12 +1,23 @@
 [project]
-name = "sqlite-scratch"
+name = "quilldb"
 version = "0.1.0"
-description = "Add your description here"
+description = "A relational database engine written from scratch in pure Python, writing SQLite's on-disk file format."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
+# Runtime is stdlib-only on purpose. Test and lint tools live in the `dev` extra below.
+dependencies = []
+
+
+[project.optional-dependencies]
+# `pip install -e ".[dev]"` -- what CI and a fresh checkout use. Keep in step with
+# [dependency-groups] below, which is the same list for `uv sync`.
+dev = [
     "hypothesis>=6.167.1",
+    "mypy>=2.3.1",
     "pytest>=9.1.1",
+    "pytest-cov>=6.0",
+    "pytest-timeout>=2.3.1",
+    "ruff>=0.16.6",
 ]
 
 
@@ -31,7 +42,9 @@ addopts = "-m 'not slow'"
 
 [tool.mypy]
 strict = true
-files = ["src"]
+# The library only. src/tests/ has ~500 missing-annotation errors that are deliberately
+# not fixed; CI runs `mypy --strict src/quilldb`, and plain `mypy` now agrees with it.
+files = ["src/quilldb"]
 
 
 [tool.ruff]
@@ -39,8 +52,12 @@ line-length = 100
 
 
 [dependency-groups]
+# Same list as the `dev` extra above, for `uv sync`.
 dev = [
+    "hypothesis>=6.167.1",
     "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=6.0",
     "pytest-timeout>=2.3.1",
     "ruff>=0.16.6",
 ]

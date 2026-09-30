@@ -58,12 +58,15 @@ mypy
 quilldb inspect path/to/file.db
 ```
 
-Note: `pyproject.toml`'s `testpaths = ["tests"]` doesn't match the actual `src/tests/` layout —
-pytest falls back to recursive discovery from cwd and still finds everything, just with a
-`PytestConfigWarning`. Run pytest from the repo root.
+Run pytest from the repo root (`testpaths = ["src/tests"]`).
 
-`mypy` is configured `strict = true` over `files = ["src"]` — new code is expected to pass strict
-mode, not incrementally typed.
+`mypy` is configured `strict = true` over `files = ["src/quilldb"]` — the library only, and new code
+is expected to pass strict mode, not incrementally typed. `src/tests/` is deliberately not
+type-checked (it has ~500 missing-annotation errors that are not being fixed), and CI runs
+`mypy --strict src/quilldb` to match.
+
+Benchmarks live in the package: `python -m quilldb.bench` runs them all, or run one with
+`python -m quilldb.bench.index_lookup` / `python -m quilldb.bench.concurrent`.
 
 ## Architecture
 
