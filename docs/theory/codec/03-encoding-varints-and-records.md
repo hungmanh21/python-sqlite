@@ -3,7 +3,7 @@
 
 > **Read before week 1 sessions 2 and 7** (`codec/varint.py`, `codec/record.py`).
 >
-> **Time:** ~30 minutes. **Prerequisite:** [chapter 02](02-slotted-page.md).
+> **Time:** ~30 minutes. **Prerequisite:** [chapter 02](../storage/02-slotted-page.md).
 >
 > ⚠️ **This chapter settled two questions that used to be open in your repo, and both are now decided in `constants.py`.** `MAX_VARINT_BYTES` is **9**, not 10 — §3.4 derives why. And there is **no zigzag encoding** — §3.5 explains what SQLite does instead, and why zigzag is a good idea that doesn't belong in this format. Read both before you write `codec/varint.py`; changing either later means regenerating every test fixture you own.
 
@@ -736,7 +736,7 @@ Test 6 is the one that gets skipped and it's the one that matters in week 8's co
 ---
 
 
-**Next:** [04 — The buffer pool](04-buffer-pool.md) — caching from first principles, and why the textbook eviction policy is actively wrong for the most common query you'll run.
+**Next:** [04 — The buffer pool](../storage/04-buffer-pool.md) — caching from first principles, and why the textbook eviction policy is actively wrong for the most common query you'll run.
 
 
 

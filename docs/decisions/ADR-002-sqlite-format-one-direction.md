@@ -39,7 +39,7 @@ checksum), but its byte layout is quilldb's own, because `sqlite3` never has to 
 ## Consequences
 
 
-- The acceptance test is external and objective. `src/tests/differential/` (287 tests) runs the same SQL
+- The acceptance test is external and objective. `src/tests/differential/` (294 tests) runs the same SQL
   through quilldb and real `sqlite3` and diffs the results, and the README example ends by asking the
   standard library's `sqlite3` to check the file it wrote; CI runs that example.
 - A bug in the format is caught even when quilldb is self-consistent. Two of the bugs in `NOTES.md`

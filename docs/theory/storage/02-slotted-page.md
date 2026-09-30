@@ -533,7 +533,7 @@ Invariant 5 is the one to be careful about. "Check space, then mutate" must be g
 ---
 
 
-**Next:** [03 — Encoding: varints and records](03-encoding-varints-and-records.md) — why a small number shouldn't cost 8 bytes, and how to read column 5 without decoding columns 1 through 4.
+**Next:** [03 — Encoding: varints and records](../codec/03-encoding-varints-and-records.md) — why a small number shouldn't cost 8 bytes, and how to read column 5 without decoding columns 1 through 4.
 
 
 

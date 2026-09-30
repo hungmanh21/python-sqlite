@@ -3,7 +3,7 @@
 
 > **Read at the start of week 1.** Covers roadmap sessions 3, 4, 5 (`storage/header.py`, `storage/pager.py`, freelist).
 >
-> **Time:** ~30 minutes. **Prerequisite:** [chapter 00](00-foundations.md), especially §0.3 (block devices) and §0.4 (why 4096).
+> **Time:** ~30 minutes. **Prerequisite:** [chapter 00](../foundations/00-foundations.md), especially §0.3 (block devices) and §0.4 (why 4096).
 
 
 ---

@@ -696,27 +696,38 @@ someone showing off a project into someone assessing one, which is what the job 
 
 - [ ] A stranger can clone, `pip install -e .`, paste the README example, and have it work **first try** —
       tested on a clean checkout in a fresh virtualenv
-- [ ] CI runs the README example, so it cannot rot
-- [ ] CI runs `sqlite3 ... PRAGMA integrity_check` on a quilldb-written file — the format claim is enforced
+      *OPEN: the example runs (`python examples/readme_example.py` prints `ok`), but a fresh-venv `pip install -e .` was never tested: the sandbox cannot reach PyPI.*
+- [x] CI runs the README example, so it cannot rot
+      *the workflow has it; the workflow itself has not run on GitHub yet.*
+- [x] CI runs `sqlite3 ... PRAGMA integrity_check` on a quilldb-written file — the format claim is enforced
+      *the example asserts `integrity_check == ok` through the stdlib `sqlite3` module.*
 - [ ] The GIF is above the fold, under 30 seconds, no typos, and includes both the `EXPLAIN` before/after
       and the `integrity_check`
+      *OPEN: postponed. The shot list is in `docs/demo.md`; the README has a placeholder comment.*
 - [ ] Benchmark table has measured numbers, states cache state and run count, and every figure agrees with
       the arithmetic
-- [ ] The table includes the two unflattering rows: per-index insert cost, and flat write throughput
-- [ ] Test-count table is generated from a real collection, with the crash-injection row called out
-- [ ] Limitations section is specific — format direction, no merging, no WAL, planner, concurrency, SQL —
+      *PARTLY: numbers and cold-pool state are stated and the arithmetic is checked, but the README does not say how many runs each figure comes from (one).*
+- [x] The table includes the two unflattering rows: per-index insert cost, and flat write throughput
+- [x] Test-count table is generated from a real collection, with the crash-injection row called out
+      *re-counted from `pytest --collect-only`: 1,712 = 1,301 + 294 + 87 + 30, 75 slow.*
+- [x] Limitations section is specific — format direction, no merging, no WAL, planner, concurrency, SQL —
       and is a single list, reconciled with the README's existing "Not implemented"
-- [ ] Four `docs/*.md` written; `durability.md` names the commit point **and** the non-guarantees;
+- [x] Four `docs/*.md` written; `durability.md` names the commit point **and** the non-guarantees;
       `concurrency.md` names the isolation level **and** what it permits
-- [ ] `architecture.md`'s diagram matches the actual module layout
-- [ ] 6–8 ADRs, each with a real "alternatives considered" section
+- [x] `architecture.md`'s diagram matches the actual module layout
+      *checked against the imports; two deliberate upward references are stated in the doc.*
+- [x] 6–8 ADRs, each with a real "alternatives considered" section
+      *nine, ADR-001 to ADR-009.*
 - [ ] CI green on 3.12 / 3.13 with `mypy --strict src/quilldb` and `ruff`; badges on line 2
-- [ ] `EXPLAIN ANALYZE` reports `pages_read`, so the demo's central moment is real output, not a mock-up
-- [ ] No stale docs: `design_decisions.md` statuses match the code, and every link from the README and
+      *OPEN: `ruff` and `mypy --strict` pass locally; the workflow has not run on GitHub. The badges are below the pitch (line 5), not on line 2, a deliberate choice in the README restructure.*
+- [x] `EXPLAIN ANALYZE` reports `pages_read`, so the demo's central moment is real output, not a mock-up
+- [x] No stale docs: `design_decisions.md` statuses match the code, and every link from the README and
       `docs/theory/README.md` resolves
-- [ ] `quilldb shell` is a working REPL; `quilldb validate` runs both validators
+      *a script found every link in README and docs resolves; it found and fixed six broken relative links in `docs/theory`. Statuses in `design_decisions.md` were spot-checked, not audited row by row.*
+- [x] `quilldb shell` is a working REPL; `quilldb validate` runs both validators
 - [ ] The 5-minute demo delivered twice, out loud, from memory
-- [ ] `docs/theory/` linked from the README — twenty chapters of design rationale is a differentiator, and
+      *OPEN: script in `docs/demo.md`; not yet rehearsed.*
+- [x] `docs/theory/` linked from the README — twenty chapters of design rationale is a differentiator, and
       an unlinked directory is an invisible one
 
 

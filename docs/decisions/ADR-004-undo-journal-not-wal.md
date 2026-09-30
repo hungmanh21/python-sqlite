@@ -34,7 +34,7 @@ an open transaction is never evicted.
 
 
 - **The commit protocol is small enough to crash-test exhaustively.** The crash matrix
-  (`src/tests/fault_injection/`, 83 tests, 65 of them marked slow) injects a crash at every write and sync
+  (`src/tests/fault_injection/`, 87 tests, 69 of them marked slow) injects a crash at every write and sync
   boundary of a commit, and a second crash during recovery itself, and asserts the database is either
   entirely pre-transaction or entirely post-transaction.
 - **Torn pages are handled by construction.** The journal stores whole original pages, not deltas, so

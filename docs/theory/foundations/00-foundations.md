@@ -848,7 +848,7 @@ Latency figures in §0.2 are conventional industry numbers (the "latency numbers
 ---
 
 
-**Next:** [01 — Pages and the pager](01-pages-and-pager.md) — why fixed-size numbered pages beat every alternative, and why the pager indirection is the most valuable boundary you'll draw all project.
+**Next:** [01 — Pages and the pager](../storage/01-pages-and-pager.md) — why fixed-size numbered pages beat every alternative, and why the pager indirection is the most valuable boundary you'll draw all project.
 
 
 

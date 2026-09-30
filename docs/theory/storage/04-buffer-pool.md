@@ -3,7 +3,7 @@
 
 > **Read before week 1 session 7** (`storage/bufferpool.py`).
 >
-> **Time:** ~35 minutes. **Prerequisite:** [chapter 00](00-foundations.md) §0.2 (latency), [chapter 01](01-pages-and-pager.md) §1.7 (the pager boundary).
+> **Time:** ~35 minutes. **Prerequisite:** [chapter 00](../foundations/00-foundations.md) §0.2 (latency), [chapter 01](01-pages-and-pager.md) §1.7 (the pager boundary).
 
 
 ---

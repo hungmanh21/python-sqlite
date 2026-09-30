@@ -239,13 +239,13 @@ bug — that's what distinguishes a documented deviation from an undocumented on
 
 ## Testing
 
-1,664 tests, run with `pytest` (the 71 slow ones are excluded by default; `pytest -m slow` adds them):
+1,712 tests, run with `pytest` (the 75 slow ones are excluded by default; `pytest -m slow` adds them):
 
 | Suite | Tests | What it does |
 |---|---:|---|
-| `src/tests/unit/` | 1,264 | Each layer in isolation, from varints up to the planner |
-| `src/tests/differential/` | 287 | The same SQL through quilldb and real `sqlite3`, results diffed |
-| `src/tests/fault_injection/` | 83 | Crashes injected at every write point of a commit and of recovery (65 of these are slow) |
+| `src/tests/unit/` | 1,301 | Each layer in isolation, from varints up to the planner |
+| `src/tests/differential/` | 294 | The same SQL through quilldb and real `sqlite3`, results diffed |
+| `src/tests/fault_injection/` | 87 | Crashes injected at every write point of a commit and of recovery (69 of these are slow) |
 | `src/tests/concurrency/` | 30 | Multi-threaded transfers, deadlocks, lock behaviour |
 
 ```console
