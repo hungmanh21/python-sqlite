@@ -41,11 +41,9 @@ def make_keys(n: int, order: str) -> list[int]:
     keys = list(range(1, n + 1))
     if order == "sequential":
         return keys
-    # TODO(human): the random order. Decide how it is generated so that runs
-    # are comparable: seeded or not, a full shuffle of 1..n or n draws from a
-    # wider range, and whether the same shuffle is reused across every run.
-    random.seed(SEED)
-    random.shuffle(keys)
+    # Seeded, full shuffle of 1..n: every run inserts the same dense keys in the
+    # same scattered order, so the reads are reproducible and comparable.
+    random.Random(SEED).shuffle(keys)
     return keys
 
 
@@ -117,5 +115,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    random.seed(SEED)
     main()

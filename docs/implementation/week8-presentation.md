@@ -112,6 +112,17 @@ write from scratch. Keep the existing "Deviations from SQLite" table; it's exact
 unapologetic section this chapter is asking for.
 
 
+**Status: restructured ✅.** `README.md` now follows this order: pitch, install and a self-contained example
+(`examples/readme_example.py`, run and checked on this checkout), architecture, features table, benchmarks
+(fresh numbers from `python -m quilldb.bench`), a reconciled "Not implemented" (every SQL entry probed
+against the real parser: `IN`, `BETWEEN`, `CASE`, `UNION`, scalar functions, `COUNT(DISTINCT)`, `NOT NULL`
+and `PRIMARY KEY` all fail to parse and are listed), the deviations table, test counts (1,664 = 1,264 unit +
+287 differential + 83 fault-injection + 30 concurrency), and design decisions. **Still open, each waiting on
+another item:** the demo GIF (§46), the CI and coverage badges and the CI step that runs
+`examples/readme_example.py` (§50), a `LICENSE` file (there is none, so no licence badge), and more ADR
+links (§48; only ADR-001 exists).
+
+
 ```markdown
 # quilldb
 > A SQL database engine written from scratch in pure Python.
@@ -401,7 +412,7 @@ depend on something to settle first:
     the hot set is reloaded. The floor is high because every lookup re-hits the catalog and index-root
     pages within the same query. Either soften the chapter to "the scan evicts the hot set (about 3 reads
     per lookup instead of 0 on the first pass)" or drop the number, and report reads, per chapter 19.
-    *(TODO: edit chapter 04 `docs/theory/storage/04-buffer-pool.md`, line ~314, "Say this out loud".)*
+    *(Done: chapter 04's "Say this out loud" now states the measured 100% / 67.5% / 100%.)*
 - **`btree_height_vs_rows`** ✅ done. Built at 1k / 10k / 100k rows (heights 2 / 2 / 3, measured 53.6 rows
   per leaf and 312 children per interior page); 1M / 10M / 100M are computed from that fanout and labelled
   "computed" in the output (heights 3 / 4 / 4). Building 1M+ rows takes too long to be worth it.
