@@ -142,7 +142,7 @@ quilldb needs the wait-for graph that SQLite doesn't.
   not a reserved word (B6-9)
 - [x] 20 consecutive runs of the transfer stress test, no flakes — session 7's flake hunt,
   131s–171s per run, all green
-- [x] `benchmarks/concurrent.py` reports read and write throughput separately: writes are flat
+- [x] `src/quilldb/bench/concurrent.py` reports read and write throughput separately: writes are flat
   because the single-writer lock allows exactly one commit in flight regardless of thread count;
   reads don't queue (SHARED coexists) but don't scale either, because CPython's GIL — not the
   lock manager — is the ceiling for CPU-bound work with nothing to release it

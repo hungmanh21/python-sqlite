@@ -1,4 +1,4 @@
-"""benchmarks/concurrent.py -- throughput vs thread count, for the README.
+"""quilldb.bench.concurrent -- throughput vs thread count, for the README.
 
 Reads and writes are reported separately, on purpose. A read-only
 statement takes SHARED, and SHARED locks coexist (docs/concurrency.md),
@@ -24,7 +24,7 @@ even with free threading, only one write could be in flight. Reporting
 both ceilings side by side, instead of only the number that looks good,
 is chapter 16 SS16.7's point.
 
-    python benchmarks/concurrent.py
+    python -m quilldb.bench.concurrent
 """
 
 from __future__ import annotations
@@ -91,11 +91,11 @@ def write_worker(db: Database, ops: int, seed: int) -> None:
 def measure(kind: str, threads: int, tmp: pathlib.Path) -> float:
     """Wall-clock throughput in ops/sec for `threads` concurrent workers.
 
-    Plain threading.Thread, not concurrent.futures.ThreadPoolExecutor --
-    this file is itself named concurrent.py, and running it as a script
-    (`python benchmarks/concurrent.py`) puts benchmarks/ first on
-    sys.path, so `import concurrent.futures` would resolve to this file
-    instead of the stdlib package.
+    Plain threading.Thread rather than concurrent.futures.ThreadPoolExecutor.
+    (This module used to live in a loose benchmarks/ directory, where running
+    it as a script put that directory first on sys.path and made
+    `import concurrent.futures` resolve to this very file. Inside the package
+    that hazard is gone, but there is no reason to change what works.)
     """
     db = setup(tmp / f"{kind}_{threads}.db")
     ops = WRITE_OPS_PER_THREAD if kind == "write" else READ_OPS_PER_THREAD

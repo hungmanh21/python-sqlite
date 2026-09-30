@@ -77,7 +77,7 @@ def test_an_index_examines_one_row_where_a_scan_examines_all(tmp_path) -> None:
     do not separate at this size -- they can even tie. That is the honest
     shape of the result: an index saves ROWS EXAMINED immediately and
     PAGE READS only once the table is big enough for the descent to be
-    cheaper than the scan. benchmarks/index_lookup.py carries the
+    cheaper than the scan. quilldb/bench/index_lookup.py carries the
     page-read claim, at 100,000 rows, where it is 2,622 against 7.
     """
     scanned = tmp_path / "scan.db"

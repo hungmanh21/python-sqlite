@@ -47,7 +47,7 @@ And the half that's easy to leave out — every index is a tax on every write:
 | 3 | 0.6252 | 4.18× |
 
 ```console
-$ python benchmarks/index_lookup.py
+$ python -m quilldb.bench.index_lookup
 ```
 
 ## Concurrency
@@ -74,7 +74,7 @@ threads add scheduling overhead instead of parallelism. The lock manager isn't t
 the interpreter is.
 
 ```console
-$ python benchmarks/concurrent.py
+$ python -m quilldb.bench.concurrent
 ```
 
 ## What works

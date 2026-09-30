@@ -69,7 +69,7 @@ that order*, the answer is in `docs/theory/txn/`.
 | [`plan/`](plan/)               | `plan/` — `planner`, `explain`                                     | 12             |
 | [`exec/`](exec/)               | `exec/` — `operators`, `expressions`, `join`, `aggregate`, `sort`  | 09, 17, 18     |
 | [`txn/`](txn/)                 | `txn/` — `transaction`, `journal`, `recovery`, `locks`             | 13, 14, 15, 16 |
-| [`benchmarks/`](benchmarks/)   | `benchmarks/`                                                      | 19             |
+| [`benchmarks/`](benchmarks/)   | `bench/` (`src/quilldb/bench/`)                                    | 19             |
 
 
 **Chapter numbers are global and follow reading order, so folders have gaps.** `btree/` jumps from

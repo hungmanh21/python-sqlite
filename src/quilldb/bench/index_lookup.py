@@ -14,7 +14,7 @@ claimed. The OS page cache is NOT dropped (that needs root), so the
 milliseconds reflect a warm OS cache and are not the headline.
 
 
-    python benchmarks/index_lookup.py
+    python -m quilldb.bench.index_lookup
 """
 
 from __future__ import annotations

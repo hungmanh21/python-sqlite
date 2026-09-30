@@ -949,7 +949,7 @@ def _analyze_counters(plan_text: str) -> dict[str, int]:
 def _explain_analyze_cold(path: Path, query: str) -> dict[str, int]:
     """Run EXPLAIN ANALYZE on a freshly opened connection, i.e. an empty
     buffer pool. That is what makes `pages_read` (pool MISSES) deterministic:
-    chapter 19 SS19.3's "cold-ish" setting, the same one benchmarks/ uses.
+    chapter 19 SS19.3's "cold-ish" setting, the same one quilldb.bench uses.
     """
     db = quilldb.connect(str(path))
     try:
