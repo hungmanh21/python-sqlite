@@ -80,6 +80,10 @@ class Pager:
         file = path.open("x+b")  # "x" is exclusive create: atomic vs. a check-then-open race
         page1, header = _bootstrap_page1()
         file.write(page1)
+        # Every later read goes through os.pread on the raw fd, which cannot see
+        # bytes still sitting in this buffered handle. CPython 3.13 happens to
+        # flush a page-sized write immediately; 3.12 does not.
+        file.flush()
 
         self = object.__new__(cls)
         self._path = path

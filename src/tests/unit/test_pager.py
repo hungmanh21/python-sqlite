@@ -23,6 +23,19 @@ def test_create_refuses_existing_file(tmp_path) -> None:
         Pager.create(path)
 
 
+def test_create_puts_page_one_on_disk_before_any_close(tmp_path) -> None:
+    # Reads go through os.pread on the raw fd, so page 1 must have left the
+    # buffered handle already. CPython 3.13 flushes this write by itself; 3.12
+    # does not, and a fresh connect() failed there with InvalidPageTypeError.
+    path = tmp_path / "test.db"
+    pager = Pager.create(path)
+    try:
+        assert path.stat().st_size == PAGE_SIZE
+        assert bytes(pager.read_page(1))[:16] == b"SQLite format 3\x00"
+    finally:
+        pager.close()
+
+
 def test_open_missing_file_raises(tmp_path) -> None:
     with pytest.raises(FileNotFoundError):
         Pager.open(tmp_path / "missing.db")
